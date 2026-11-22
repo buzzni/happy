@@ -1,4 +1,6 @@
+import * as moduleApi from 'node:module';
 import { AGENT_PLAN_DESCRIPTOR_ENV } from '@/launcher/agentPlanLaunch';
+import { bundledSeccompFilterPresent, residentModulesEnabled, startResidentModuleHost } from './residentModuleHost';
 import { bindPersonalEndpointLease, assertPersonalEndpointWorkspace, personalEndpointEnvironment, releasePersonalEndpointEnvironment, personalEndpointMarker, PERSONAL_ENDPOINT_BINDING_ENV, type PersonalEndpointSelection } from './personalLlmEndpoint';
 
 import { createBrowserSessionReconnect } from './browserSessionReconnect';
@@ -6,6 +8,7 @@ import { readBrowserTaskPidStartTime } from './browserTaskSessionOwner';
 import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship } from './ownedSpawnRuntime';
+import { ownershipHappyOrigin, ownershipTrustEnv } from './sessionOwnershipTrust';
 import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
 import { drainBashRpcs } from '@/modules/common/bashRpcScheduler';
@@ -52,7 +55,7 @@ import { runManagedScript } from './automations/managedScriptRunner';
 
 import { ApiClient } from '@/api/api';
 import { TrackedSession, SessionEncryptionData } from './types';
-import { MachineMetadata, DaemonState, Metadata, Machine, Session } from '@/api/types';
+import { MachineMetadata, DaemonState, Metadata, Machine, Session, SPAWN_SESSION_KEY_CAPABILITY } from '@/api/types';
 import {
   type RecoverSessionOptions,
   type RecoverSessionResult,
@@ -65,6 +68,7 @@ import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { reseedCompanyKey, settleMachineControl } from '@/datakey/machineControl';
+import { backfillViewerPublicKey } from '@/datakey/viewerKeyBackfill';
 import { createCompanyKeyReseedHandler } from './companyKeyReseedHandler';
 import type { PayloadTrust } from '@/daemon/automations/payloadTrust';
 import { createMachineControlIo } from '@/datakey/machineControlIo';
@@ -154,7 +158,7 @@ import {
   SETUP_TOKEN_BINDING_ENV,
   SETUP_TOKEN_RESUME_REBOUND_ENV,
 } from './sessionEnv';
-import { sanitizeChildEnv } from '@/utils/childEnv';
+import { RESIDENT_MODULE_HOST_ENV, sanitizeChildEnv } from '@/utils/childEnv';
 import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import { createOrgLlmEndpointStudioClient } from './orgLlmEndpointStudio';
@@ -205,6 +209,7 @@ import { createSessionRetention, retentionProtects } from './sessionRetention';
 import { readStaleRuntimeRestartConfig, sweepStaleRuntimeSessions } from './staleRuntimeSessionRestart';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
 import { outputFormatSeed, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
+import { APP_PROFILE_CAPABILITY, appProfileSeed } from '@/claude/appProfile';
 import {
   removeDeferredContinuationContextFile,
   stageDeferredContinuationContext,
@@ -484,6 +489,8 @@ export const initialMachineMetadata: MachineMetadata = {
   channelSupport: CHANNEL_SUPPORT_CAPABILITY,
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
   ...(agentPlanCapabilityForPlatform(process.platform) ? { agentPlan: agentPlanCapabilityForPlatform(process.platform) } : {}),
+  ...(configuration.machineControl === 'strict' ? {} : { spawnSessionKey: SPAWN_SESSION_KEY_CAPABILITY }),
+  appProfile: APP_PROFILE_CAPABILITY,
   structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
   writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
   listFilesPage: LIST_FILES_PAGE_CAPABILITY,
@@ -911,6 +918,7 @@ export async function startDaemon(): Promise<void> {
   let stopLogHousekeeping: () => void = () => undefined;
   let stopClaudeSwapSupervisor: () => void = () => undefined;
   let standaloneWindows: Awaited<ReturnType<typeof createStandaloneWindowsRuntime>>;
+  let residentModules: ReturnType<typeof startResidentModuleHost> | undefined;
   let stopUsageRecovery: () => Promise<void> = async () => undefined;
   let stopWorkMachineCredential = () => {};
   let stopScriptWorker: () => Promise<void> = async () => undefined;
@@ -1022,14 +1030,15 @@ export async function startDaemon(): Promise<void> {
     // registers nothing and keeps the key its parent provisioned.
     const credentials = managedCredential?.ok || workMachine
       ? authSetup.credentials
-      : await settleMachineControl({
+      // aplus-dev-studio specs/script-automation-viewer-key R2 — agents read the viewer key from access.key.
+      : await backfillViewerPublicKey(await settleMachineControl({
         mode: configuration.machineControl,
         credentials: authSetup.credentials,
         machineId,
         serverPublicKey,
         metadata: daemonMachineMetadata,
         io: createMachineControlIo({ token: authSetup.credentials.token, machineId }),
-      });
+      }));
     logger.debug(`[DAEMON RUN] Auth and machine setup complete (machine control: ${managedCredential?.ok ? 'managed' : configuration.machineControl})`);
 
     // ── Managed runtime admission, decided before anything can accept work ──
@@ -1967,6 +1976,11 @@ export async function startDaemon(): Promise<void> {
     let releaseSetupTokenAccounts = (_managedAccountIds: string[]): void => {};
 
     const launchReadiness = createLaunchReadinessGate();
+    if (residentModulesEnabled({ platform: process.platform, versions: process.versions, env: process.env,
+      hasRegisterHooks: 'registerHooks' in moduleApi && typeof moduleApi.registerHooks === 'function',
+      linuxSeccompFilter: process.platform === 'linux' && bundledSeccompFilterPresent(projectPath()) })) {
+      residentModules = startResidentModuleHost(projectPath());
+    }
     const ownsUnresolvedJob = (pid: number) => standaloneWindows?.owner.ownsRoot(pid) ?? false;
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
@@ -2633,6 +2647,10 @@ export async function startDaemon(): Promise<void> {
         if (options.outputFormat) {
           Object.assign(extraEnv, outputFormatSeed(options.outputFormat));
         }
+        // App profile (aplus agent-app-api T5): validated at the RPC boundary; the child fails rather than run without it.
+        if (options.appProfile) {
+          Object.assign(extraEnv, appProfileSeed(options.appProfile));
+        }
         if (options.exitAfterFirstTurn) {
           extraEnv.HAPPY_AUTOMATION_RUN_ONCE = '1';
           // Captured into the session's agentEnvironment, so an attention resume keeps it.
@@ -2979,6 +2997,8 @@ export async function startDaemon(): Promise<void> {
       const workspaceLaunch = { submitted: false, tracked: false };
       let exitObserved = false;
       try {
+      const residentDescriptor = ['claude', 'codex'].includes(args[0]) ? residentModules?.descriptor() : undefined;
+      if (residentDescriptor) env = { ...env, [RESIDENT_MODULE_HOST_ENV]: residentDescriptor };
       // Native preparation creates a suspended root; authorize execution at resume below.
       const prepareStartedAt = Date.now();
       if (standaloneWindows) { workspaceLaunch.submitted = true; onProcessSubmission?.(); }
@@ -6140,6 +6160,8 @@ export async function startDaemon(): Promise<void> {
     // Default OFF: the route refuses and agent-caller-binding answers only owned-journal sources.
     // A token's account never changes, so only a confirmed answer is remembered; registration is re-read every time.
     const accountByToken = new Map<string, string>();
+    // D5: a released daemon verifies A+ ownership documents with the pinned public trust unless the environment names its own.
+    const ownershipOrigin = ownershipHappyOrigin(configuration.serverUrl), ownershipEnv = ownershipTrustEnv(process.env, ownershipOrigin);
     callerLaunches = createAgentCallerLaunches({ enabled: process.env[OWNER_CONTACT_SWITCH] === '1',
       identity: async () => {
         try {
@@ -6149,8 +6171,8 @@ export async function startDaemon(): Promise<void> {
           return { machineId: state.machineId, happyAccountId, epoch: state.epoch };
         } catch { return null; }
       },
-      trust: () => readOwnerContactTrust(process.env, configuration.serverUrl), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });
-    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: configuration.serverUrl, env: process.env,
+      trust: () => readOwnerContactTrust({ HAPPY_APLUS_STUDIO_ORIGIN: process.env.HAPPY_APLUS_STUDIO_ORIGIN, ...ownershipEnv }, ownershipOrigin), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });
+    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: ownershipOrigin, env: ownershipEnv,
       registration: ownedRegistration,
       // The Windows trial launch carries no capability pipe, so its owned children keep the daemon-held binding.
       launchCallers: { query: raw => callerLaunches!.query(raw), currentCaller: sessionId => callerLaunches!.currentCaller(sessionId),
@@ -6216,6 +6238,10 @@ export async function startDaemon(): Promise<void> {
       } }),
       ownedSpawn,
       orgSubagent,
+      readSessionEncryption: sessionId => {
+        const persisted = readPersistedSessions()[sessionId];
+        return persisted ? { encryptionKey: persisted.encryptionKey, encryptionVariant: persisted.encryptionVariant } : null;
+      },
       daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,
       difficultyRouting: difficultyRoutingHost,
@@ -6403,6 +6429,7 @@ export async function startDaemon(): Promise<void> {
           await terminalWorkers.stop();
           await writeScopeRuntime?.close();
           await standaloneWindows?.owner.close();
+          await residentModules?.close();
           await stopBrowserBridge();
           await cleanupDaemonState();
           try {
@@ -6867,6 +6894,7 @@ export async function startDaemon(): Promise<void> {
       await terminalWorkers.stop();
       await writeScopeRuntime?.close();
       await standaloneWindows?.owner.close();
+      await residentModules?.close();
       await stopBrowserBridge();
 
       // Preserve state file with stopped status and final session list
@@ -6935,6 +6963,7 @@ export async function startDaemon(): Promise<void> {
     await stopUsageRecovery();
     await stopBrowserAttention();
     await standaloneWindows?.owner.close().catch(() => {});
+    await residentModules?.close().catch(() => {});
     stopLogHousekeeping();
     stopClaudeSwapSupervisor();
     await stopScriptWorker().catch((shutdownError) => logger.debug('[script-automations] Shutdown report remains in outbox', shutdownError));

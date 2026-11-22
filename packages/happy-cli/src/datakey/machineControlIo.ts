@@ -72,6 +72,7 @@ export function createMachineControlIo(input: { token: string; machineId: string
         publicKey: credentials.encryption.publicKey,
         machineKey: credentials.encryption.machineKey,
         neverEscrowed: credentials.encryption.neverEscrowed === true,
+        viewerPublicKey: credentials.encryption.viewerPublicKey,
       })
       // A re-login reuses the key recorded here; an old one would no longer
       // open what the server holds.

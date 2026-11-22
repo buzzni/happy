@@ -22,7 +22,7 @@ import { createWorktreeOpsHandlers } from '@/daemon/worktreeOps';
 import { io, Socket } from 'socket.io-client';
 import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
-import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
+import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody, SPAWN_SESSION_KEY_CAPABILITY } from './types';
 import type { DaemonRestartLifecycle } from './types';
 import { DAEMON_RESTARTING_CODE, withRestartLifecycle, withTerminalSurvival } from '@/daemon/restartDrainLifecycle';
 import type { TerminalSurvivalState } from '@/daemon/terminalWorker/workerHost';
@@ -56,6 +56,7 @@ import { AI_AUTH_SELECTION_CAPABILITY, parseAiAuthSelection } from '@/daemon/ses
 import { agentPlanCapabilityForPlatform, parseAgentPlanSpawnParam } from '@/daemon/agentPlanGrantEnvelope';
 import { parseResumeAuthRequirement, type ResumeAuthRequirement } from '@/daemon/resumeSetupTokenRebind';
 import { parseOutputFormat, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
+import { APP_PROFILE_CAPABILITY, parseAppProfile } from '@/claude/appProfile';
 import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
 import { backoff } from '@/utils/time';
 import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
@@ -104,7 +105,18 @@ const STRICT_UNBOUND_RELAY_REFUSAL = {
 const STRICT_VIEWER_REFUSAL = {
     outcome: 'rejected' as const,
     code: 'STRICT_VIEWER_UNAVAILABLE',
-    message: 'The remote screen is not available on a machine in strict mode',
+    message: 'A machine in strict mode carries its remote screen only over the sealed viewer channel',
+};
+/**
+ * viewer-channel-strict-design.md H0. A project binding is built from what happy-server sends — its
+ * workspace paths included — so on a strict machine it cannot keep the server off the daemon's own
+ * remote-screen stack (STRICT_RESERVED_RELAY_PORTS). Those ports are never a project's, so the
+ * project relay refuses them before it looks at the binding.
+ */
+const STRICT_RESERVED_PORT_REFUSAL = {
+    outcome: 'rejected' as const,
+    code: 'STRICT_RESERVED_PORT',
+    message: 'This machine runs in strict mode and does not relay its remote-screen or browser-debugging ports',
 };
 /** What a relay terminal's open ack advertises (specs/desktop-terminal-reliability/ Phase 3). */
 const RELAY_TERMINAL_CAPS = { resume: true, snapshot: true, pagedResume: true };
@@ -159,9 +171,16 @@ import {
     type ViewerProofFn,
 } from '@/daemon/previewViewerEvidenceGate';
 import { PreviewWsProxy } from '@/daemon/previewWsProxy';
+import { createBoundOpenNonceGuard } from '@/daemon/boundOpen';
+import {
+    createViewerChannelEndpoint,
+    type ViewerChannelEndpoint,
+    type ViewerChannelTarget,
+    type ViewerTunnelBinding,
+} from '@/daemon/viewerChannelEndpoint';
 import { startServerProcess, StartServerError } from '@/daemon/startServer';
 import packageJson from '../../package.json';
-import { AUTOMATION_PROTOCOL_VERSION, AUTOMATION_SCHEDULE_KINDS, COMPANY_KEY_RESEED_CAPABILITY, COMPANY_KEY_RESEED_METHOD, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, AUTOMATION_SCHEDULE_KINDS, COMPANY_KEY_RESEED_CAPABILITY, COMPANY_KEY_RESEED_METHOD, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, VIEWER_CHANNEL_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, type AuthenticatedEnvelopesCapability } from '@slopus/happy-wire';
 import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
@@ -594,6 +613,23 @@ type IsolatedViewerStartResult = {
     reused: boolean;
 } & ViewerBrowserState;
 
+/**
+ * aplus-dev-studio specs/agent-app-api — the session key a server-started session was sealed with, handed back in the
+ * spawn reply (itself sealed to the machine key). On a dataKey account each session has its own key the server never
+ * receives otherwise; a legacy session uses the account secret the server already holds, so none is sent. No field at
+ * all when the session never reported a key: the caller treats that like an older daemon and fails rather than wait.
+ */
+function sessionKeyReply(
+    sessionId: string,
+    encryption: { encryptionKey: string; encryptionVariant: 'legacy' | 'dataKey' } | null,
+): { sessionKey?: { variant: 'dataKey'; key: string } | { variant: 'legacy' } } {
+    if (!encryption) {
+        logger.debug(`[API MACHINE] Session key requested for ${sessionId}, but the session reported none`);
+        return {};
+    }
+    return { sessionKey: encryption.encryptionVariant === 'dataKey' ? { variant: 'dataKey', key: encryption.encryptionKey } : { variant: 'legacy' } };
+}
+
 type MachineRpcHandlers = {
     sessionRetention?: import('@/daemon/sessionRetention').SessionRetention;
     /** aplus-dev-studio specs/cross-machine-agent-delegation. Absent = no links, no lane, no advertisement. */
@@ -602,6 +638,8 @@ type MachineRpcHandlers = {
     orgSubagent?: ReturnType<typeof createOrgSubagentRuntime>;
     daemonSessionState?: (request: unknown) => Promise<DaemonSessionStateResponse>;
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
+    /** The key a session reported when it started (persisted sessions), for `returnSessionKey`. Null when it never reported one. */
+    readSessionEncryption?: (sessionId: string) => { encryptionKey: string; encryptionVariant: 'legacy' | 'dataKey' } | null;
     resumeSession?: (sessionId: string, options?: {
         model?: string;
         permissionMode?: string;
@@ -883,6 +921,10 @@ export class ApiMachineClient {
     private readonly openingTerminals = new Map<string, { cancelled: boolean }>();
     // Live raw-TCP tunnels for preview WebSocket upgrades (previewWsProxy.ts).
     private previewWsProxy: PreviewWsProxy | null = null;
+    /** Where a strict machine's viewer tunnels end instead of websockify (viewer-channel-strict-design.md §4-1). */
+    private viewerChannelEndpoint: ViewerChannelEndpoint | null = null;
+    /** Remembers viewer channel opens across reconnects, so one recorded open opens one channel. */
+    private readonly viewerChannelNonceGuard = createBoundOpenNonceGuard();
     /**
      * specs/runtime-isolation-hardening (H3, P2) — opens whose binding is
      * still being verified.
@@ -1231,6 +1273,7 @@ export class ApiMachineClient {
         sessionRetention,
         daemonSessionState,
         spawnSession,
+        readSessionEncryption,
         resumeSession,
         recoverSession,
         stopSession,
@@ -1466,7 +1509,9 @@ export class ApiMachineClient {
                 aiAuthSelection,
                 agentPlan,
                 outputFormat,
+                appProfile,
                 launchMcpServers,
+                returnSessionKey,
             } = params || {};
             logger.debug(`[API MACHINE] Spawning session: dir=${directory}, hasUserCreds=${!!(happyToken && happySecret)}`);
 
@@ -1497,6 +1542,15 @@ export class ApiMachineClient {
             // Refused rather than dropped: a caller that asked for a machine-readable result must
             // not get a session that silently runs without one (specs/claude-cli-benchmark-followups R2).
             const validOutputFormat = parseOutputFormat(outputFormat);
+            // aplus-dev-studio specs/agent-app-api T5: refused, never dropped — a dropped profile runs a public app's
+            // session with every tool and setting of this machine.
+            const validAppProfile = parseAppProfile(appProfile);
+            if (validAppProfile && (agent ?? 'claude') !== 'claude') {
+                throw new Error('An app profile is only supported for Claude');
+            }
+            if (validAppProfile && exitAfterFirstTurn !== true) {
+                throw new Error('An app profile is only for a run-once session');
+            }
             if (validOutputFormat && (agent ?? 'claude') !== 'claude') {
                 throw new Error('Structured output is only supported for Claude');
             }
@@ -1541,6 +1595,13 @@ export class ApiMachineClient {
             }
             if (browserContinuation !== undefined && typeof browserContinuation !== 'boolean') {
                 throw new Error('Browser continuation must be a boolean');
+            }
+            if (returnSessionKey !== undefined && typeof returnSessionKey !== 'boolean') {
+                throw new Error('Return-session-key must be a boolean');
+            }
+            // aplus-dev-studio specs/agent-app-api: a strict machine promises the server cannot read session content.
+            if (returnSessionKey && configuration.machineControl === 'strict') {
+                throw new Error('A strict machine does not hand a session key to the server');
             }
             if (browserContinuation && !exitAfterFirstTurn) {
                 throw new Error('Browser continuation is only for a run-once session');
@@ -1587,6 +1648,7 @@ export class ApiMachineClient {
                 aiAuthSelection: validAiAuthSelection,
                 ...(validAgentPlan ? { agentPlan: validAgentPlan } : {}),
                 ...(validOutputFormat ? { outputFormat: validOutputFormat } : {}),
+                ...(validAppProfile ? { appProfile: validAppProfile } : {}),
                 ...(validLaunchMcpServers ? { launchMcpServers: validLaunchMcpServers } : {}),
             });
 
@@ -1615,6 +1677,7 @@ export class ApiMachineClient {
                             ? { appliedOrgLlmEndpoint: result.appliedOrgLlmEndpoint }
                             : {}),
                         ...(result.launchMcpDropped?.length ? { launchMcpDropped: result.launchMcpDropped } : {}),
+                        ...(returnSessionKey ? sessionKeyReply(result.sessionId, readSessionEncryption?.(result.sessionId) ?? null) : {}),
                     };
 
                 case 'requestToApproveDirectoryCreation':
@@ -2408,8 +2471,12 @@ export class ApiMachineClient {
      * Same gate as the project relay, over the viewer variant. There is no
      * `unbound` outcome: these events exist only for bound requests, so an
      * absent binding is a caller error rather than an older server.
+     *
+     * The HTTP side only: a strict machine serves no viewer page through the
+     * relay, which rewrites the pages it carries — the strict client brings its
+     * own (viewer-channel-strict-design.md §4-1).
      */
-    private enforceViewerBinding(
+    private enforceViewerHttpBinding(
         binding: unknown,
         port: number,
     ): Promise<{ outcome: 'enforced' } | { outcome: 'rejected'; code: string; message: string }> {
@@ -2417,12 +2484,12 @@ export class ApiMachineClient {
         return enforceViewerRelayBinding(binding, port, this.viewerLeaseDeps());
     }
 
-    /** Handler body of the `preview-viewer-runtime-lease` socket event. */
+    /**
+     * Handler body of the `preview-viewer-runtime-lease` socket event. Answered on a strict
+     * machine too: the relay checks a viewer tunnel's lease with it, and the answer is a lease
+     * id and an evidence kind, nothing of the screen.
+     */
     private async answerPreviewViewerRuntimeLease(params: any, ack: (response: any) => void): Promise<void> {
-        if (configuration.machineControl === 'strict') {
-            ack({ type: 'error', code: STRICT_VIEWER_REFUSAL.code, message: STRICT_VIEWER_REFUSAL.message });
-            return;
-        }
         try {
             const result = await acquireViewerLease(
                 { viewerKey: params?.viewerKey, port: params?.port },
@@ -2439,8 +2506,31 @@ export class ApiMachineClient {
         }
     }
 
+    /**
+     * viewer-channel-strict-design.md §4-2 — the screen a viewer channel open may reach, read
+     * again when it opens: the slot can have changed hands since the relay checked the lease.
+     * Native stacks only: a broker's VNC port is inside its container (§4-6).
+     */
+    private async resolveViewerChannelTarget(binding: ViewerTunnelBinding): Promise<ViewerChannelTarget | null> {
+        if (this.browserSessionBroker) return null;
+        const lease = await this.isolatedViewerRegistry.get(binding.viewerKey);
+        if (!lease || lease.webPort !== binding.port) return null;
+        const verified = await enforceViewerRelayBinding(
+            { purpose: 'viewer', viewerKey: binding.viewerKey, leaseId: binding.leaseId },
+            binding.port,
+            this.viewerLeaseDeps(),
+        );
+        if (verified.outcome !== 'enforced') return null;
+        const backend = selectViewerBackend(await detectViewerCapabilities());
+        return {
+            vncPort: lease.vncPort,
+            display: lease.display,
+            resize: lease.processIds?.xvnc && backend?.resizeMode === 'remote' ? 'remote' : 'scale',
+        };
+    }
+
     private async relayPreviewViewerBoundHttp(params: any): Promise<any> {
-        const binding = await this.enforceViewerBinding(params?.binding, params?.port);
+        const binding = await this.enforceViewerHttpBinding(params?.binding, params?.port);
         if (binding.outcome === 'rejected') {
             logger.debug(`[API MACHINE] viewer-bound http refused: ${binding.code} ${binding.message}`);
             return { type: 'error', code: binding.code, message: binding.message };
@@ -2468,6 +2558,9 @@ export class ApiMachineClient {
      * Viewer upgrades. Shares the whole cancellation / supersede / close
      * machinery with the project tunnel — a second copy would drift, and the
      * expiry and revocation behaviour is exactly what must not differ.
+     *
+     * On a strict machine the tunnel ends at the sealed viewer channel instead of
+     * websockify, so no screen byte crosses the relay in plaintext.
      */
     private async openPreviewViewerWsTunnelBound(params: any): Promise<any> {
         const tunnelId = typeof params?.tunnelId === 'string' ? params.tunnelId : null;
@@ -2480,13 +2573,21 @@ export class ApiMachineClient {
         if (superseded) superseded.cancelled = true;
         this.previewWsPendingOpens.set(tunnelId, pending);
         try {
-            const binding = await this.enforceViewerBinding(params?.binding, params?.port);
+            const binding = await enforceViewerRelayBinding(params?.binding, params?.port, this.viewerLeaseDeps());
             if (pending.cancelled) return cancelled;
             if (binding.outcome === 'rejected') {
                 logger.debug(`[API MACHINE] viewer-bound ws refused: ${binding.code} ${binding.message}`);
                 return { ok: false, code: binding.code, message: binding.message };
             }
-            const opened = await this.previewWsProxy!.open(params);
+            const strict = configuration.machineControl === 'strict';
+            const channel = this.viewerChannelEndpoint;
+            if (strict && !channel) {
+                return { ok: false, code: STRICT_VIEWER_REFUSAL.code, message: STRICT_VIEWER_REFUSAL.message };
+            }
+            const tunnel: ViewerTunnelBinding = { viewerKey: params.binding.viewerKey, leaseId: params.binding.leaseId, port: params.port };
+            const opened = strict
+                ? await this.previewWsProxy!.open(params, () => channel!.attach(tunnel))
+                : await this.previewWsProxy!.open(params);
             if (pending.cancelled) {
                 this.previewWsProxy?.close(tunnelId);
                 return cancelled;
@@ -2631,6 +2732,9 @@ export class ApiMachineClient {
         binding: unknown,
         port: number,
     ): Promise<{ outcome: 'enforced' | 'unbound' } | { outcome: 'rejected'; code: string; message: string }> {
+        if (configuration.machineControl === 'strict' && STRICT_RESERVED_RELAY_PORTS.has(port)) {
+            return STRICT_RESERVED_PORT_REFUSAL;
+        }
         if (binding === undefined || binding === null) {
             // A strict machine relays only requests bound to a registered preview runtime: unbound, the
             // relay would let happy-server reach any local port in plaintext.
@@ -2655,6 +2759,10 @@ export class ApiMachineClient {
      * by then is reported as EVIDENCE_BUSY rather than left to ack late.
      */
     private async answerPreviewRuntimeLease(params: any, ack: (response: any) => void): Promise<void> {
+        if (configuration.machineControl === 'strict' && STRICT_RESERVED_RELAY_PORTS.has(params?.port)) {
+            ack({ type: 'error', code: STRICT_RESERVED_PORT_REFUSAL.code, message: STRICT_RESERVED_PORT_REFUSAL.message });
+            return;
+        }
         const deps = this.previewLeaseDeps({ probeDeadlineMs: MINT_LEASE_ANSWER_DEADLINE_MS });
         if (!deps) {
             ack({
@@ -4131,6 +4239,16 @@ export class ApiMachineClient {
         // quietly falling back to an unbound token.
         this.onAcked('preview-runtime-lease', (params, ack) => this.answerPreviewRuntimeLease(params, ack));
 
+        this.viewerChannelEndpoint = createViewerChannelEndpoint({
+            machineId: this.machine.id,
+            openSealed: (bytes) => {
+                const opened = tryDecrypt(this.machine.encryptionKey, this.machine.encryptionVariant, bytes);
+                return opened.ok ? opened.value : null;
+            },
+            sealBound: (value) => encodeBase64(encrypt(this.machine.encryptionKey, this.machine.encryptionVariant, value)),
+            nonceGuard: this.viewerChannelNonceGuard,
+            resolveTarget: (binding) => this.resolveViewerChannelTarget(binding),
+        });
         // Preview WebSocket relay — raw byte tunnel for upgrades (noVNC /
         // websockify, ws, HMR). Bytes flow verbatim so the upstream performs the
         // actual WS handshake with the browser end-to-end. See previewWsProxy.ts.
@@ -4650,6 +4768,15 @@ export class ApiMachineClient {
             const advertisedAgentPlan = this.managedHandlers ? undefined : agentPlanCapabilityForPlatform(process.platform);
             const agentPlanStale = JSON.stringify(this.machine.metadata?.agentPlan)
                 !== JSON.stringify(advertisedAgentPlan);
+            const advertisedSpawnSessionKey = this.managedHandlers || configuration.machineControl === 'strict'
+                ? undefined
+                : SPAWN_SESSION_KEY_CAPABILITY;
+            const spawnSessionKeyStale = JSON.stringify(this.machine.metadata?.spawnSessionKey)
+                !== JSON.stringify(advertisedSpawnSessionKey);
+            // Managed runtimes start no daemon-spawned Claude session, so nothing there would apply a profile.
+            const advertisedAppProfile = this.managedHandlers ? undefined : APP_PROFILE_CAPABILITY;
+            const appProfileStale = JSON.stringify(this.machine.metadata?.appProfile)
+                !== JSON.stringify(advertisedAppProfile);
             // Managed runtimes do not serve `writeFile`, so nothing there would answer an attempt.
             const advertisedWriteFileAttempt = this.managedHandlers ? undefined : WRITE_FILE_ATTEMPT_CAPABILITY;
             const writeFileAttemptStale = JSON.stringify(this.machine.metadata?.writeFileAttempt)
@@ -4701,6 +4828,17 @@ export class ApiMachineClient {
                 : TERMINAL_BINDING_CAPABILITY;
             const terminalBindingStale = JSON.stringify(this.machine.metadata?.terminalBinding)
                 !== JSON.stringify(advertisedTerminalBinding);
+            // viewer-channel-strict-design §4-6: the switch that turns clients to the sealed remote-screen channel.
+            // Only where a viewer tunnel can end at it: the machine is strict (under compat the tunnel still
+            // ends at websockify), the preview tunnel is attached (not managed, not the Windows trial), the
+            // stack is native (a broker's VNC is inside its container), and a machine key exists to bind the open.
+            const advertisedViewerChannel = configuration.machineControl !== 'strict'
+                || this.managedHandlers || this.windowsStandaloneTrial || this.browserSessionBroker
+                || this.machine.encryptionVariant !== 'dataKey'
+                ? undefined
+                : VIEWER_CHANNEL_CAPABILITY;
+            const viewerChannelStale = JSON.stringify(this.machine.metadata?.browserViewerChannel)
+                !== JSON.stringify(advertisedViewerChannel);
             const advertisedAgentDelegation = this.agentDelegationAvailable && !this.managedHandlers ? AGENT_DELEGATION_CAPABILITY : undefined;
             const agentDelegationStale = JSON.stringify(this.machine.metadata?.agentDelegation)
                 !== JSON.stringify(advertisedAgentDelegation);
@@ -4714,7 +4852,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || agentDelegationStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || spawnSessionKeyStale || appProfileStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || viewerChannelStale || agentDelegationStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4750,6 +4888,8 @@ export class ApiMachineClient {
                     channelSupport: advertisedChannelSupport,
                     aiAuthSelection: advertisedAiAuthSelection,
                     agentPlan: advertisedAgentPlan,
+                    spawnSessionKey: advertisedSpawnSessionKey,
+                    appProfile: advertisedAppProfile,
                     structuredOutput: advertisedStructuredOutput,
                     writeFileAttempt: advertisedWriteFileAttempt,
                     listFilesPage: advertisedListFilesPage,
@@ -4762,6 +4902,7 @@ export class ApiMachineClient {
                     workspaceSync: advertisedWorkspaceSync,
                     companyKeyReseed: advertisedCompanyKeyReseed,
                     terminalBinding: advertisedTerminalBinding,
+                    browserViewerChannel: advertisedViewerChannel,
                     agentDelegation: advertisedAgentDelegation,
                     daemonSessionState: daemonSessionStateAvailable ? { version: 1 } : undefined,
                     happyCliVersion: newCliVersion,
@@ -4973,6 +5114,13 @@ const VIEWER_CONFIRM_DEAD_MS = 3_000;
 
 /** Chrome's conventional CDP port, then a small range for extra profiles. */
 const CDP_PORT_RANGE = [9222, 9223, 9224, 9225, 9226, 9227, 9228] as const;
+
+/**
+ * Password-less VNC, its websockify front and Chrome's debugging port: each hands over the screen or
+ * the whole browser to whoever reaches it. Fixed lists rather than the live lease records, so a stack
+ * that outlived a daemon restart is covered too.
+ */
+const STRICT_RESERVED_RELAY_PORTS: ReadonlySet<number> = new Set([...VIEWER_VNC_PORTS, ...VIEWER_WEB_PORTS, ...CDP_PORT_RANGE]);
 
 /**
  * A distinct CDP port per profile. Reusing one port makes the second Chrome

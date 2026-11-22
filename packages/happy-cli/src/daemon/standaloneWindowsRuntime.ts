@@ -8,6 +8,7 @@ import { StandaloneLaunchJournal, protectStandaloneObservationDirectory } from '
 import { StandaloneLaunchFailure, StandaloneSessionOwner } from './standaloneSessionOwner';
 import { launchWindowsSession, probeWindowsProcessIdentity, readWindowsSessionReceipt, verifyWindowsSessionLauncher, WindowsSessionLaunchError } from './windowsSessionLauncher';
 import { resolveHappyCliSpawnCommand } from '../utils/spawnHappyCLI';
+import { RESIDENT_MODULE_HOST_ENV } from '../utils/childEnv';
 import { terminateAllDaemonTerminalSessions } from './daemonTerminalSessions';
 import type { TerminateOutcome, WindowsTerminalHost } from './remoteTerminal';
 
@@ -133,7 +134,7 @@ export async function createStandaloneWindowsRuntime(options: {
       isNoProcessError: error => error instanceof WindowsSessionLaunchError,
       launch: async input => {
         await protectStandaloneObservationDirectory(nativeDirectory);
-        const command = resolveHappyCliSpawnCommand(input.args);
+        const command = resolveHappyCliSpawnCommand(input.args, undefined, !!input.env[RESIDENT_MODULE_HOST_ENV]);
         const native = await launchWindowsSession({ helperPath, helperSha256: digest,
           executable: process.execPath, args: command.args, cwd: input.cwd, env: input.env,
           instanceId: input.instanceId, launchId: input.launchId,

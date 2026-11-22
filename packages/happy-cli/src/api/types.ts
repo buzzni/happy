@@ -2,7 +2,7 @@ export type SetupTokenRotationState = 'switching' | 'switched' | 'exhausted' | '
 import type { RpcRequest, RpcResponseCallback } from './rpc/types';
 import { z } from 'zod'
 import type { OrgRequirementsAgentState, ProviderUsageEventV1, Update, UpdateMachineBody } from '@slopus/happy-wire';
-import { authenticatedEnvelopesCapabilitySchema, companyKeyReseedCapabilitySchema, OrgRequirementsCapabilitySchema, projectPurgeCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, terminalBindingCapabilitySchema, workspaceSyncCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
+import { authenticatedEnvelopesCapabilitySchema, companyKeyReseedCapabilitySchema, OrgRequirementsCapabilitySchema, projectPurgeCapabilitySchema, rpcBindingCapabilitySchema, sealedSpawnEnvCapabilitySchema, terminalBindingCapabilitySchema, viewerChannelCapabilitySchema, workspaceSyncCapabilitySchema, worktreeOpsCapabilitySchema, type RpcBindingCapability } from '@slopus/happy-wire';
 import { UsageSchema } from '@/claude/types'
 import { DifficultyRoutingCapabilitySchema, DifficultyRoutingIntentSchema } from '@/difficultyRouting'
 import type { SandboxConfig } from '@/persistence'
@@ -283,6 +283,16 @@ export const MachineMetadataSchema = z.object({
    */
   agentPlan: z.object({ version: z.literal(1), claude: z.literal(1).optional(), claudeModels:z.array(z.string().min(1).max(200)).max(100).optional(), codexModels: z.array(z.string().min(1).max(200)).max(100).optional() }).optional(),
   /**
+   * aplus-dev-studio specs/agent-app-api — `spawn-happy-session` accepts `returnSessionKey` and answers with the
+   * session's key. Absent on an older daemon (which drops the field) and on a strict machine (which refuses it).
+   */
+  spawnSessionKey: z.object({ version: z.literal(1) }).optional(),
+  /**
+   * aplus-dev-studio specs/agent-app-api T5 — `spawn-happy-session` accepts `appProfile` for a run-once Claude session.
+   * Absent on an older daemon, which would drop the field and run the session unrestricted.
+   */
+  appProfile: z.object({ version: z.literal(1) }).optional(),
+  /**
    * Saycode specs/claude-cli-benchmark-followups R2 — `spawn-happy-session` accepts `outputFormat`
    * for these agents. Absent on an older daemon, which would drop the field and run the session
    * without it, so a client must not send one. `agents` is a plain string array so a newer value
@@ -346,6 +356,7 @@ export const MachineMetadataSchema = z.object({
   companyKeyReseed: companyKeyReseedCapabilitySchema.optional(),
   /** aplus terminal-binding-strict-design §4-7: opens remote terminals with their own key (contract v2), dataKey BYOS only. */
   terminalBinding: terminalBindingCapabilitySchema.optional(),
+  browserViewerChannel: viewerChannelCapabilitySchema.optional(),
   /**
    * Agent Browser execution machine. protocol 2: spawns accept `browserAttestation` (a session-user
    * attestation). Studio sends one only when this is reported, and treats the machine by `tenancyMode`.
@@ -910,3 +921,6 @@ export type AgentTransientRetry = {
   scheduledAt: number
   retryAt: number
 }
+
+/** aplus-dev-studio specs/agent-app-api — advertised as machine metadata `spawnSessionKey`. */
+export const SPAWN_SESSION_KEY_CAPABILITY = { version: 1 as const };

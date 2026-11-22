@@ -71,6 +71,7 @@ import {
 import type { LessonDeliveryTicket, LessonTurnHost } from '@/memory/lessonTurnHost';
 import { CLAUDE_TRANSIENT_CONTINUE_PROMPT } from './claudeTransientRetry';
 import type { ClaudeOutputFormat } from './structuredOutput';
+import { applyAppProfile, type ClaudeAppProfile } from './appProfile';
 
 export type ClaudeActiveInputSender = (text: string) => Promise<boolean>;
 
@@ -263,6 +264,8 @@ export async function claudeRemote(opts: {
     exitAfterFirstTurn?: boolean,
     /** Session-scoped structured output (specs/claude-cli-benchmark-followups R2); every query of the session carries it. */
     outputFormat?: ClaudeOutputFormat,
+    /** aplus-dev-studio specs/agent-app-api T5 — fixed at spawn; applied last, over every option and the message mode. */
+    appProfile?: ClaudeAppProfile,
     /** Receives this query's launch options so an off-turn title runs with the same payer and sandbox. */
     offTurnTitle?: ClaudeTitleBridge,
     /** The live query's `/btw` side-question channel, then `null` once the query ends. */
@@ -643,8 +646,9 @@ async function runClaudeRemote(
      * overwritten by the next recall — so a late result cannot be attached to
      * a turn it did not belong to.
      */
-    const lessonTurn = opts.lessons?.sessionId ? (opts.lessons.turn ?? null) : null;
-    const lessonReview = opts.lessons?.sessionId ? (opts.lessons.review ?? null) : null;
+    // An app session answers a public service's end user: no project lesson reaches its input or is reviewed from it (T5).
+    const lessonTurn = opts.lessons?.sessionId && !opts.appProfile ? (opts.lessons.turn ?? null) : null;
+    const lessonReview = opts.lessons?.sessionId && !opts.appProfile ? (opts.lessons.review ?? null) : null;
     // Unknown means automation: a session this host cannot classify must not
     // be allowed to teach the project.
     const cancelProposal = () => opts.lessonProposalTurn?.cancel();
@@ -745,6 +749,7 @@ function readTurnText(content: unknown): string {
     const isCommandInput = (content: unknown) => /^\/\S/.test(readTurnText(content).trimStart());
     let queryClosed = false;
     const withLessons = async (content: string | ContentBlockParam[], spans?: PreparationSpan[]) => {
+        if (opts.appProfile) return content;
         // Native slash commands must remain the first provider input token. The transient retry note
         // joins the failed request, which already carries its lessons (specs/claude-transient-retry D2).
         if (isCommandInput(content) || content === CLAUDE_TRANSIENT_CONTINUE_PROMPT) {
@@ -803,10 +808,11 @@ function readTurnText(content: unknown): string {
      * 필드를 몰라서 조용히 사라진다(실제로 `tools`·`effort` 가 그랬다).
      * 검증된 계획이 없으면 기존 동작으로 돌아가지 않고 여기서 멈춘다.
      */
-    const sdkOptions = bindManagedQueryOptions(assembledOptions, {
+    const boundOptions = bindManagedQueryOptions(assembledOptions, {
         managed: opts.managedRun === true,
         env: process.env,
     });
+    const sdkOptions = opts.appProfile ? applyAppProfile(boundOptions, opts.appProfile) : boundOptions;
 
     // A channel batch can already be outside MessageQueue2 while checkpoint preparation awaits.
     // Only this last synchronous boundary may claim it started; absent authority fails closed.
@@ -825,7 +831,8 @@ function readTurnText(content: unknown): string {
     // A scoped process sandbox and a managed run keep the in-turn title: their
     // boundary is the outer process wrapper or the approved plan, which a
     // second query would not share.
-    if (!processSandbox && opts.managedRun !== true) opts.offTurnTitle?.provide(sdkOptions);
+    // An app session has no chat to title; the side query would also run outside its profile.
+    if (!processSandbox && opts.managedRun !== true && !opts.appProfile) opts.offTurnTitle?.provide(sdkOptions);
     // A managed run answers only the prompt its envelope admitted; a side question would be a second one.
     const sideQuestionRequest = opts.managedRun === true ? null : sideQuestionRequestOf(response);
     if (sideQuestionRequest) opts.onSideQuestionChannelReady?.({ request: sideQuestionRequest, isTurnInProgress: () => thinking });

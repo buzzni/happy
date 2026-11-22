@@ -1,6 +1,6 @@
 import nacl from 'tweetnacl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, bindRpcRequest, terminalFrameKeyInfo } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, VIEWER_CHANNEL_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, bindRpcRequest, terminalFrameKeyInfo } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
 import {
     ApiMachineClient,
@@ -2083,6 +2083,61 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    // aplus-dev-studio specs/agent-app-api — the server asks for a session key only from a daemon that says it
+    // returns one; a strict machine never does, its contract being that the server cannot read session content.
+    it.each([
+        { mode: undefined, advertised: { version: 1 } },
+        { mode: 'strict' as const, advertised: undefined },
+    ])('advertises spawnSessionKey only off strict machine control ($mode)', async ({ mode, advertised }) => {
+        const control = configuration as { machineControl?: 'compat' | 'strict' };
+        if (mode) control.machineControl = mode;
+        try {
+            vi.useFakeTimers();
+            const published: any[] = [];
+            mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+                if (event === 'machine-update-metadata') {
+                    published.push(data.metadata);
+                    return { result: 'success', version: 1, metadata: data.metadata };
+                }
+                if (event === 'machine-update-state') {
+                    return { result: 'success', version: 1, daemonState: data.daemonState };
+                }
+                return { result: 'success' };
+            });
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+
+            socketHandlers.connect![0]!();
+            await vi.waitFor(() => expect(published.length).toBeGreaterThan(0));
+            expect(machine.metadata?.spawnSessionKey).toEqual(advertised);
+
+            client.shutdown();
+        } finally {
+            delete control.machineControl;
+        }
+    });
+
+    // aplus-dev-studio specs/agent-app-api T5 — the server starts an app session only on a daemon that applies the
+    // profile; an older one would drop the field and run the session with every tool of the machine.
+    it('advertises the app profile', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            if (event === 'machine-update-state') return { result: 'success', version: 1, daemonState: data.daemonState };
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        expect(machine.metadata?.appProfile).toBeUndefined();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.appProfile).toEqual({ version: 1 }));
+
+        client.shutdown();
+    });
+
     // aplus-dev-studio specs/remote-file-list-pages — the web picks listFilesPage only on a
     // daemon that says it serves it; an older daemon answers only after the reconnect grace.
     it('advertises listFilesPage on a machine registered before the advertisement existed', async () => {
@@ -2231,6 +2286,42 @@ describe('ApiMachineClient socket reconnection', () => {
         await vi.waitFor(() => expect(machine.metadata?.terminalBinding).toEqual(expected));
 
         client.shutdown();
+    });
+
+    // aplus-dev-studio viewer-channel-strict-design §4-6 — the switch that turns clients to the sealed
+    // remote-screen channel: only where viewer tunnels can end at it (a strict machine with a native viewer
+    // stack the preview tunnel reaches) and a machine key exists to bind the open. Under compat the tunnel
+    // still ends at websockify.
+    it.each([
+        { mode: 'strict' as const, variant: 'dataKey' as const, setup: {}, expected: VIEWER_CHANNEL_CAPABILITY },
+        { mode: 'compat' as const, variant: 'dataKey' as const, setup: {}, expected: undefined },
+        { mode: 'strict' as const, variant: 'legacy' as const, setup: {}, expected: undefined },
+        { mode: 'strict' as const, variant: 'dataKey' as const, setup: { managedHandlers: {} }, expected: undefined },
+        { mode: 'strict' as const, variant: 'dataKey' as const, setup: { browserSessionBroker: {} }, expected: undefined },
+        { mode: 'strict' as const, variant: 'dataKey' as const, setup: { windowsStandaloneTrial: true }, expected: undefined },
+    ])('advertises the sealed viewer channel on a $mode $variant machine ($setup)', async ({ mode, variant, setup, expected }) => {
+        const control = configuration as { machineControl?: 'compat' | 'strict' };
+        control.machineControl = mode;
+        try {
+            vi.useFakeTimers();
+            mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+                if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+                if (event === 'machine-update-state') return { result: 'success', version: 1, daemonState: data.daemonState };
+                return { result: 'success' };
+            });
+            const machine = { ...makeMachine(), encryptionVariant: variant };
+            machine.metadata = { ...machine.metadata!, browserViewerChannel: expected ? undefined : VIEWER_CHANNEL_CAPABILITY };
+            const client = new ApiMachineClient('fake-token', machine);
+            Object.assign(client as any, setup);
+            client.connect();
+
+            socketHandlers.connect![0]!();
+            await vi.waitFor(() => expect(machine.metadata?.browserViewerChannel).toEqual(expected));
+
+            client.shutdown();
+        } finally {
+            delete control.machineControl;
+        }
     });
 
     // aplus-dev-studio specs/cross-machine-agent-delegation R11 — only a daemon that wired the links advertises them.

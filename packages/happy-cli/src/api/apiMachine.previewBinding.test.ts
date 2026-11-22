@@ -21,6 +21,13 @@ const config = vi.hoisted(() => ({
 
 vi.mock('@/configuration', () => ({ configuration: config }))
 
+const viewerLease = vi.hoisted(() => ({ enforce: vi.fn(), acquire: vi.fn() }))
+vi.mock('@/daemon/previewViewerLease', async (importOriginal) => ({
+    ...(await importOriginal<typeof import('@/daemon/previewViewerLease')>()),
+    enforceViewerRelayBinding: viewerLease.enforce,
+    acquireViewerLease: viewerLease.acquire,
+}))
+
 vi.mock('@/modules/common/registerCommonHandlers', () => ({
     registerCommonHandlers: vi.fn(),
 }))
@@ -393,15 +400,119 @@ describe('ApiMachineClient preview relay on a strict machine', () => {
         await expect(client.enforcePreviewBinding(BINDING, 3000)).resolves.toMatchObject({ code: 'PORT_PROJECT_MISMATCH' })
     })
 
-    it('refuses the remote-screen relay and its lease', async () => {
+    // viewer-channel-strict-design.md §4-1: the relay rewrites the pages it carries, so no viewer page
+    // goes through it; a viewer tunnel ends at the sealed channel, never at websockify.
+    const VIEWER_BINDING = { purpose: 'viewer', viewerKey: 'k', leaseId: 'l' }
+
+    it('serves no remote-screen page through the relay', async () => {
         const client = await newClient()
         client.setRPCHandlers(rpcHandlers({ readAll: vi.fn().mockResolvedValue({}) }))
-        await expect(client.enforceViewerBinding({ purpose: 'viewer', viewerKey: 'k', leaseId: 'l' }, 6080)).resolves.toMatchObject({
-            outcome: 'rejected',
-            code: 'STRICT_VIEWER_UNAVAILABLE',
-        })
+        await expect(client.relayPreviewViewerBoundHttp({ port: 6080, method: 'GET', path: '/vnc.html', binding: VIEWER_BINDING }))
+            .resolves.toMatchObject({ type: 'error', code: 'STRICT_VIEWER_UNAVAILABLE' })
+    })
+
+    it('answers the relay\'s viewer lease check', async () => {
+        const client = await newClient()
+        viewerLease.acquire.mockResolvedValue({ type: 'success', leaseId: 'l', evidenceKind: 'native' })
         const ack = vi.fn()
         await client.answerPreviewViewerRuntimeLease({ viewerKey: 'k', port: 6080 }, ack)
-        expect(ack).toHaveBeenCalledWith(expect.objectContaining({ type: 'error', code: 'STRICT_VIEWER_UNAVAILABLE' }))
+        expect(ack).toHaveBeenCalledWith({ type: 'success', leaseId: 'l', evidenceKind: 'native' })
+    })
+
+    it('ends a verified viewer tunnel at the sealed channel instead of the local port', async () => {
+        const client = await newClient()
+        viewerLease.enforce.mockResolvedValue({ outcome: 'enforced' })
+        const attach = vi.fn(() => ({}))
+        client.viewerChannelEndpoint = { attach, closeAll: vi.fn(), size: 0 }
+        const open = vi.fn(async (_params: unknown, connectUpstream?: () => unknown) => {
+            connectUpstream?.()
+            return { ok: true }
+        })
+        client.previewWsProxy = { open, close: vi.fn(), closeAll: vi.fn() }
+
+        await expect(client.openPreviewViewerWsTunnelBound({ tunnelId: 't', port: 6080, dataB64: '', binding: VIEWER_BINDING }))
+            .resolves.toEqual({ ok: true, bindingEnforced: true })
+        expect(open).toHaveBeenCalledWith(expect.objectContaining({ port: 6080 }), expect.any(Function))
+        expect(attach).toHaveBeenCalledWith({ viewerKey: 'k', leaseId: 'l', port: 6080 })
+    })
+
+    it('refuses a viewer tunnel rather than reach websockify when the sealed channel is not there', async () => {
+        const client = await newClient()
+        viewerLease.enforce.mockResolvedValue({ outcome: 'enforced' })
+        const open = vi.fn()
+        client.previewWsProxy = { open, close: vi.fn(), closeAll: vi.fn() }
+
+        await expect(client.openPreviewViewerWsTunnelBound({ tunnelId: 't', port: 6080, dataB64: '', binding: VIEWER_BINDING }))
+            .resolves.toMatchObject({ ok: false, code: 'STRICT_VIEWER_UNAVAILABLE' })
+        expect(open).not.toHaveBeenCalled()
+    })
+
+    // viewer-channel-strict-design.md H0. The project binding is built from what happy-server sends,
+    // workspace paths included: naming `/` would claim every listener on the machine. The remote-screen
+    // stack (password-less VNC, its websockify front) and Chrome's debugging port belong to the daemon,
+    // never to a project, so the project relay must not reach them whatever the binding says.
+    const ROOT_CLAIM = { projectId: 'proj-1', leaseId: 'lease-1', workspacePaths: ['/'] }
+
+    it.each([5900, 5902, 6080, 6082, 9222, 9228])('refuses a bound relay to the daemon-owned port %i', async (port) => {
+        const client = await newClient()
+        const probe = vi.fn()
+        client.previewProbe = probe
+        client.setRPCHandlers(rpcHandlers({ readAll: vi.fn().mockResolvedValue({}) }))
+        const open = vi.fn()
+        client.previewWsProxy = { open, close: vi.fn(), closeAll: vi.fn() }
+
+        await expect(client.enforcePreviewBinding(ROOT_CLAIM, port)).resolves.toMatchObject({
+            outcome: 'rejected',
+            code: 'STRICT_RESERVED_PORT',
+        })
+        await expect(client.relayPreviewBoundHttp({ port, method: 'GET', path: '/', binding: ROOT_CLAIM })).resolves.toMatchObject({
+            type: 'error',
+            code: 'STRICT_RESERVED_PORT',
+        })
+        await expect(client.openPreviewWsTunnelBound({ tunnelId: 't', port, dataB64: '', binding: ROOT_CLAIM })).resolves.toMatchObject({
+            ok: false,
+            code: 'STRICT_RESERVED_PORT',
+        })
+        expect(open).not.toHaveBeenCalled()
+        expect(probe).not.toHaveBeenCalled()
+    })
+
+    it('does not mint a project lease on a daemon-owned port', async () => {
+        const client = await newClient()
+        const probe = vi.fn()
+        client.previewProbe = probe
+        client.setRPCHandlers(rpcHandlers({ readAll: vi.fn().mockResolvedValue({}) }))
+        const ack = vi.fn()
+
+        await client.answerPreviewRuntimeLease({ projectId: 'proj-1', port: 9222, workspacePaths: ['/'] }, ack)
+
+        expect(ack).toHaveBeenCalledWith(expect.objectContaining({ type: 'error', code: 'STRICT_RESERVED_PORT' }))
+        expect(probe).not.toHaveBeenCalled()
+    })
+})
+
+describe('ApiMachineClient viewer tunnel on a compat machine', () => {
+    it('still pipes a verified viewer tunnel to the local port', async () => {
+        const client = await newClient()
+        viewerLease.enforce.mockResolvedValue({ outcome: 'enforced' })
+        const attach = vi.fn()
+        client.viewerChannelEndpoint = { attach, closeAll: vi.fn(), size: 0 }
+        const open = vi.fn(async () => ({ ok: true }))
+        client.previewWsProxy = { open, close: vi.fn(), closeAll: vi.fn() }
+
+        await expect(client.openPreviewViewerWsTunnelBound({ tunnelId: 't', port: 6080, dataB64: '', binding: { purpose: 'viewer', viewerKey: 'k', leaseId: 'l' } }))
+            .resolves.toEqual({ ok: true, bindingEnforced: true })
+        expect(open).toHaveBeenCalledWith(expect.objectContaining({ port: 6080 }))
+        expect(attach).not.toHaveBeenCalled()
+    })
+})
+
+describe('ApiMachineClient preview relay to daemon-owned ports on a compat machine', () => {
+    it('verifies a bound request on them as before', async () => {
+        const client = await newClient()
+        client.setRPCHandlers(rpcHandlers({
+            readAll: vi.fn().mockResolvedValue({ 'session:other-project': { port: 9222, projectId: 'other-project' } }),
+        }))
+        await expect(client.enforcePreviewBinding(BINDING, 9222)).resolves.toMatchObject({ code: 'PORT_PROJECT_MISMATCH' })
     })
 })

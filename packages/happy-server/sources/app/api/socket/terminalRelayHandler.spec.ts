@@ -1,3 +1,4 @@
+import { generateKeyPairSync, sign } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const connections = new Set<any>();
@@ -47,7 +48,7 @@ vi.mock('@/app/events/eventRouter', () => ({
 }));
 
 import { CLIENT_REATTACH_GRACE_MS, terminalRelayHandler } from './terminalRelayHandler';
-import { _resetTerminalSessionsForTest, getTerminalSession } from './terminalSessions';
+import { _resetTerminalSessionsForTest, getTerminalSession, removeTerminalSession } from './terminalSessions';
 
 class FakeSocket {
     connected = true;
@@ -161,6 +162,76 @@ describe('terminalRelayHandler machine socket selection', () => {
             execution.find.mockReset().mockResolvedValue(null);
             execution.permit.mockReset();
         }
+    });
+
+    it('lists and closes only sessions whose signing key is proved on the shared account', async () => {
+        const daemon = new FakeSocket('daemon');
+        registerMachineSocket('m1', daemon);
+        terminalRelayHandler('u1', daemon as any);
+        const client = Object.assign(new FakeSocket('client'), { data: { clientType: 'user-scoped' } });
+        const other = Object.assign(new FakeSocket('other'), { data: { clientType: 'user-scoped' } });
+        terminalRelayHandler('u1', client as any);
+        terminalRelayHandler('u1', other as any);
+        const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+        const ownerKey = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url');
+        const opened = vi.fn();
+        await client.trigger('terminal-open', { machineId: 'm1', params: 'enc', ownerKey }, opened);
+        const sessionId = opened.mock.calls[0][0].sessionId;
+        const foreignKey = generateKeyPairSync('ed25519');
+        const foreignPublic = foreignKey.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url');
+        for (let i = 0; i < 4; i++) {
+            await other.trigger('terminal-open', { machineId: 'm1', params: 'enc', ownerKey: i === 0 ? undefined : foreignPublic }, vi.fn());
+        }
+        const overLimit = vi.fn();
+        await client.trigger('terminal-open', { machineId: 'm1', params: 'enc', ownerKey, capacityVersion: 1 }, overLimit);
+        expect(overLimit).toHaveBeenCalledWith({ ok: false, error: 'Too many active terminals', capacity: { version: 1, active: 5, limit: 5, manageable: true } });
+        const legacy = vi.fn();
+        await client.trigger('terminal-open', { machineId: 'm1', params: 'enc' }, legacy);
+        expect(legacy).toHaveBeenCalledWith({ ok: false, error: 'Too many active terminals' });
+        const signFor = async (socket: FakeSocket, action: string, target = '', own = true) => {
+            const challenge = vi.fn();
+            await socket.trigger('terminal-management-challenge', { action, target }, challenge);
+            const nonce = challenge.mock.calls[0][0].nonce;
+            return { action, target, ownerKey: own ? ownerKey : foreignPublic, signature: sign(null, Buffer.from(JSON.stringify(['terminal-management-v1', nonce, action, target])), own ? privateKey : foreignKey.privateKey).toString('base64url') };
+        };
+
+        const list = vi.fn();
+        const proof = await signFor(client, 'list');
+        await other.trigger('terminal-manage', proof, list);
+        expect(list).toHaveBeenLastCalledWith({ ok: false });
+        await client.trigger('terminal-manage', proof, list);
+        expect(list).toHaveBeenLastCalledWith({ ok: true, active: 5, limit: 5, sessions: [{ sessionId, machineId: 'm1', createdAt: expect.any(Number) }] });
+        await client.trigger('terminal-manage', proof, list);
+        expect(list).toHaveBeenLastCalledWith({ ok: false });
+        await other.trigger('terminal-manage', await signFor(other, 'list', '', false), list);
+        expect(list).toHaveBeenLastCalledWith({ ok: true, active: 5, limit: 5, sessions: expect.arrayContaining([expect.objectContaining({ machineId: 'm1' })]) });
+        const otherRows = list.mock.lastCall?.[0].sessions;
+        expect(otherRows).toHaveLength(3);
+        expect(otherRows).not.toContainEqual(expect.objectContaining({ sessionId }));
+        await expect(daemon.trigger('terminal-management-challenge', { action: 'list', target: '' }, vi.fn())).rejects.toThrow('missing handler');
+
+        const closed = vi.fn();
+        await other.trigger('terminal-manage', await signFor(other, 'close', sessionId, false), closed);
+        expect(closed).toHaveBeenCalledWith({ ok: false });
+        expect(roomEmits).not.toContainEqual(expect.objectContaining({ event: 'terminal-close-fwd' }));
+        closed.mockClear();
+        const closing = client.trigger('terminal-manage', await signFor(client, 'close', sessionId), closed);
+        await vi.waitFor(() => expect(roomEmits).toContainEqual({ room: 'daemon', event: 'terminal-close-fwd', payload: { sessionId } }));
+        expect(closed).not.toHaveBeenCalled();
+        await daemon.trigger('terminal-closed', { sessionId, code: 0 });
+        await closing;
+        expect(closed).toHaveBeenCalledWith({ ok: true });
+        expect(roomEmits).toContainEqual(expect.objectContaining({ room: 'client', event: 'terminal-closed' }));
+
+        const pending = vi.fn();
+        await client.trigger('terminal-open', { machineId: 'm1', params: 'enc', ownerKey }, pending);
+        const lostId = pending.mock.calls[0][0].sessionId;
+        const unconfirmed = vi.fn();
+        const lostClose = client.trigger('terminal-manage', await signFor(client, 'close', lostId), unconfirmed);
+        await vi.waitFor(() => expect(roomEmits).toContainEqual({ room: 'daemon', event: 'terminal-close-fwd', payload: { sessionId: lostId } }));
+        await removeTerminalSession(lostId);
+        await lostClose;
+        expect(unconfirmed).toHaveBeenCalledWith({ ok: false, code: 'UNCONFIRMED' });
     });
 
     it('forwards terminal-open to the newest machine socket when a stale one is still registered', async () => {
@@ -712,18 +783,60 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
         ]);
     });
 
+    it('confirms a managed close across replicas only after the quota index is updated', async () => {
+        const { publicKey, privateKey } = generateKeyPairSync('ed25519');
+        const ownerKey = publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url');
+        const { daemon, sessionId } = await openAcrossReplicas(ownerKey);
+        const replicaC = await loadReplica();
+        const manager = Object.assign(new FakeSocket('manager'), { data: { clientType: 'user-scoped' } });
+        replicaC.relay.terminalRelayHandler('u1', manager as any);
+
+        const challenge = vi.fn();
+        await manager.trigger('terminal-management-challenge', { action: 'close', target: sessionId }, challenge);
+        const nonce = challenge.mock.calls[0][0].nonce;
+        const message = Buffer.from(JSON.stringify(['terminal-management-v1', nonce, 'close', sessionId]));
+        const ack = vi.fn();
+        const close = manager.trigger('terminal-manage', {
+            action: 'close', target: sessionId, ownerKey, signature: sign(null, message, privateKey).toString('base64url'),
+        }, ack);
+        await vi.waitFor(() => expect(roomEmits).toContainEqual({ room: 'daemon-1', event: 'terminal-close-fwd', payload: { sessionId } }));
+
+        const remove = redis.srem.bind(redis);
+        let release!: () => void;
+        const blocked = new Promise<void>(resolve => { release = resolve; });
+        vi.spyOn(redis, 'srem').mockImplementation(async (key, ...members) => {
+            if (key === 'terminal:user:u1') await blocked;
+            return remove(key, ...members);
+        });
+        const membership = vi.spyOn(redis, 'smembers');
+        const exit = daemon.trigger('terminal-closed', { sessionId, code: 0 });
+        try {
+            await vi.waitFor(() => {
+                expect(redis.record(sessionId).closedAt).toBeTypeOf('number');
+                expect(membership).toHaveBeenCalledWith('terminal:user:u1');
+            });
+            expect(ack).not.toHaveBeenCalled();
+        } finally {
+            release();
+        }
+        await exit;
+        await close;
+        expect(ack).toHaveBeenCalledWith({ ok: true });
+        expect(roomEmits).toContainEqual(expect.objectContaining({ room: 'client-1', event: 'terminal-closed' }));
+    });
+
     /** Client handled by replica B, daemon by replica A. */
-    async function openAcrossReplicas() {
+    async function openAcrossReplicas(ownerKey?: string) {
         const replicaA = await loadReplica();
         const replicaB = await loadReplica();
         const daemon = new FakeSocket('daemon-1');
         registerMachineSocket('m1', daemon);
         (daemon as any).data = { clientType: 'machine-scoped', machineId: 'm1' };
         replicaA.relay.terminalRelayHandler('u1', daemon as any);
-        const client = new FakeSocket('client-1');
+        const client = Object.assign(new FakeSocket('client-1'), { data: { clientType: 'user-scoped' } });
         replicaB.relay.terminalRelayHandler('u1', client as any);
         const ack = vi.fn();
-        await client.trigger('terminal-open', { machineId: 'm1', params: 'enc' }, ack);
+        await client.trigger('terminal-open', { machineId: 'm1', params: 'enc', ownerKey }, ack);
         const sessionId = ack.mock.calls[0][0].sessionId;
         roomEmits.length = 0;
         return { replicaA, replicaB, daemon, client, sessionId };

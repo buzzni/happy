@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "origins": {
+    "https://saycode.ai": {
+      "issuer": "https://saycode.ai",
+      "audience": "https://saycode.ai",
+      "publicKeys": {
+        "aef6ff940e6def127cda4b4b73c0dbb4aa0a9bcf891133d81867a3fdb062ff54": "wXzuUR8PtlKeCc9eEfImeUxDCwqten_0gYY4WoutYNU"
+      }
+    }
+  }
+}

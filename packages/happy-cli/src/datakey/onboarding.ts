@@ -14,6 +14,7 @@
 import type { Credentials } from '@/persistence'
 import { serializeProvisionedLegacyCredentials } from '@/persistence'
 import { encodeBase64 } from '@/api/encryption'
+import { deriveContentKeyPair } from '@/resume/localHappyAgentAuth'
 
 export type OnboardingSkipReason =
   | 'not-provisioned'
@@ -25,7 +26,7 @@ export type OnboardingSkipReason =
 
 export type SerializedDataKeyCredentials = {
   token: string
-  encryption: { publicKey: string; machineKey: string }
+  encryption: { publicKey: string; machineKey: string; viewerPublicKey: string }
 }
 
 export type OnboardingResult =
@@ -62,6 +63,8 @@ export function planDataKeyOnboarding(input: {
       encryption: {
         publicKey: encodeBase64(enc.provisioned.publicKey),
         machineKey: encodeBase64(enc.provisioned.machineKey),
+        // aplus-dev-studio specs/script-automation-viewer-key R1
+        viewerPublicKey: encodeBase64(deriveContentKeyPair(enc.secret).publicKey),
       },
     },
     // 원본 legacy(+병기) 를 그대로 백업해 deactivate 가 바이트 동일 복원.

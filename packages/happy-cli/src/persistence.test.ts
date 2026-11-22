@@ -374,6 +374,29 @@ describe('parseCredentials', () => {
         expect(unmarked!.encryption).not.toHaveProperty('neverEscrowed');
         expect(contradicted!.encryption).not.toHaveProperty('neverEscrowed');
     });
+
+    /*
+     * aplus-dev-studio specs/script-automation-viewer-key R3 — the automation
+     * viewer key is read leniently: a malformed value costs that key only.
+     */
+    it('keeps a dataKey file viewer public key and drops a malformed one without losing the credential', async () => {
+        const { parseCredentials } = await import('./persistence');
+        const encryption = {
+            publicKey: Buffer.alloc(32, 2).toString('base64'),
+            machineKey: Buffer.alloc(32, 3).toString('base64'),
+        };
+        const viewerPublicKey = Buffer.alloc(32, 6);
+
+        const kept = parseCredentials({ token: 't', encryption: { ...encryption, viewerPublicKey: viewerPublicKey.toString('base64') } });
+        const short = parseCredentials({ token: 't', encryption: { ...encryption, viewerPublicKey: Buffer.alloc(16, 6).toString('base64') } });
+        const wrongType = parseCredentials({ token: 't', encryption: { ...encryption, viewerPublicKey: 7 } });
+
+        expect(kept!.encryption).toMatchObject({ type: 'dataKey', viewerPublicKey: new Uint8Array(viewerPublicKey) });
+        expect(short!.encryption).toMatchObject({ type: 'dataKey' });
+        expect(short!.encryption).not.toHaveProperty('viewerPublicKey');
+        expect(wrongType!.encryption).toMatchObject({ type: 'dataKey' });
+        expect(wrongType!.encryption).not.toHaveProperty('viewerPublicKey');
+    });
 });
 
 /*
@@ -419,6 +442,19 @@ describe('replaceCredentialsDataKey', () => {
 
         await replaceCredentialsDataKey({ token: 't', publicKey, machineKey });
         expect(JSON.parse(readFileSync(configuration.privateKeyFile, 'utf8')).encryption).not.toHaveProperty('neverEscrowed');
+    });
+
+    it('carries the automation viewer public key only when given', async () => {
+        const { readCredentials, replaceCredentialsDataKey } = await import('./persistence');
+        const machineKey = new Uint8Array(Buffer.alloc(32, 4));
+        const publicKey = new Uint8Array(Buffer.alloc(32, 5));
+        const viewerPublicKey = new Uint8Array(Buffer.alloc(32, 6));
+
+        await replaceCredentialsDataKey({ token: 't', publicKey, machineKey, viewerPublicKey });
+        expect((await readCredentials())!.encryption).toEqual({ type: 'dataKey', publicKey, machineKey, viewerPublicKey });
+
+        await replaceCredentialsDataKey({ token: 't', publicKey, machineKey });
+        expect(JSON.parse(readFileSync(configuration.privateKeyFile, 'utf8')).encryption).not.toHaveProperty('viewerPublicKey');
     });
 });
 

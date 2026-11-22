@@ -204,7 +204,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
             return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
         } catch (error) {
             const code = error instanceof Error && /^[A-Z0-9_-]{1,100}$/.test(error.message) ? error.message : 'SCRIPT_MANAGEMENT_FAILED';
-            return { isError: true, content: [{ type: 'text' as const, text: code }] };
+            return { isError: true, content: [{ type: 'text' as const, text: code === 'SCRIPT_VIEWER_KEY_MISMATCH' ? `${code}\n${viewerKeyMismatchHint('프로젝트 도구 > 자동화 > 스크립트 등록')}` : code }] };
         }
     }));
 
@@ -220,7 +220,7 @@ function createMcpServer(handlers: HappyServerHandlers): McpServer {
             return { content: [{ type: 'text' as const, text: JSON.stringify(result) }] };
         } catch (error) {
             const code = error instanceof Error && /^[A-Z0-9_-]{1,100}$/.test(error.message) ? error.message : 'SCHEDULED_TASK_MANAGEMENT_FAILED';
-            return { isError: true, content: [{ type: 'text' as const, text: code }] };
+            return { isError: true, content: [{ type: 'text' as const, text: code === 'SCHEDULED_TASK_VIEWER_KEY_MISMATCH' ? `${code}\n${viewerKeyMismatchHint('프로젝트 도구 > 자동화')}` : code }] };
         }
     }));
 
@@ -637,6 +637,11 @@ function createBrowserTaskRuntimeClient(client: ApiSessionClient, profileId: str
 
 /** Env var Claude expands in the TCP MCP header; the name avoids the credential filter's `_TOKEN` suffix. */
 const MCP_BEARER_ENV = 'SAYCODE_MCP_BEARER';
+
+// aplus-dev-studio specs/script-automation-viewer-key R7 — the same request fails the same way until a key changes.
+function viewerKeyMismatchHint(appPath: string): string {
+    return `This machine holds no key matching this project's automation viewer key, so it cannot register here. Do not retry. Ask the user to register it in the Saycode app: ${appPath}.`;
+}
 
 export async function startHappyServer(
     client: ApiSessionClient,

@@ -158,6 +158,19 @@ describe('settleMachineControl in strict mode', () => {
         expect(h.calls).toEqual([]);
     });
 
+    // aplus-dev-studio specs/script-automation-viewer-key R3
+    it('keeps the automation viewer public key through a machine key replacement', async () => {
+        const h = harness();
+        const viewerPublicKey = new Uint8Array(32).fill(9);
+        const base = dataKeyCredentials();
+        if (base.encryption.type !== 'dataKey') throw new Error('unreachable');
+
+        const settled = await settle(h, { mode: 'strict', credentials: { ...base, encryption: { ...base.encryption, viewerPublicKey } } });
+
+        expect(settled.encryption).toMatchObject({ machineKey: newKey, viewerPublicKey });
+        expect(h.state.written).toEqual(settled);
+    });
+
     it('keeps a key that was never escrowed without asking the server', async () => {
         const h = harness();
         const credentials = dataKeyCredentials(oldKey, true);

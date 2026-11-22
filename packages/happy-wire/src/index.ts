@@ -19,6 +19,7 @@ export * from './companyKeyReseed';
 export * from './sealedSpawnEnv';
 export * from './worktreeOps';
 export * from './terminalBinding';
+export * from './viewerChannel';
 
 export * from './orgSetupTokenApproval';
 export * from './orgRequirements';

@@ -33,6 +33,11 @@ const rowSchema = z.object({ id, projectId: id, registrationKey: id, revision: z
 type Row = z.infer<typeof rowSchema>;
 export function createScriptAutomationTools(options: {
   projectId: string; directory: string; viewerKeyPair?: nacl.BoxKeyPair; viewerPublicKey?: Uint8Array;
+  /**
+   * The viewer key the account secret derives, which the app registers projects with, kept in access.key once the
+   * secret left it (aplus-dev-studio specs/script-automation-viewer-key R1). `viewerPublicKey` stays the sender trust key.
+   */
+  storedViewerPublicKey?: Uint8Array;
   machineReader?: { machineId: string; machineAccountId: string; mode: 'compat' | 'strict';
     key: { publicKey: Uint8Array; secretKey: Uint8Array; registeredKeyVersion: number } };
   /**
@@ -49,6 +54,9 @@ export function createScriptAutomationTools(options: {
   if (reader && reader.key.registeredKeyVersion < 1) throw new Error('SCRIPT_MACHINE_KEY_REQUIRED');
   const samePublicKey = (encoded: string | null | undefined, expected: Uint8Array) =>
     typeof encoded === 'string' && Buffer.from(encoded, 'base64').equals(Buffer.from(expected));
+  // Only keys held here count; a key the server names is never taken as one (R6).
+  const viewerCandidates = options.viewerKeyPair ? [viewerPublicKey] : [options.storedViewerPublicKey, viewerPublicKey].filter((key): key is Uint8Array => !!key);
+  const matchingViewerKey = (encoded: string | null | undefined) => viewerCandidates.find((key) => samePublicKey(encoded, key));
   function verifyMachine(value: { machineId?: string; machineAccountId?: string; machineKeyVersion: number; machinePublicKey?: string | null }) {
     if (reader && (value.machineId !== reader.machineId || value.machineAccountId !== reader.machineAccountId
       || value.machineKeyVersion !== reader.key.registeredKeyVersion || !samePublicKey(value.machinePublicKey, reader.key.publicKey))) {
@@ -61,7 +69,7 @@ export function createScriptAutomationTools(options: {
     if (!reader) return scriptAutomationPayloadSchema.parse(decryptScriptValue({ encrypted: row.encrypted,
       context: context(row.registrationKey, 'configuration'), recipient: 'viewer', secretKey: options.viewerKeyPair!.secretKey }));
     verifyMachine(row);
-    if (!samePublicKey(row.viewerPublicKey, viewerPublicKey!)) throw new Error('SCRIPT_VIEWER_KEY_MISMATCH');
+    if (!matchingViewerKey(row.viewerPublicKey)) throw new Error('SCRIPT_VIEWER_KEY_MISMATCH');
     const verdict = judgePayload({ trust: { mode: reader.mode, customerPublicKey: viewerPublicKey!, machineAutomationPublicKey: reader.key.publicKey },
       allowMachineSender: true, opening: openScriptValueForMachine({ encrypted: row.encrypted,
         context: context(row.registrationKey, 'configuration'), secretKey: reader.key.secretKey }) });
@@ -90,14 +98,14 @@ export function createScriptAutomationTools(options: {
     let value = schema.parse(await options.request({ operation: 'target' }));
     if (value.automationProtocolVersion < 5) throw new Error('SCRIPT_RUNNER_UNSUPPORTED');
     verifyMachine(value);
-    const publicKey = Buffer.from(viewerPublicKey!).toString('base64');
     if (!value.viewerPublicKey) {
-      await options.request({ operation: 'viewer-key', expectedKeyVersion: value.viewerKeyVersion, publicKey });
+      await options.request({ operation: 'viewer-key', expectedKeyVersion: value.viewerKeyVersion, publicKey: Buffer.from(viewerCandidates[0]).toString('base64') });
       value = schema.parse(await options.request({ operation: 'target' }));
     }
     verifyMachine(value);
-    if (!samePublicKey(value.viewerPublicKey, viewerPublicKey!)) throw new Error('SCRIPT_VIEWER_KEY_MISMATCH');
-    return { ...value, publicKey, machinePublicKey: new Uint8Array(Buffer.from(value.machinePublicKey, 'base64')) };
+    const viewerKey = matchingViewerKey(value.viewerPublicKey);
+    if (!viewerKey) throw new Error('SCRIPT_VIEWER_KEY_MISMATCH');
+    return { ...value, viewerKey, machinePublicKey: new Uint8Array(Buffer.from(value.machinePublicKey, 'base64')) };
   }
   async function sourceFile(path: string) {
     if (isAbsolute(path)) throw new Error('SCRIPT_SOURCE_OUTSIDE_PROJECT');
@@ -143,7 +151,7 @@ export function createScriptAutomationTools(options: {
         const sealingKey = reader?.key ?? options.localAutomationKey;
         const ownMachine = !!sealingKey
           && Buffer.from(sealingKey.publicKey).equals(Buffer.from(keys.machinePublicKey));
-        const recipients = { viewerPublicKey: viewerPublicKey!, machinePublicKey: keys.machinePublicKey,
+        const recipients = { viewerPublicKey: keys.viewerKey, machinePublicKey: keys.machinePublicKey,
           ...(ownMachine ? { sender: sealingKey! } : {}) };
         const encrypted = encryptScriptValue({ value, context: context(input.registrationKey, 'configuration'), ...recipients });
         const artifact = encryptScriptValue({ value: { source: file.source }, context: context(artifactId, 'artifact'), ...recipients });
@@ -216,7 +224,7 @@ export async function runScriptAutomationTool(raw: unknown, session: { directory
     machineReader = { machineId, machineAccountId: key.machineAccountId, key: localAutomationKey!, mode: configuration.machineControl };
   }
   const client = createScriptAutomationTools({ projectId, directory: session.directory,
-    ...(credentials ? { viewerKeyPair: credentials.contentKeyPair } : { viewerPublicKey: encryption!.publicKey, machineReader }),
+    ...(credentials ? { viewerKeyPair: credentials.contentKeyPair } : { viewerPublicKey: encryption!.publicKey, storedViewerPublicKey: encryption!.viewerPublicKey, machineReader }),
     localAutomationKey,
     request: async (request) => {
       const response = await fetch(new URL('/api/automation/script-management', url), { method: 'POST', redirect: 'error',

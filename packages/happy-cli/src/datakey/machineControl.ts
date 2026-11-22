@@ -171,6 +171,7 @@ function withKey(credentials: Credentials, encryption: DataKeyEncryption, machin
       publicKey: encryption.publicKey,
       machineKey,
       ...(neverEscrowed ? { neverEscrowed: true as const } : {}),
+      ...(encryption.viewerPublicKey ? { viewerPublicKey: encryption.viewerPublicKey } : {}),
     },
   }
 }
@@ -422,6 +423,8 @@ async function commitReseed(io: MachineControlIo, credentials: Credentials, pend
       publicKey: decodeBase64(pending.reseed.publicKey),
       machineKey: decodeBase64(pending.machineKey),
       neverEscrowed: true,
+      ...(credentials.encryption.type === 'dataKey' && credentials.encryption.viewerPublicKey
+        ? { viewerPublicKey: credentials.encryption.viewerPublicKey } : {}),
     },
   }
   await io.writeCredentials(replaced)

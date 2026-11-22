@@ -1,5 +1,6 @@
 import { PERSONAL_ENDPOINT_BINDING_ENV, personalEndpointMarker } from './personalLlmEndpoint'
 import { describe, expect, it } from 'vitest'
+import { consumeAppProfileSeed } from '@/claude/appProfile'
 import {
     buildManagedSessionSpawnEnvironment,
     buildResumedSessionSpawnEnvironment,
@@ -366,6 +367,22 @@ describe('Saycode agent resume environment', () => {
         expect(buildResumedSessionSpawnEnvironment({
             inherited: { PATH: '/usr/bin', HAPPY_INITIAL_OUTPUT_FORMAT: seed }, explicit: {}, sessionId: 'session-3',
         }).HAPPY_INITIAL_OUTPUT_FORMAT).toBeUndefined()
+    })
+
+    it('keeps an app profile across a resume, and a corrupt one as a marker the runner refuses (aplus agent-app-api T5)', () => {
+        const seed = JSON.stringify({ version: 1, mcpServers: ['shopping'], systemPrompt: '너는 쇼핑 도우미다.' })
+        const captured = captureSaycodeAgentEnvironment({ HAPPY_INITIAL_APP_PROFILE: seed })
+        expect(captured).toEqual({ HAPPY_INITIAL_APP_PROFILE: seed })
+        expect(buildResumedSessionSpawnEnvironment({
+            inherited: { PATH: '/usr/bin' }, explicit: {}, agentEnvironment: captured, sessionId: 'session-2',
+        })).toMatchObject({ HAPPY_INITIAL_APP_PROFILE: seed })
+
+        const corrupt = captureSaycodeAgentEnvironment({ HAPPY_INITIAL_APP_PROFILE: '{not json' })
+        expect(corrupt).toEqual({ HAPPY_INITIAL_APP_PROFILE: '' })
+        const resumed = buildResumedSessionSpawnEnvironment({
+            inherited: { PATH: '/usr/bin' }, explicit: {}, agentEnvironment: corrupt, sessionId: 'session-3',
+        })
+        expect(() => consumeAppProfileSeed({ ...resumed })).toThrow(/App profile/)
     })
 
     it('captures the Chat(beta) browser continuation mark so a resumed turn keeps its guidance', () => {

@@ -87,6 +87,18 @@ function pendingReseed(overrides: Partial<PendingMachineKeyRotation> = {}): Pend
 }
 
 describe('reseedCompanyKey', () => {
+    // aplus-dev-studio specs/script-automation-viewer-key R3 — the viewer key derives from the Happy secret, not the company key.
+    it('keeps the automation viewer public key across the company key change', async () => {
+        const h = harness();
+        const viewerPublicKey = new Uint8Array(32).fill(9);
+        const credentials = strictCredentials();
+        if (credentials.encryption.type !== 'dataKey') throw new Error('unreachable');
+
+        await reseed(h, { ...credentials, encryption: { ...credentials.encryption, viewerPublicKey } });
+
+        expect(h.state.written?.encryption).toMatchObject({ publicKey: newCompany.publicKey, viewerPublicKey });
+    });
+
     it('replaces the machine key under the new company key on the server, then locally, and removes the record last', async () => {
         const h = harness();
         const result = await reseed(h);
