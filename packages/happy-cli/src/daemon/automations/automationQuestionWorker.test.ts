@@ -66,11 +66,19 @@ function fixture() {
     if (lostStart) { lostStart = false; return { ok: false, error: 'request-unconfirmed' } }
     return { ok: true, value: { projectId: 'chat:c1', runLeaseExpiresAt: Date.now() + 300_000 } }
   }), heartbeat: vi.fn(async (_input: unknown) => ({ ok: true })) }
-  const deps: AutomationQuestionWorkerInput = { home, serverUrl: origin, accountId: 'owner', machineId: 'm1', token: 'private-machine-token',
+  const deps: AutomationQuestionWorkerInput = { home, serverUrl: origin, accountId: 'owner', machineId: 'm1', token: () => 'private-machine-token',
     host, transport, journal: createAutomationContextLaunchJournal(home), runtimeStore: createServerAutomationRuntimeStore({ filePath: join(home, 'runtime.json') }),
     decode: vi.fn(() => payload), log: vi.fn() }
   return { deps, payload, previousResult, host, transport, worker: createAutomationQuestionWorker(deps) }
 }
+// A protected daemon's wmx_ credential is renewed every few minutes; the worker reads the current one per request.
+it('sends the credential current at each request, not the one it was created with', async () => {
+  const f = fixture(); let token = 'expired-wmx-token'
+  const worker = createAutomationQuestionWorker({ ...f.deps, token: () => token })
+  token = 'private-machine-token'
+  await worker.ready(); await worker.maintain()
+  expect(f.host.dispatch).toHaveBeenCalledTimes(1)
+})
 it('fsyncs one private claim identity before the network and dispatches a fresh selected question without changing schedules', async () => {
   const f = fixture(); await f.worker.ready(); await f.worker.maintain()
   expect(persistedAtClaim).toBe(true)

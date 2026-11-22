@@ -19,7 +19,9 @@ import { automationContextHoldCode } from './automationContextDeferred'
 
 type Host = ReturnType<typeof createAutomationContextHost>
 export type AutomationQuestionWorkerInput = {
-  home: string; serverUrl: string; accountId: string; machineId: string; token: string
+  home: string; serverUrl: string; accountId: string; machineId: string
+  /** Read per request: a protected daemon's wmx_ credential is renewed every few minutes. */
+  token(): string
   journal: AutomationContextLaunchJournal; runtimeStore: ServerAutomationRuntimeStore
   host: Pick<Host, 'prepare' | 'dispatch'> & { cancelRun(runId: string): Promise<boolean> }
   decode(question: { requestId: string; sourceRunId: string; automationId: string; projectId: string;
@@ -44,7 +46,7 @@ type Record = z.infer<typeof recordSchema>
 export function createAutomationQuestionWorker(deps: AutomationQuestionWorkerInput) {
   const origin = new URL(deps.serverUrl)
   if (!['http:', 'https:'].includes(origin.protocol) || origin.username || origin.password || origin.search || origin.hash
-    || !deps.accountId || !deps.machineId || !deps.token) throw new Error('AUTOMATION_QUESTION_CONFIGURATION_INVALID')
+    || !deps.accountId || !deps.machineId || !deps.token()) throw new Error('AUTOMATION_QUESTION_CONFIGURATION_INVALID')
   const base = origin.toString().replace(/\/+$/, ''), serial = createSerialLock()
   const scope = createHash('sha256').update(JSON.stringify([base, deps.accountId, deps.machineId])).digest('hex')
   const root = join(deps.home, 'automation-context-questions.v1'), directory = join(root, scope)
@@ -111,7 +113,7 @@ export function createAutomationQuestionWorker(deps: AutomationQuestionWorkerInp
   async function request(path: string, method = 'GET', body?: unknown, signal?: AbortSignal): Promise<unknown> {
     let response: Response
     try { response = await fetch(base + path, { method, redirect: 'error', signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(10_000)]) : AbortSignal.timeout(10_000),
-      headers: { Authorization: `Bearer ${deps.token}`, 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) }) }
+      headers: { Authorization: `Bearer ${deps.token()}`, 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) }) }
     catch { throw new Error('AUTOMATION_QUESTION_REQUEST_UNCONFIRMED') }
     if (!response.ok) { await response.body?.cancel(); throw new Error(`AUTOMATION_QUESTION_HTTP_${response.status}`) }
     const reader = response.body?.getReader(), chunks: Uint8Array[] = []; let size = 0

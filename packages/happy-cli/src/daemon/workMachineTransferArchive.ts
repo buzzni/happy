@@ -7,7 +7,11 @@
  * their Claude/Codex provider records. Nothing else under HAPPY_HOME, CLAUDE_CONFIG_DIR or
  * CODEX_HOME is ever enumerated, so account/device keys, AI logins and execution credentials stay
  * behind by construction. Files that may still carry an execution credential (provider records,
- * env-like files, Git config) are scanned and the export stops, naming the file, never the value.
+ * env-like files, .npmrc, Git config of the project, its submodules and worktrees) are scanned, and
+ * every other project file is checked for a PEM private key header; the export stops naming the
+ * file, never the value.
+ * A conversation in this machine's sessions.json that the plan leaves out (and that is not
+ * archived) stops the export too: it would not open on the target.
  *
  * Archive layout: `happy/sessions.json` (the selected records) and `fs/<absolute path>` for every
  * selected entry. Extraction admits only those two shapes, regular files, directories and symlinks
@@ -20,6 +24,8 @@ import { Readable } from 'node:stream';
 import { create as createTar, extract as extractTar, list as listTar } from 'tar';
 import { z } from 'zod';
 import { getProjectPath } from '@/claude/utils/path';
+import { withReportedProviderIdentity } from './resumeCursorPersistence';
+import { readWorkMachineSessionStop, workMachineSessionStopPath } from './workMachineSessionStop';
 
 export type WorkMachineTransferSession = {
     sessionId: string;
@@ -34,7 +40,10 @@ export type WorkMachineTransferSelection = {
     /** Every absolute path archived, each root before its descendants. */
     entries: string[];
     sessions: WorkMachineTransferSession[];
-    /** The planned sessions' recovery records, verbatim from sessions.json. */
+    /**
+     * The planned sessions' recovery records from sessions.json, with the cursor and provider
+     * conversation their processes recorded when they stopped (workMachineSessionStop.ts).
+     */
     records: Record<string, unknown>;
 };
 
@@ -55,22 +64,32 @@ const recordSchema = z.object({
     deferredContinuationContextFile: z.string().optional(),
 }).passthrough();
 
+const archivedRecord = z.object({ metadata: z.object({ lifecycleState: z.literal('archived') }).passthrough() }).passthrough();
+
 /** Logins that may sit inside a project tree and never travel. */
 const LOGIN_FILES = new Set(['.git-credentials', '.netrc', '.credentials.json']);
-const SCANNED_NAME = /^\.env(\..*)?$|\.env$|^\.mcp\.json$/;
+const SCANNED_NAME = /^\.env(\..*)?$|\.env$|^\.mcp\.json$|^\.npmrc$/;
+const PRIVATE_KEY = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
 const CREDENTIAL_PATTERNS = [
     /\bwm[xt]_[A-Za-z0-9_-]{8,}/,
     /authorization["']?\s*[:=]\s*["']?\s*bearer\s+[A-Za-z0-9._~+/=-]{8,}/i,
     /extraheader\s*=\s*authorization/i,
     /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@"']+:[^\s/@"']+@/i,
+    // A token as the whole userinfo (https://ghp_…@github.com); a short user name such as git@ is not one.
+    /\bhttps?:\/\/[^\s/:@"']{16,}@/i,
+    PRIVATE_KEY,
 ];
+/** Git config (the project's, a submodule's, a worktree's): credential helpers and extra HTTP headers. */
+const GIT_CONFIG = /\/\.git\/(?:.+\/)?config(?:\.worktree)?$/;
+const GIT_CONFIG_PATTERNS = [/^\s*(?:helper|extraheader)\s*=/im];
+const NPMRC_PATTERNS = [/(?:^|:)_(?:authToken|auth|password)\s*=/m];
 /** A base64url JSON payload with a signature segment: caller grants, connector capabilities, JWTs. */
 const SIGNED_TOKEN = /\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g;
 
 const within = (root: string, path: string) => path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`);
 
-function containsCredential(text: string): boolean {
-    if (CREDENTIAL_PATTERNS.some(pattern => pattern.test(text))) return true;
+function containsCredential(text: string, patterns: readonly RegExp[] = CREDENTIAL_PATTERNS): boolean {
+    if (patterns.some(pattern => pattern.test(text))) return true;
     for (const match of text.matchAll(SIGNED_TOKEN)) {
         try {
             const payload = JSON.parse(Buffer.from(match[0].split('.')[0], 'base64url').toString('utf8'));
@@ -80,13 +99,29 @@ function containsCredential(text: string): boolean {
     return false;
 }
 
+const credentialFound = (path: string) => new Error(`Credential material found in ${path}; remove it before exporting`);
+
 async function assertNoCredential(path: string): Promise<void> {
+    const patterns = [...CREDENTIAL_PATTERNS, ...(GIT_CONFIG.test(path) ? GIT_CONFIG_PATTERNS : []),
+        ...(basename(path) === '.npmrc' ? NPMRC_PATTERNS : [])];
     // Overlap keeps a token split across two reads whole (tokens are capped at 4 KiB).
     let carry = '';
     for await (const chunk of createReadStream(path, { encoding: 'utf8', highWaterMark: 1024 * 1024 })) {
         const text = carry + (chunk as string);
-        if (containsCredential(text)) throw new Error(`Credential material found in ${path}; remove it before exporting`);
+        if (containsCredential(text, patterns)) throw credentialFound(path);
         carry = text.slice(-8192);
+    }
+}
+
+/** Key files (id_rsa, *.pem, *.key) open with their PEM header; the rest of an unscanned file is not read. */
+async function assertNotPrivateKey(path: string): Promise<void> {
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+        const head = Buffer.alloc(4096);
+        const { bytesRead } = await file.read(head, 0, head.length, 0);
+        if (PRIVATE_KEY.test(head.subarray(0, bytesRead).toString('latin1'))) throw credentialFound(path);
+    } finally {
+        await file.close();
     }
 }
 
@@ -116,7 +151,8 @@ async function collectTree(root: string, scanAll: boolean, entries: string[]): P
         // Sockets, FIFOs and devices belong to running processes, pid and Git lock files to dead ones.
         if (!info.isFile() || name.endsWith('.pid') || LOGIN_FILES.has(name)
             || (name.endsWith('.lock') && path.includes('/.git/'))) return;
-        if (scanAll || SCANNED_NAME.test(name) || path.endsWith('/.git/config')) await assertNoCredential(path);
+        if (scanAll || SCANNED_NAME.test(name) || GIT_CONFIG.test(path)) await assertNoCredential(path);
+        else await assertNotPrivateKey(path);
         entries.push(path);
     };
     await visit(root);
@@ -168,12 +204,33 @@ async function providerRoots(input: {
     return { session: { provider: 'codex', nativeId: codexThreadId! }, roots: matches };
 }
 
+/**
+ * The session's record as its process left it. The daemon's copy can trail the process by 30 s and
+ * counts input delivered to the loop, not input a turn ran; a session with no stop record, or one
+ * that stopped mid-turn, cannot say which input ran, and is never guessed at.
+ */
+async function stoppedRecord(happyHome: string, sessionId: string, stored: unknown): Promise<unknown> {
+    const stop = await readWorkMachineSessionStop(workMachineSessionStopPath(happyHome, sessionId), sessionId);
+    const drainLonger = 'Cancel the migration (resume) so the session can finish, then drain longer before freezing and exporting again';
+    if (!stop) {
+        throw new Error(`Session ${sessionId} has no clean-stop record: its process is still running or did not stop cleanly. ${drainLonger}`);
+    }
+    if (stop.turnInFlight) throw new Error(`Session ${sessionId} was stopped while a turn was still running. ${drainLonger}`);
+    if (stop.inputSkipped) throw new Error(`Session ${sessionId} stopped with an input that never started a turn before a later one did. ${drainLonger}`);
+    const record = z.object({ metadata: z.object({}).passthrough() }).passthrough().safeParse(stored);
+    if (!record.success) return stored;
+    const metadata = withReportedProviderIdentity(record.data.metadata, stop) ?? record.data.metadata;
+    return { ...record.data, metadata, lastProcessedSeq: stop.lastProcessedSeq };
+}
+
 export async function selectWorkMachineTransfer(input: {
     happyHome: string;
     claudeConfigDir: string;
     codexHome: string;
     projectPaths: string[];
     sessionIds: string[];
+    /** False only for the dry run (`export --check`), which runs while the sessions still do. */
+    requireStopRecords: boolean;
 }): Promise<WorkMachineTransferSelection> {
     const homes = [input.happyHome, input.claudeConfigDir, input.codexHome];
     for (const path of input.projectPaths) {
@@ -189,13 +246,20 @@ export async function selectWorkMachineTransfer(input: {
         .filter((path, index, all) => !all.slice(0, index).some(outer => within(outer, path)));
 
     const stored = await readSessionRecords(input.happyHome);
+    // Every conversation on this machine travels or is archived: one left out would not open on the target.
+    const planned = new Set(input.sessionIds);
+    const unplanned = Object.keys(stored).filter(sessionId => !planned.has(sessionId) && !archivedRecord.safeParse(stored[sessionId]).success).sort();
+    if (unplanned.length) {
+        throw new Error(`Sessions on this machine are missing from the transfer plan: ${unplanned.join(', ')}. Add them to the plan or archive them before exporting`);
+    }
     const records: Record<string, unknown> = {};
     const sessions: WorkMachineTransferSession[] = [];
     const providerPaths: string[] = [];
     for (const sessionId of [...new Set(input.sessionIds)].sort()) {
         identifier.parse(sessionId);
         if (!(sessionId in stored)) throw new Error(`Session ${sessionId} has no recovery record on this machine`);
-        const parsed = recordSchema.safeParse(stored[sessionId]);
+        const record = input.requireStopRecords ? await stoppedRecord(input.happyHome, sessionId, stored[sessionId]) : stored[sessionId];
+        const parsed = recordSchema.safeParse(record);
         if (!parsed.success) {
             throw new Error(`Session ${sessionId} is not transferable: it needs a dataKey record with a processed cursor and no staged user home`);
         }
@@ -212,7 +276,7 @@ export async function selectWorkMachineTransfer(input: {
         });
         sessions.push({ sessionId, ...provider.session, lastProcessedSeq });
         providerPaths.push(...provider.roots);
-        records[sessionId] = stored[sessionId];
+        records[sessionId] = record;
     }
     if (containsCredential(JSON.stringify(records))) {
         throw new Error(`Credential material found in ${join(input.happyHome, 'sessions.json')}; remove it before exporting`);

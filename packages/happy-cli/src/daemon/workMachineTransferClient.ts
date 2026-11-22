@@ -120,13 +120,19 @@ export function openWorkMachineTransfer(input: {
         restored: (body: { deviceId: string; dataEncryptionKey: string; proof: WorkMachineDeviceProof; manifestSha256: string }) =>
             retry('Studio restored report', async () => { await (await studio('POST', 'restored', body)).body?.cancel(); }),
 
-        /** Uploads one byte range of `file`, unless the store already holds it (same size, and same MD5 ETag when given). */
+        /**
+         * Uploads one byte range of `file`, unless the store already holds it: same size and a digest
+         * of those bytes, an MD5 ETag or a sha256 checksum. A store that reports neither (an opaque
+         * ETag under SSE-KMS or multipart) gets the part again: an old part of the same size would
+         * otherwise stay and fail every import.
+         */
         uploadPart: (part: WorkMachinePart & { file: string; start: number; md5: string }) => retry(`Upload of part ${part.n}`, async () => {
             const head = await request(await presign(part.n, { method: 'HEAD' }), { method: 'HEAD', redirect: 'error' }).catch(() => null);
             const etag = head?.headers.get('etag')?.replace(/^W\//, '').replace(/"/g, '');
-            if (head?.ok && Number(head.headers.get('content-length')) === part.size && (!etag || !/^[a-f0-9]{32}$/.test(etag) || etag === part.md5)) {
-                return 'skipped' as const;
-            }
+            const sha256 = head?.headers.get('x-amz-checksum-sha256');
+            const vouched = (!!etag && /^[a-f0-9]{32}$/.test(etag) && etag === part.md5)
+                || (!!sha256 && Buffer.from(sha256, 'base64').toString('hex') === part.sha256);
+            if (head?.ok && Number(head.headers.get('content-length')) === part.size && vouched) return 'skipped' as const;
             const target = await presign(part.n, { method: 'PUT', size: part.size, sha256: part.sha256 });
             const source = createReadStream(part.file, { start: part.start, end: part.start + part.size - 1 });
             try {

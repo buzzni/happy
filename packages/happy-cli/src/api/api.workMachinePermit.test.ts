@@ -22,6 +22,10 @@ describe('work machine session execution permit', () => {
             received.push({ sessionId: request.params.sessionId, authorization: request.headers.authorization });
             return reply.code(204).send();
         });
+        app.post<{ Params: { sessionId: string } }>('/v1/sessions/:sessionId/push-event', async (request, reply) => {
+            received.push({ sessionId: request.params.sessionId, authorization: request.headers.authorization });
+            return reply.send({ success: true, push: { status: 'sent' } });
+        });
         await app.listen({ port: 0, host: '127.0.0.1' });
         originalUrl = configuration.serverUrl;
         const address = app.server.address();
@@ -40,5 +44,15 @@ describe('work machine session execution permit', () => {
 
         await expect(api.permitWorkMachineSessionExecution()).resolves.toBeUndefined();
         expect(received).toEqual([{ sessionId: 'protected-session', authorization: 'Bearer wmx_session_token_for_tests' }]);
+    });
+
+    // The server takes only the conversation's own session credential for a protected conversation's push.
+    it('sends a protected conversation\'s push with its session credential', async () => {
+        const initial = { token: 'wmx_session_token_for_tests', expiresAt: Date.now() + 60_000 };
+        const api = ApiClient.workMachineSession({ sessionId: 'protected-session', initial, renew: async () => initial });
+
+        api.push().sendSessionNotification({ kind: 'done', metadata: null, data: { sessionId: 'protected-session', type: 'ready' } });
+
+        await expect.poll(() => received).toEqual([{ sessionId: 'protected-session', authorization: 'Bearer wmx_session_token_for_tests' }]);
     });
 });

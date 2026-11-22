@@ -10,8 +10,9 @@ import { getProjectPath } from '@/claude/utils/path';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
 import { getWorkMachineDeviceId, saveWorkMachineExecutionBinding, workMachineSigningIdentity } from './workMachineCredential';
 import {
-    createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
+    assertWorkMachineTargetHome, checkWorkMachineExport, createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
 } from './workMachineMigration';
+import { workMachineSessionStopPath, writeWorkMachineSessionStop } from './workMachineSessionStop';
 
 const machineId = 'logical-machine';
 const accountId = 'test-account';
@@ -36,6 +37,8 @@ class FakeStudio {
     puts = new Map<number, number>();
     failPuts = new Map<number, number>();
     tamperGet = new Set<number>();
+    /** What HEAD reports as the object's digest: an MD5 ETag (S3 single PUT), an opaque one, or opaque plus a sha256 checksum. */
+    headDigest: 'md5' | 'opaque' | 'opaque-sha256' = 'md5';
     manifest: { manifestB64: string; proof: unknown } | null = null;
     restored: Record<string, unknown> | null = null;
 
@@ -68,8 +71,9 @@ class FakeStudio {
                 return { status: 200 };
             }
             if (!stored) return { status: 404 };
-            const etag = `"${createHash('md5').update(stored).digest('hex')}"`;
-            if (req.method === 'HEAD') return { status: 200, headers: { 'content-length': String(stored.length), etag } };
+            const etag = this.headDigest === 'md5' ? `"${createHash('md5').update(stored).digest('hex')}"` : '"opaque-etag-1"';
+            const checksum: Record<string, string> = this.headDigest === 'opaque-sha256' ? { 'x-amz-checksum-sha256': createHash('sha256').update(stored).digest('base64') } : {};
+            if (req.method === 'HEAD') return { status: 200, headers: { 'content-length': String(stored.length), etag, ...checksum } };
             const body = Buffer.from(stored);
             if (this.tamperGet.has(n)) body[body.length - 1] ^= 1;
             return { status: 200, body, headers: { 'content-length': String(body.length) } };
@@ -131,6 +135,12 @@ async function machinesFixture(root: string, studio: FakeStudio) {
     });
     const sessions = { 'claude-session': record('claudeSessionId', claudeId, 7), 'codex-session': record('codexThreadId', codexId, 9) };
     await writeFile(join(sourceHome, 'sessions.json'), JSON.stringify({ sessions }), { mode: 0o600 });
+    // Both session processes stopped cleanly between turns (workMachineSessionStop.ts).
+    for (const [sessionId, lastProcessedSeq, provider] of [['claude-session', 7, { claudeSessionId: claudeId }], ['codex-session', 9, { codexThreadId: codexId }]] as const) {
+        writeWorkMachineSessionStop(workMachineSessionStopPath(sourceHome, sessionId), {
+            v: 1, sessionId, cleanStop: true, stoppedAt: 1_000, lastProcessedSeq, turnInFlight: false, inputSkipped: false, ...provider,
+        });
+    }
     const sourceDeviceId = await getWorkMachineDeviceId(sourceHome, machineId);
     await saveWorkMachineExecutionBinding(sourceHome, { accountId, machineId, generation, deviceId: sourceDeviceId, serverOrigin: 'https://happy.invalid' });
 
@@ -239,6 +249,23 @@ describe('work machine export and import over the Studio transfer API', () => {
         expect(studio.restored).toEqual(restored);
     });
 
+    it('checks the export during drain without stop records, uploads or a saved seal', async () => {
+        const fixture = await machinesFixture(root, studio);
+        await rm(join(fixture.sourceHome, 'work-machine-sessions'), { recursive: true });
+
+        const checked = await checkWorkMachineExport(fixture.exportInput);
+
+        expect(checked).toEqual({ sessions: ['claude-session', 'codex-session'], paths: [fixture.project, fixture.claudeRecord, fixture.codexRecord].sort() });
+        expect(studio.puts.size).toBe(0);
+        expect(studio.manifest).toBeNull();
+        await expect(lstat(join(fixture.sourceHome, 'work-machine-transfer', jobId, 'export'))).rejects.toMatchObject({ code: 'ENOENT' });
+
+        await writeFile(join(fixture.project, '.npmrc'), '//registry.npmjs.org/:_authToken=npm_secretvalue\n');
+        const failure = await checkWorkMachineExport(fixture.exportInput).catch((error: Error) => error);
+        expect((failure as Error).message).toContain(join(fixture.project, '.npmrc'));
+        expect((failure as Error).message).not.toContain('npm_secretvalue');
+    });
+
     it('resumes an interrupted upload without sending verified parts again', async () => {
         const fixture = await machinesFixture(root, studio);
         studio.failPuts.set(1, 100);
@@ -253,6 +280,22 @@ describe('work machine export and import over the Studio transfer API', () => {
         await fixture.vacateSource();
         await importWorkMachine(fixture.importInput);
         expect(await readFile(join(fixture.project, 'draft.txt'), 'utf8')).toBe('untracked\n');
+    });
+
+    // Medium 14: a store whose ETag is not an MD5 (SSE-KMS, multipart) cannot vouch for a part by size alone.
+    it.each([
+        ['an opaque ETag', 'opaque', 2],
+        ['an opaque ETag with a matching sha256 checksum', 'opaque-sha256', 1],
+    ] as const)('re-uploads a part the store reports with %s only when it cannot vouch for its bytes', async (_label, headDigest, putsOfPart0) => {
+        const fixture = await machinesFixture(root, studio);
+        studio.headDigest = headDigest;
+        studio.failPuts.set(1, 100);
+        await expect(exportWorkMachine(fixture.exportInput)).rejects.toThrow('part 1');
+        studio.failPuts.clear();
+
+        await exportWorkMachine(fixture.exportInput);
+
+        expect(studio.puts.get(0)).toBe(putsOfPart0);
     });
 
     it('rejects a tampered part and places nothing', async () => {
@@ -301,6 +344,31 @@ describe('work machine export and import over the Studio transfer API', () => {
         expect(studio.restored).toBeNull();
     });
 
+    it('refuses a receipt length past its bound before allocating it', async () => {
+        const fixture = await machinesFixture(root, studio);
+        await exportWorkMachine(fixture.exportInput);
+        await fixture.vacateSource();
+        // Within the object, so only the bound stops it: a source may claim up to the whole 32 GiB.
+        const length = Buffer.alloc(4);
+        length.writeUInt32BE(100 * 1024);
+        const object = Buffer.concat([randomBytes(128 * 1024), length, Buffer.from('WMR1')]);
+        studio.objects.clear();
+        studio.objects.set('part-0', object);
+        const manifest = JSON.parse(Buffer.from(studio.manifest!.manifestB64, 'base64url').toString('utf8'));
+        Object.assign(manifest, { totalBytes: object.length, partSize: object.length, parts: [{ n: 0, size: object.length, sha256: createHash('sha256').update(object).digest('hex') }] });
+        const bytes = Buffer.from(JSON.stringify(manifest));
+        const keys = await loadOrCreateDeviceKeys(fixture.sourceHome, machineId);
+        const issuedAt = Date.now();
+        const message = Buffer.from(JSON.stringify(['happy-work-machine-export-v1', jobId, createHash('sha256').update(bytes).digest('base64url'), issuedAt]));
+        studio.manifest = {
+            manifestB64: bytes.toString('base64url'),
+            proof: { issuedAt, publicKey: workMachineSigningIdentity(keys.signing.publicKey).publicKey, signature: Buffer.from(nacl.sign.detached(message, keys.signing.secretKey)).toString('base64url') },
+        };
+
+        await expect(importWorkMachine(fixture.importInput)).rejects.toThrow('The transfer archive has no receipt');
+        await expect(lstat(fixture.project)).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+
     it('refuses to overwrite a path that already exists on the target', async () => {
         const fixture = await machinesFixture(root, studio);
         await exportWorkMachine(fixture.exportInput);
@@ -310,6 +378,39 @@ describe('work machine export and import over the Studio transfer API', () => {
         await expect(lstat(fixture.claudeRecord)).rejects.toMatchObject({ code: 'ENOENT' });
         await expect(lstat(join(fixture.targetHome, 'sessions.json'))).rejects.toMatchObject({ code: 'ENOENT' });
         expect(studio.restored).toBeNull();
+    });
+
+    // Medium 13: `happy auth login` on a fresh target PC writes a machine id of its own.
+    it('takes over a home whose only machine id is the one a plain login minted', async () => {
+        const fixture = await machinesFixture(root, studio);
+        await exportWorkMachine(fixture.exportInput);
+        await fixture.vacateSource();
+
+        await expect(assertWorkMachineTargetHome(fixture.targetHome, undefined, machineId)).resolves.toBeUndefined();
+        await expect(assertWorkMachineTargetHome(fixture.targetHome, 'login-minted-machine', machineId)).resolves.toBeUndefined();
+        await expect(importWorkMachine({ ...fixture.importInput, configuredMachineId: 'login-minted-machine' })).resolves.toMatchObject({ machineId });
+        // Once it holds sessions it is a machine of its own.
+        await expect(assertWorkMachineTargetHome(fixture.targetHome, 'login-minted-machine', machineId))
+            .rejects.toThrow('Another work machine is already configured in this home');
+    });
+
+    it('refuses a target home bound to another work machine or holding sessions, before placing anything', async () => {
+        const fixture = await machinesFixture(root, studio);
+        await exportWorkMachine(fixture.exportInput);
+        await fixture.vacateSource();
+        await writeFile(join(fixture.targetHome, 'sessions.json'), JSON.stringify({ sessions: { 'local-session': {} } }), { mode: 0o600 });
+
+        await expect(importWorkMachine({ ...fixture.importInput, configuredMachineId: 'login-minted-machine' }))
+            .rejects.toThrow('Another work machine is already configured in this home');
+        await expect(lstat(fixture.project)).rejects.toMatchObject({ code: 'ENOENT' });
+
+        await rm(join(fixture.targetHome, 'sessions.json'));
+        const otherDevice = await getWorkMachineDeviceId(fixture.targetHome, 'other-machine');
+        await saveWorkMachineExecutionBinding(fixture.targetHome, {
+            accountId, machineId: 'other-machine', generation: 1, deviceId: otherDevice, serverOrigin: 'https://happy.invalid',
+        });
+        await expect(assertWorkMachineTargetHome(fixture.targetHome, 'other-machine', machineId))
+            .rejects.toThrow('Another work machine is already configured in this home');
     });
 
     it('signs a restore proof with the original device for a new data key', async () => {
@@ -330,5 +431,43 @@ describe('work machine export and import over the Studio transfer API', () => {
         expect(after.token).toBe(before.token);
         expect(after.encryption.machineKey).not.toBe(before.encryption.machineKey);
         await expect(createWorkMachineRestoreProof({ home: fixture.sourceHome, machineId: 'another-machine', generation: 4 })).rejects.toThrow();
+    });
+
+    // Medium 14: a rerun after a lost answer must not replace the key the first proof names.
+    it('returns the same restore proof and key on a rerun for the same generation', async () => {
+        const fixture = await machinesFixture(root, studio);
+        await writeFile(join(fixture.sourceHome, 'access.key'), JSON.stringify({
+            token: 'source-account-token',
+            encryption: { publicKey: Buffer.from(nacl.box.keyPair().publicKey).toString('base64'), machineKey: randomBytes(32).toString('base64') },
+        }), { mode: 0o600 });
+        const first = await createWorkMachineRestoreProof({ home: fixture.sourceHome, machineId, generation: 4 });
+        const keyAfterFirst = await readFile(join(fixture.sourceHome, 'access.key'), 'utf8');
+
+        expect(await createWorkMachineRestoreProof({ home: fixture.sourceHome, machineId, generation: 4 })).toEqual(first);
+        expect(await readFile(join(fixture.sourceHome, 'access.key'), 'utf8')).toBe(keyAfterFirst);
+
+        const next = await createWorkMachineRestoreProof({ home: fixture.sourceHome, machineId, generation: 5 });
+        expect(next.dataEncryptionKey).not.toBe(first.dataEncryptionKey);
+    });
+
+    it.each(['import', 'restore-proof'] as const)('keeps the access.key fields it does not own when %s replaces the key', async (operation) => {
+        const fixture = await machinesFixture(root, studio);
+        const home = operation === 'import' ? fixture.targetHome : fixture.sourceHome;
+        const before = {
+            token: `${operation}-account-token`, futureField: { kept: true },
+            encryption: { publicKey: Buffer.from(nacl.box.keyPair().publicKey).toString('base64'), machineKey: randomBytes(32).toString('base64'), neverEscrowed: true },
+        };
+        await writeFile(join(home, 'access.key'), JSON.stringify(before), { mode: 0o600 });
+        if (operation === 'import') {
+            await exportWorkMachine(fixture.exportInput);
+            await fixture.vacateSource();
+            await importWorkMachine(fixture.importInput);
+        } else {
+            await createWorkMachineRestoreProof({ home, machineId, generation: 4 });
+        }
+
+        const after = JSON.parse(await readFile(join(home, 'access.key'), 'utf8'));
+        expect(after).toEqual({ ...before, encryption: { ...before.encryption, machineKey: expect.any(String) } });
+        expect(after.encryption.machineKey).not.toBe(before.encryption.machineKey);
     });
 });

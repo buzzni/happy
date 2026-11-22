@@ -5712,7 +5712,8 @@ export async function startDaemon(): Promise<void> {
       },
     }) : null;
     const questionWorker = contextHost && contextJournal && contextAccountId ? createAutomationQuestionWorker({
-      home: configuration.happyHomeDir, serverUrl: configuration.serverUrl, token: credentials.token,
+      // The current daemon credential: on a protected machine the wmx_ token, which renewals replace.
+      home: configuration.happyHomeDir, serverUrl: configuration.serverUrl, token: () => credentials.token,
       accountId: contextAccountId, machineId, journal: contextJournal, host: contextHost, runtimeStore: serverAutomationRuntimeStore,
       transport: apiMachine.serverAutomationTransport(), log: message => logger.warn(message),
       decode: question => trustedServerAutomationPayload({ automationId: question.automationId, generation: question.generation,
@@ -6297,7 +6298,8 @@ export async function startDaemon(): Promise<void> {
           const trackedSession = findTrackedSessionById(sessionId);
           if (!trackedSession?.encryption) return null;
           return createCheckpointEventPublisher({
-            token: credentials.token,
+            // A protected conversation takes only its own session credential for its events (fresh for this operation).
+            token: workMachine ? (await workMachine.device.renew(sessionId)).token : credentials.token,
             sessionId,
             encryption: trackedSession.encryption,
           });
@@ -6549,9 +6551,13 @@ export async function startDaemon(): Promise<void> {
           removeDeferredContinuationContextFile(dead.deferredContinuationContextFile);
         }
         if (dead.happySessionId) {
-          api.postSessionEvent(dead.happySessionId, 'session-end', '').catch((error) => {
-            logger.debug(`[DAEMON RUN] Failed to emit session-end for dead session ${dead.happySessionId}: ${error}`);
-          });
+          const deadSessionId = dead.happySessionId;
+          // A protected conversation takes only its own session credential for its events.
+          (workMachine ? workMachine.device.renew(deadSessionId).then(({ token }) => token) : Promise.resolve(undefined))
+            .then(token => api.postSessionEvent(deadSessionId, 'session-end', '', token))
+            .catch((error) => {
+              logger.debug(`[DAEMON RUN] Failed to emit session-end for dead session ${deadSessionId}: ${error}`);
+            });
         }
       }
     }

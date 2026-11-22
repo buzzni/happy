@@ -7,6 +7,7 @@ import { z } from 'zod';
 import { replacePrivateFile } from '@/persistence';
 import { credentialFileLockPath, withCredentialLock } from '@/utils/credentialLock';
 import { loadOrCreateDeviceKeys, type DeviceKeys } from './deviceKeys';
+import { workMachineSessionStopPath } from './workMachineSessionStop';
 
 const identifier = z.string().min(1).max(200).regex(/^[a-zA-Z0-9_-]+$/);
 const ed25519SpkiPrefix = Buffer.from('302a300506032b6570032100', 'hex');
@@ -29,6 +30,8 @@ export type WorkMachineSessionCredentials = {
     sessionId: string;
     initial: WorkMachineCredential;
     renew: () => Promise<WorkMachineCredential>;
+    /** Where this process leaves its clean-stop record (workMachineSessionStop.ts). */
+    stopRecord?: string;
 };
 const bindingPath = (home: string) => join(home, 'work-machine-execution.json');
 
@@ -187,7 +190,7 @@ export async function openWorkMachineSessionCredentials(
     if (!sessionId) throw new Error('Work machine provider startup requires an existing session');
     const device = await openWorkMachineCredentials(home, serverUrl, binding, request);
     const renew = () => device.renew(sessionId);
-    return { sessionId, initial: await renew(), renew };
+    return { sessionId, initial: await renew(), renew, stopRecord: workMachineSessionStopPath(home, sessionId) };
 }
 
 export function watchWorkMachineCredential(input: {

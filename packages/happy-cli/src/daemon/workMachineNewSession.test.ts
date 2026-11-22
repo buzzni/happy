@@ -69,6 +69,25 @@ describe('prepareWorkMachineNewSession', () => {
         expect(post).not.toHaveBeenCalled();
     });
 
+    // Medium 14: a spawn whose answer was lost is retried; it must land on the conversation it created.
+    it('gives a retried spawn request the same tag and session key, and different requests their own', async () => {
+        const spawn = async (initialPromptLocalId?: string) => {
+            const result = await prepareWorkMachineNewSession({
+                protectedMachine: true, options: initialPromptLocalId ? { initialPromptLocalId } : {}, credentials: deviceCredentials, metadata,
+                persist: async () => true,
+            });
+            if (result.kind !== 'created') throw new Error(`expected created, got ${result.kind}`);
+            return { tag: (post.mock.calls.at(-1)![1] as { tag: string }).tag, key: Buffer.from(result.session.encryptionKey).toString('hex') };
+        };
+
+        const first = await spawn('local-prompt-1');
+        expect(await spawn('local-prompt-1')).toEqual(first);
+        const other = await spawn('local-prompt-2');
+        expect(other.tag).not.toBe(first.tag);
+        expect(other.key).not.toBe(first.key);
+        expect((await spawn()).tag).not.toBe((await spawn()).tag);
+    });
+
     it('refuses to start when the created conversation is not durably recorded', async () => {
         const result = await prepareWorkMachineNewSession({
             protectedMachine: true, options: {}, credentials: deviceCredentials, metadata, persist: async () => false,

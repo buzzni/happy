@@ -4,7 +4,8 @@
  *
  * - target-approval: the target binds a fresh per-job recipient key to its device signing key.
  * - export: on the stopped source, seals the planned selection with the existing archive envelope,
- *   uploads it in parts and submits the manifest the source device signs.
+ *   uploads it in parts and submits the manifest the source device signs. `--check` runs the same
+ *   selection and credential scan without stopping anything, sealing or uploading.
  * - import: on the target, verifies the manifest signature and every part, restores into staging,
  *   places the data at the same absolute paths without overwriting anything, writes the session
  *   recovery records, rotates the machine data key and reports the execution-replace proof.
@@ -12,7 +13,8 @@
  *
  * State lives in `HAPPY_HOME/work-machine-transfer/<jobId>/` (0700): the recipient key, the sealed
  * export with its part digests (a rerun resumes the same bytes), downloaded parts and the restore
- * report (a rerun re-sends it after a lost answer).
+ * report (a rerun re-sends it after a lost answer). Restore proofs are kept in
+ * `HAPPY_HOME/work-machine-restore/<machineId>-<generation>.json` for the same reason.
  *
  * Uploaded object = sealed archive ‖ receipt JSON ‖ uint32be(receipt length) ‖ "WMR1". The manifest
  * field list of plan 5.6 has no receipt, so it travels inside the signed part digests.
@@ -38,6 +40,8 @@ import { proveWorkMachineArchiveRecipient, restoreWorkMachineArchive, sealWorkMa
 
 export const WORK_MACHINE_PART_SIZE = 8 * 1024 ** 2;
 const RECEIPT_MAGIC = Buffer.from('WMR1');
+/** A receipt is a few KiB of JSON; the bound keeps a hostile length from sizing an allocation. */
+const MAX_RECEIPT_BYTES = 64 * 1024;
 const sha256Hex = z.string().regex(/^[a-f0-9]{64}$/);
 const deviceId = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const manifestSchema = z.object({
@@ -63,6 +67,11 @@ const exportStateSchema = manifestSchema.omit({ jobId: true, machineId: true, so
     .extend({ md5: z.array(z.string()) });
 const recipientFileSchema = z.object({ approval: z.unknown(), recipientSecret: z.string() });
 const restoredSchema = z.object({ deviceId, dataEncryptionKey: z.string(), proof: z.unknown(), manifestSha256: sha256Hex });
+const restoreProofSchema = z.object({
+    deviceId, dataEncryptionKey: z.string(),
+    proof: z.object({ issuedAt: z.number(), publicKey: z.string(), signature: z.string() }),
+    machineKeySha256: sha256Hex,
+});
 
 type TransferEndpoint = {
     home: string;
@@ -115,15 +124,28 @@ function signScope(keys: DeviceKeys, scope: (issuedAt: number) => unknown[]): Wo
     };
 }
 
+const accessKeySchema = z.object({ encryption: z.object({ machineKey: z.string() }).passthrough() }).passthrough();
+/** Names the machine key in access.key without keeping a copy of it. */
+async function machineKeyDigest(home: string): Promise<string | null> {
+    const stored = accessKeySchema.safeParse(await readJson(join(home, 'access.key')));
+    return stored.success ? createHash('sha256').update(stored.data.encryption.machineKey).digest('hex') : null;
+}
+
 /**
  * Replaces this home's machine data key and returns the new envelope (base64, as machine
  * registration sends it: 105 bytes) with the proof-scope digest, base64url sha256 over those bytes.
+ * Only `encryption.machineKey` changes: the token, `neverEscrowed` (the new key goes to the
+ * account key alone, never to the server) and any field a newer CLI added stay as they were.
  * The previous access.key is kept once beside it.
  */
 async function rotateMachineDataKey(home: string, backupSuffix: string): Promise<{ dataEncryptionKey: string; digest: string }> {
     const accessKey = join(home, 'access.key');
-    const credentials = parseCredentials(await readJson(accessKey));
-    if (credentials?.encryption.type !== 'dataKey') throw new Error('This home needs a dataKey account login (access.key) to rotate the machine data key');
+    const raw = await readJson(accessKey);
+    const credentials = parseCredentials(raw);
+    const stored = accessKeySchema.safeParse(raw);
+    if (credentials?.encryption.type !== 'dataKey' || !stored.success) {
+        throw new Error('This home needs a dataKey account login (access.key) to rotate the machine data key');
+    }
     await copyFile(accessKey, `${accessKey}.before-${backupSuffix}`, constants.COPYFILE_EXCL).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== 'EEXIST') throw error;
     });
@@ -131,8 +153,7 @@ async function rotateMachineDataKey(home: string, backupSuffix: string): Promise
     try {
         const envelope = wrapDataEncryptionKey(machineKey, credentials.encryption.publicKey);
         await replacePrivateFile(accessKey, JSON.stringify({
-            encryption: { publicKey: encodeBase64(credentials.encryption.publicKey), machineKey: encodeBase64(machineKey) },
-            token: credentials.token,
+            ...stored.data, encryption: { ...stored.data.encryption, machineKey: encodeBase64(machineKey) },
         }, null, 2));
         return { dataEncryptionKey: encodeBase64(envelope), digest: createHash('sha256').update(envelope).digest('base64url') };
     } finally {
@@ -164,13 +185,8 @@ export async function createWorkMachineTargetApproval(input: {
     }
 }
 
-export async function exportWorkMachine(input: TransferEndpoint & {
-    claudeConfigDir: string;
-    codexHome: string;
-    /** Tests only; the contract is 8 MiB. */
-    partSize?: number;
-}): Promise<{ manifestSha256: string; totalBytes: number; parts: number }> {
-    const client = openWorkMachineTransfer(input);
+/** The Studio plan, checked against this home's execution binding: this must be its source. */
+async function sourcePlan(client: ReturnType<typeof openWorkMachineTransfer>, input: TransferEndpoint) {
     const plan = await client.plan();
     const binding = await readWorkMachineExecutionBinding(input.home);
     if (plan.jobId !== input.jobId || !binding || binding.machineId !== plan.machineId || binding.generation !== plan.generation) {
@@ -181,6 +197,31 @@ export async function exportWorkMachine(input: TransferEndpoint & {
         || approval.sourceDeviceId !== binding.deviceId) {
         throw new Error('The target approval in the plan is for a different job, machine, generation or source device');
     }
+    return { plan, binding, approval };
+}
+
+/**
+ * `export --check`: the export's selection and credential scan while the source still runs (during
+ * drain), so a blocker shows before freeze. Nothing is sealed, uploaded or signed, and the sessions'
+ * stop records are not required yet: they exist only once the session processes have stopped.
+ */
+export async function checkWorkMachineExport(input: TransferEndpoint & { claudeConfigDir: string; codexHome: string }): Promise<{ sessions: string[]; paths: string[] }> {
+    const { plan } = await sourcePlan(openWorkMachineTransfer(input), input);
+    const selection = await selectWorkMachineTransfer({
+        happyHome: input.home, claudeConfigDir: input.claudeConfigDir, codexHome: input.codexHome,
+        projectPaths: plan.projectPaths, sessionIds: plan.sessions.map(session => session.sessionId), requireStopRecords: false,
+    });
+    return { sessions: selection.sessions.map(session => session.sessionId), paths: selection.roots };
+}
+
+export async function exportWorkMachine(input: TransferEndpoint & {
+    claudeConfigDir: string;
+    codexHome: string;
+    /** Tests only; the contract is 8 MiB. */
+    partSize?: number;
+}): Promise<{ manifestSha256: string; totalBytes: number; parts: number }> {
+    const client = openWorkMachineTransfer(input);
+    const { plan, binding, approval } = await sourcePlan(client, input);
 
     const directory = await jobDirectory(input.home, input.jobId, 'export');
     const sealed = join(directory, 'transfer.bin');
@@ -193,7 +234,7 @@ export async function exportWorkMachine(input: TransferEndpoint & {
         await mkdir(directory, { mode: 0o700 });
         const selection = await selectWorkMachineTransfer({
             happyHome: input.home, claudeConfigDir: input.claudeConfigDir, codexHome: input.codexHome,
-            projectPaths: plan.projectPaths, sessionIds: plan.sessions.map(session => session.sessionId),
+            projectPaths: plan.projectPaths, sessionIds: plan.sessions.map(session => session.sessionId), requireStopRecords: true,
         });
         const recordsFile = join(directory, 'records.json');
         await writeFile(recordsFile, JSON.stringify(selection.records), { mode: 0o600, flag: 'wx' });
@@ -267,6 +308,17 @@ async function readSessionStore(home: string): Promise<Record<string, unknown> &
     const parsed = z.object({ sessions: z.record(z.string(), z.unknown()) }).passthrough().safeParse(stored);
     if (!parsed.success) throw new Error('This home has an unreadable session store');
     return parsed.data;
+}
+
+/**
+ * A target home may take the logical machine id when it has none, the same one, or only the id a
+ * plain `happy auth login` minted: no work machine binding and no sessions of its own.
+ */
+export async function assertWorkMachineTargetHome(home: string, configuredMachineId: string | undefined, machineId: string): Promise<void> {
+    if (!configuredMachineId || configuredMachineId === machineId) return;
+    if (await readWorkMachineExecutionBinding(home) || Object.keys((await readSessionStore(home)).sessions).length) {
+        throw new Error('Another work machine is already configured in this home');
+    }
 }
 
 async function assertNothingToOverwrite(home: string, manifest: Manifest): Promise<void> {
@@ -360,7 +412,7 @@ async function downloadArchive(client: ReturnType<typeof openWorkMachineTransfer
         await handle.read(trailer, 0, 8, manifest.totalBytes - 8);
         const length = trailer.readUInt32BE(0);
         sealedBytes = manifest.totalBytes - 8 - length;
-        if (!trailer.subarray(4).equals(RECEIPT_MAGIC) || sealedBytes <= 0) throw new Error('The transfer archive has no receipt');
+        if (!trailer.subarray(4).equals(RECEIPT_MAGIC) || sealedBytes <= 0 || length > MAX_RECEIPT_BYTES) throw new Error('The transfer archive has no receipt');
         const receiptBytes = Buffer.alloc(length);
         await handle.read(receiptBytes, 0, length, sealedBytes);
         receipt = JSON.parse(receiptBytes.toString('utf8'));
@@ -372,7 +424,12 @@ async function downloadArchive(client: ReturnType<typeof openWorkMachineTransfer
     return { sealed, receipt };
 }
 
-export async function importWorkMachine(input: TransferEndpoint & { claudeConfigDir: string; codexHome: string }): Promise<{ machineId: string; deviceId: string; manifestSha256: string }> {
+export async function importWorkMachine(input: TransferEndpoint & {
+    claudeConfigDir: string;
+    codexHome: string;
+    /** This home's settings.machineId; the caller replaces it with the imported one afterwards. */
+    configuredMachineId?: string;
+}): Promise<{ machineId: string; deviceId: string; manifestSha256: string }> {
     const client = openWorkMachineTransfer(input);
     const directory = await jobDirectory(input.home, input.jobId);
     const recipientFile = recipientFileSchema.safeParse(await readJson(join(directory, 'recipient.json')));
@@ -392,6 +449,7 @@ export async function importWorkMachine(input: TransferEndpoint & { claudeConfig
     const { manifest, sha256 } = verifiedManifest(await client.manifest(), approval, input.jobId);
     const placedPath = join(importDirectory, 'placed.json');
     if (!await exists(placedPath)) {
+        await assertWorkMachineTargetHome(input.home, input.configuredMachineId, approval.machineId);
         await assertNothingToOverwrite(input.home, manifest);
         await assertDiskSpace(importDirectory, manifest);
         const { sealed, receipt } = await downloadArchive(client, manifest, importDirectory);
@@ -432,18 +490,37 @@ export async function importWorkMachine(input: TransferEndpoint & { claudeConfig
     return { machineId: approval.machineId, deviceId: report.deviceId, manifestSha256: sha256 };
 }
 
+/**
+ * One restore proof per (machine, generation). The result is kept with a digest of the key it
+ * names, so a rerun after a lost answer returns the same proof instead of replacing a key the
+ * operator may already have handed to the rollback. A crash before it is kept leaves a key nobody
+ * was given, which a rerun may replace.
+ */
 export async function createWorkMachineRestoreProof(input: { home: string; machineId: string; generation: number }) {
     const binding = await readWorkMachineExecutionBinding(input.home);
     if (!binding || binding.machineId !== input.machineId) throw new Error('This home is not the original device of that work machine');
+    const pendingDirectory = join(input.home, 'work-machine-restore');
+    await mkdir(pendingDirectory, { recursive: true, mode: 0o700 });
+    const pendingPath = join(pendingDirectory, `${workMachineIdentifier.parse(input.machineId)}-${input.generation}.json`);
+    const pending = restoreProofSchema.safeParse(await readJson(pendingPath));
+    if (pending.success) {
+        const { machineKeySha256, ...proof } = pending.data;
+        if (machineKeySha256 !== await machineKeyDigest(input.home)) {
+            throw new Error(`The machine data key changed after the restore proof for generation ${input.generation} was made`);
+        }
+        return proof;
+    }
     return withDeviceKeys(input.home, input.machineId, async keys => {
         if (workMachineSigningIdentity(keys.signing.publicKey).deviceId !== binding.deviceId) {
             throw new Error('This home no longer holds the original device key');
         }
         const { dataEncryptionKey, digest } = await rotateMachineDataKey(input.home, `work-machine-restore-${input.generation}`);
-        return {
+        const proof = {
             deviceId: binding.deviceId,
             dataEncryptionKey,
             proof: signScope(keys, issuedAt => ['happy-work-machine-restore-v1', input.machineId, input.generation, binding.deviceId, digest, issuedAt]),
         };
+        await replacePrivateFile(pendingPath, JSON.stringify({ ...proof, machineKeySha256: await machineKeyDigest(input.home) }));
+        return proof;
     });
 }

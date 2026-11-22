@@ -7,34 +7,38 @@ import {
     workMachineExecutionBindingSchema,
 } from '@/daemon/workMachineCredential';
 import {
-    createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
+    assertWorkMachineTargetHome, checkWorkMachineExport, createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
 } from '@/daemon/workMachineMigration';
-import { readCredentials, readSettings, updateSettings } from '@/persistence';
+import { stopTrackedSessionProcesses } from '@/daemon/workMachineSessionStop';
+import { readCredentials, readDaemonState, readSettings, updateSettings } from '@/persistence';
 
 const USAGE = [
     'Usage: happy work-machine prepare <machineId>',
     '       happy work-machine bind <machineId> <accountId> <generation>',
     '       happy work-machine target-approval <machineId> <jobId> <expiresAt> --account <accountId> --generation <n> --source-device <deviceId> [--max-bytes <n>]',
-    '       happy work-machine export --studio <url> --job <jobId> --token <wmt_…>',
-    '       happy work-machine import --studio <url> --job <jobId> --token <wmt_…>',
+    '       happy work-machine export --studio <url> --job <jobId> [--token <wmt_…>] [--check]',
+    '       happy work-machine import --studio <url> --job <jobId> [--token <wmt_…>]',
+    '       (the transfer token may come from HAPPY_WORK_MACHINE_TRANSFER_TOKEN instead, keeping it out of argv)',
     '       happy work-machine restore-proof <machineId> <current generation>',
 ].join('\n');
 /** The envelope's single-archive ceiling. */
 const MAX_ARCHIVE_BYTES = 32 * 1024 ** 3;
 
-/** Positional arguments and `--name value` options; anything else is a usage error. */
-function parseArguments(args: string[], allowed: string[]): { positional: string[]; options: Record<string, string> } {
+/** Positional arguments, `--name value` options and bare `--flag`s; anything else is a usage error. */
+function parseArguments(args: string[], allowed: string[], allowedFlags: string[] = []) {
     const positional: string[] = [];
     const options: Record<string, string> = {};
+    const flags = new Set<string>();
     for (let index = 0; index < args.length; index += 1) {
         const name = args[index].startsWith('--') ? args[index].slice(2) : null;
         if (name === null) { positional.push(args[index]); continue; }
+        if (allowedFlags.includes(name) && !flags.has(name)) { flags.add(name); continue; }
         const value = args[index + 1];
         if (!allowed.includes(name) || value === undefined || name in options) throw new Error(USAGE);
         options[name] = value;
         index += 1;
     }
-    return { positional, options };
+    return { positional, options, flags };
 }
 
 const positiveInteger = (value: string | undefined) => {
@@ -68,8 +72,7 @@ export async function handleWorkMachineCommand(args: string[]): Promise<void> {
         const { positional, options } = parseArguments(rest, ['account', 'generation', 'source-device', 'max-bytes']);
         const [targetMachineId, jobId, expiresAt] = positional;
         if (positional.length !== 3 || !options.account || !options['source-device']) throw new Error(USAGE);
-        const settings = await readSettings({ strict: true });
-        if (settings.machineId && settings.machineId !== targetMachineId) throw new Error('Another work machine is already configured in this home');
+        await assertWorkMachineTargetHome(happyHomeDir, (await readSettings({ strict: true })).machineId, targetMachineId);
         const expiry = /^\d+$/.test(expiresAt) ? Number(expiresAt) : Date.parse(expiresAt);
         console.log(JSON.stringify(await createWorkMachineTargetApproval({
             home: happyHomeDir, machineId: targetMachineId, jobId, accountId: options.account,
@@ -80,19 +83,25 @@ export async function handleWorkMachineCommand(args: string[]): Promise<void> {
         return;
     }
     if (operation === 'export' || operation === 'import') {
-        const { positional, options } = parseArguments(rest, ['studio', 'job', 'token']);
-        if (positional.length || !options.studio || !options.job || !options.token) throw new Error(USAGE);
+        const { positional, options, flags } = parseArguments(rest, ['studio', 'job', 'token'], operation === 'export' ? ['check'] : []);
+        const token = options.token ?? process.env.HAPPY_WORK_MACHINE_TRANSFER_TOKEN;
+        if (positional.length || !options.studio || !options.job || !token) throw new Error(USAGE);
+        const endpoint = { home: happyHomeDir, studioUrl: options.studio, jobId: options.job, token, ...providerHomes() };
+        // A dry run while the source still drains: nothing is stopped, sealed or uploaded.
+        if (flags.has('check')) {
+            console.log(JSON.stringify(await checkWorkMachineExport(endpoint)));
+            return;
+        }
         await requireStoppedDaemon(operation === 'export' ? 'exporting this work machine' : 'importing a work machine');
-        const endpoint = { home: happyHomeDir, studioUrl: options.studio, jobId: options.job, token: options.token, ...providerHomes() };
         if (operation === 'export') {
+            // Its sessions outlive the daemon; each leaves its clean-stop record as it exits.
+            await stopTrackedSessionProcesses((await readDaemonState())?.trackedSessions ?? []);
             console.log(JSON.stringify(await exportWorkMachine(endpoint)));
             return;
         }
-        const imported = await importWorkMachine(endpoint);
-        await updateSettings(current => {
-            if (current.machineId && current.machineId !== imported.machineId) throw new Error('Another work machine is already configured in this home');
-            return { ...current, machineId: imported.machineId };
-        }, { strict: true });
+        // The import checked this home before placing anything (assertWorkMachineTargetHome).
+        const imported = await importWorkMachine({ ...endpoint, configuredMachineId: (await readSettings({ strict: true })).machineId });
+        await updateSettings(current => ({ ...current, machineId: imported.machineId }), { strict: true });
         console.log(JSON.stringify(imported));
         return;
     }

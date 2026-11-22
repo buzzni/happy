@@ -7,6 +7,7 @@ import { create as createTar } from 'tar';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { getProjectPath } from '@/claude/utils/path';
 import { extractWorkMachineArchive, packWorkMachineArchive, selectWorkMachineTransfer } from './workMachineTransferArchive';
+import { workMachineSessionStopPath, writeWorkMachineSessionStop, type WorkMachineSessionStop } from './workMachineSessionStop';
 
 const claudeId = '11111111-2222-4333-8444-555555555555';
 const codexId = '019a0000-0000-7000-8000-000000000001';
@@ -38,13 +39,21 @@ async function machineFixture(root: string) {
         metadataVersion: 1, agentStateVersion: 1, savedAt: 1,
         metadata: { path: project, host: 'source', [nativeField]: nativeId }, lastProcessedSeq,
     });
+    const archived = record('claudeSessionId', '99999999-2222-4333-8444-555555555555', 1);
     const sessions = {
         'claude-session': record('claudeSessionId', claudeId, 4),
         'codex-session': record('codexThreadId', codexId, 6),
-        'other-session': record('claudeSessionId', '99999999-2222-4333-8444-555555555555', 1),
+        // Archived on this machine: closed, so a plan that leaves it out does not block.
+        'other-session': { ...archived, metadata: { ...archived.metadata, lifecycleState: 'archived' } },
     };
     await writeFile(join(home, 'sessions.json'), JSON.stringify({ sessions }), { mode: 0o600 });
-    return { home, claudeConfigDir, codexHome, project, claudeRecord, codexRecord };
+    // What each planned session process left when it stopped (workMachineSessionStop.ts).
+    const stopped = (sessionId: string, fields: Partial<WorkMachineSessionStop>) => writeWorkMachineSessionStop(workMachineSessionStopPath(home, sessionId), {
+        v: 1, sessionId, cleanStop: true, stoppedAt: 1_000, lastProcessedSeq: 0, turnInFlight: false, inputSkipped: false, ...fields,
+    });
+    stopped('claude-session', { lastProcessedSeq: 4, claudeSessionId: claudeId });
+    stopped('codex-session', { lastProcessedSeq: 6, codexThreadId: codexId });
+    return { home, claudeConfigDir, codexHome, project, claudeRecord, codexRecord, stopped };
 }
 
 describe('work machine transfer archive selection', () => {
@@ -52,11 +61,13 @@ describe('work machine transfer archive selection', () => {
     beforeEach(async () => { root = await mkdtemp(join(tmpdir(), 'work-machine-archive-test-')); });
     afterEach(async () => { await rm(root, { recursive: true, force: true }); });
 
-    const select = (fixture: Awaited<ReturnType<typeof machineFixture>>, overrides: { projectPaths?: string[]; sessionIds?: string[] } = {}) =>
+    const select = (fixture: Awaited<ReturnType<typeof machineFixture>>,
+        overrides: { projectPaths?: string[]; sessionIds?: string[]; requireStopRecords?: boolean } = {}) =>
         selectWorkMachineTransfer({
             happyHome: fixture.home, claudeConfigDir: fixture.claudeConfigDir, codexHome: fixture.codexHome,
             projectPaths: overrides.projectPaths ?? [fixture.project],
             sessionIds: overrides.sessionIds ?? ['claude-session', 'codex-session'],
+            requireStopRecords: overrides.requireStopRecords ?? true,
         });
 
     it('selects project trees and the planned provider records but no logins, locks or pid files', async () => {
@@ -92,7 +103,55 @@ describe('work machine transfer archive selection', () => {
         stored.sessions['claude-session'].agentEnvironment = { SOME_GRANT: 'wmx_' + 'b'.repeat(40) };
         await writeFile(join(fixture.home, 'sessions.json'), JSON.stringify(stored), { mode: 0o600 });
         await expect(select(fixture)).rejects.toThrow(join(fixture.home, 'sessions.json'));
-        await expect(select(fixture, { sessionIds: ['codex-session'] })).resolves.toBeTruthy();
+    });
+
+    // Reviewer scenario (High 1): the daemon wrote seq 10 and stopped; the session ran seq 12 within the
+    // next 30 s and named its Claude conversation after that. The manifest carries what the session recorded.
+    it('carries the cursor and provider conversation the session recorded when it stopped, not the daemon\'s older write', async () => {
+        const fixture = await machineFixture(root);
+        const stored = JSON.parse(await readFile(join(fixture.home, 'sessions.json'), 'utf8'));
+        stored.sessions['claude-session'].lastProcessedSeq = 10;
+        delete stored.sessions['claude-session'].metadata.claudeSessionId;
+        await writeFile(join(fixture.home, 'sessions.json'), JSON.stringify(stored), { mode: 0o600 });
+        fixture.stopped('claude-session', { lastProcessedSeq: 12, claudeSessionId: claudeId });
+
+        const selection = await select(fixture);
+
+        expect(selection.sessions[0]).toEqual({ sessionId: 'claude-session', provider: 'claude', nativeId: claudeId, lastProcessedSeq: 12 });
+        expect(selection.records['claude-session']).toMatchObject({ lastProcessedSeq: 12, metadata: { claudeSessionId: claudeId } });
+    });
+
+    it('refuses a session whose process left no clean-stop record, and the dry run does not need one', async () => {
+        const fixture = await machineFixture(root);
+        await rm(workMachineSessionStopPath(fixture.home, 'codex-session'));
+
+        await expect(select(fixture)).rejects.toThrow(/codex-session has no clean-stop record.*cancel the migration/i);
+        await expect(select(fixture, { requireStopRecords: false })).resolves.toMatchObject({
+            sessions: [expect.objectContaining({ lastProcessedSeq: 4 }), expect.objectContaining({ lastProcessedSeq: 6 })],
+        });
+    });
+
+    it.each([
+        ['a turn was still running', { turnInFlight: true }],
+        ['an input never started while a later one did', { inputSkipped: true }],
+    ])('refuses a session whose stop record shows %s', async (_label, fields) => {
+        const fixture = await machineFixture(root);
+        fixture.stopped('codex-session', { lastProcessedSeq: 6, codexThreadId: codexId, ...fields });
+
+        await expect(select(fixture)).rejects.toThrow(/codex-session .*cancel the migration.*drain longer/i);
+    });
+
+    it('blocks the export naming every session on this machine the plan leaves out', async () => {
+        const fixture = await machineFixture(root);
+        const stored = JSON.parse(await readFile(join(fixture.home, 'sessions.json'), 'utf8'));
+        stored.sessions['unplanned-b'] = stored.sessions['claude-session'];
+        stored.sessions['unplanned-a'] = stored.sessions['codex-session'];
+        await writeFile(join(fixture.home, 'sessions.json'), JSON.stringify(stored), { mode: 0o600 });
+
+        const failure = await select(fixture).catch((error: Error) => error);
+        expect((failure as Error).message).toContain('unplanned-a, unplanned-b');
+        expect((failure as Error).message).not.toContain('other-session');
+        await expect(select(fixture, { requireStopRecords: false })).rejects.toThrow('unplanned-a, unplanned-b');
     });
 
     it.each([
@@ -102,6 +161,37 @@ describe('work machine transfer archive selection', () => {
         const fixture = await machineFixture(root);
         await writeFile(join(fixture.project, '.env.local'), `MCP=${contents}\n`);
         await expect(select(fixture)).rejects.toThrow(join(fixture.project, '.env.local'));
+    });
+
+    it.each([
+        ['a remote URL with a bare token', '.git/config', '[remote "origin"]\n\turl = https://ghp_abcdefghijklmnopqrstuvwxyz0123@github.com/x/y\n'],
+        ['a credential helper', '.git/config', '[credential]\n\thelper = store --file /tmp/creds\n'],
+        ['an extra header', '.git/config', '[http]\n\textraheader = AUTHORIZATION: basic eDp5\n'],
+        ['a submodule credential helper', '.git/modules/lib/config', '[credential "https://example.invalid"]\n\thelper = !echo password=x\n'],
+        ['a worktree extra header', '.git/worktrees/w1/config.worktree', '[http]\n\textraHeader = Authorization: Bearer abc\n'],
+        ['an npm token', '.npmrc', '//registry.npmjs.org/:_authToken=npm_abcdefghijklmnop\n'],
+        ['a nested npm token', 'packages/app/.npmrc', '_auth=dXNlcjpwYXNz\n'],
+        ['a private key file', 'deploy/id_ed25519', '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n'],
+        ['a PEM key', 'certs/server.key', '-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n'],
+    ])('aborts naming the file when the project carries %s, never its value', async (_label, relative, contents) => {
+        const fixture = await machineFixture(root);
+        await mkdir(join(fixture.project, relative, '..'), { recursive: true });
+        await writeFile(join(fixture.project, relative), contents);
+
+        const failure = await select(fixture).catch((error: Error) => error);
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toContain(join(fixture.project, relative));
+        for (const secret of ['ghp_abc', 'creds', 'eDp5', 'password=x', 'Bearer abc', 'npm_abc', 'dXNlcjpwYXNz', 'b3BlbnNzaC1', 'MIIEpAIB']) {
+            expect((failure as Error).message).not.toContain(secret);
+        }
+    });
+
+    it('keeps ordinary Git remotes, a public key and a plain .npmrc', async () => {
+        const fixture = await machineFixture(root);
+        await writeFile(join(fixture.project, '.git', 'config'), '[remote "origin"]\n\turl = git@github.com:x/y.git\n[remote "mirror"]\n\turl = https://git@example.invalid/x/y\n');
+        await writeFile(join(fixture.project, '.npmrc'), 'registry=https://registry.npmjs.org/\n');
+        await writeFile(join(fixture.project, 'id_ed25519.pub'), 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI user@host\n');
+        await expect(select(fixture)).resolves.toBeTruthy();
     });
 
     it('aborts when a Git remote embeds a login', async () => {
@@ -126,7 +216,7 @@ describe('work machine transfer archive selection', () => {
         await expect(select(fixture, { projectPaths: [join(root, 'workspace', 'other')] })).rejects.toThrow();
         await mkdir(join(root, 'workspace', 'other'));
         await expect(select(fixture, { projectPaths: [join(root, 'workspace', 'other')] })).rejects.toThrow('claude-session');
-        await expect(select(fixture, { sessionIds: ['missing-session'] })).rejects.toThrow('missing-session');
+        await expect(select(fixture, { sessionIds: ['claude-session', 'codex-session', 'missing-session'] })).rejects.toThrow('missing-session');
     });
 
     it('extracts only entries under the declared roots and rejects anything else', async () => {
