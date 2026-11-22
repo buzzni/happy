@@ -7,7 +7,7 @@ import { promisify } from 'node:util'
 import { pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { RESIDENT_MODULE_HOST_ENV } from '@/utils/childEnv'
-import { startResidentModuleHost } from './residentModuleHost'
+import { residentModulesEnabled, startResidentModuleHost } from './residentModuleHost'
 
 const execute = promisify(execFile)
 const tempRoots: string[] = []
@@ -76,4 +76,20 @@ describe('resident Happy module host', () => {
       kind: 'ordinary', provider: 'codex', scope: 'fallback', tokenPresent: false,
     })
   }, 15_000)
+})
+
+describe('resident module gate', () => {
+  const plainNode = { versions: {}, hasRegisterHooks: true, env: {} }
+  it('serves the resident bundle on Windows Node with loader hooks', () => {
+    expect(residentModulesEnabled({ ...plainNode, platform: 'win32' })).toBe(true)
+  })
+  it.each(['darwin', 'linux'] as const)('keeps %s on the installed module graph', platform => {
+    expect(residentModulesEnabled({ ...plainNode, platform })).toBe(false)
+  })
+  it('stays off under Electron, Bun, without loader hooks, or when disabled for comparison', () => {
+    expect(residentModulesEnabled({ ...plainNode, platform: 'win32', versions: { electron: '41.0.0' } })).toBe(false)
+    expect(residentModulesEnabled({ ...plainNode, platform: 'win32', versions: { bun: '1.3.0' } })).toBe(false)
+    expect(residentModulesEnabled({ ...plainNode, platform: 'win32', hasRegisterHooks: false })).toBe(false)
+    expect(residentModulesEnabled({ ...plainNode, platform: 'win32', env: { HAPPY_DISABLE_RESIDENT_MODULES: '1' } })).toBe(false)
+  })
 })

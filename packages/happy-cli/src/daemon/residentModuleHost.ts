@@ -4,6 +4,17 @@ import { readdir, readFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { join } from 'node:path'
 
+/** Whether this daemon serves the resident bundle: a plain Node with synchronous loader hooks, unless disabled for comparison. */
+export function residentModulesEnabled(runtime: {
+  platform: NodeJS.Platform
+  versions: { electron?: string; bun?: string; [name: string]: string | undefined }
+  hasRegisterHooks: boolean
+  env: NodeJS.ProcessEnv
+}) {
+  return runtime.platform === 'win32' && !runtime.versions.electron && !runtime.versions.bun
+    && runtime.hasRegisterHooks && runtime.env.HAPPY_DISABLE_RESIDENT_MODULES !== '1'
+}
+
 /** Loads verified installation code once. Session data and project files never reach this listener. */
 export function startResidentModuleHost(root: string) {
   const source = join(root, 'dist', 'win32-resident')
