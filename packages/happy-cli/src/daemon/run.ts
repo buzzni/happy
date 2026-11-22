@@ -5712,7 +5712,8 @@ export async function startDaemon(): Promise<void> {
       },
     }) : null;
     const questionWorker = contextHost && contextJournal && contextAccountId ? createAutomationQuestionWorker({
-      home: configuration.happyHomeDir, serverUrl: configuration.serverUrl, token: credentials.token,
+      // The current daemon credential: on a protected machine the wmx_ token, which renewals replace.
+      home: configuration.happyHomeDir, serverUrl: configuration.serverUrl, token: () => credentials.token,
       accountId: contextAccountId, machineId, journal: contextJournal, host: contextHost, runtimeStore: serverAutomationRuntimeStore,
       transport: apiMachine.serverAutomationTransport(), log: message => logger.warn(message),
       decode: question => trustedServerAutomationPayload({ automationId: question.automationId, generation: question.generation,
