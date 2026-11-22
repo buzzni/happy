@@ -1,6 +1,6 @@
 import * as moduleApi from 'node:module';
 import { AGENT_PLAN_DESCRIPTOR_ENV } from '@/launcher/agentPlanLaunch';
-import { startResidentModuleHost } from './residentModuleHost';
+import { residentModulesEnabled, startResidentModuleHost } from './residentModuleHost';
 import { bindPersonalEndpointLease, assertPersonalEndpointWorkspace, personalEndpointEnvironment, releasePersonalEndpointEnvironment, personalEndpointMarker, PERSONAL_ENDPOINT_BINDING_ENV, type PersonalEndpointSelection } from './personalLlmEndpoint';
 
 import { createBrowserSessionReconnect } from './browserSessionReconnect';
@@ -1931,9 +1931,8 @@ export async function startDaemon(): Promise<void> {
     let releaseSetupTokenAccounts = (_managedAccountIds: string[]): void => {};
 
     const launchReadiness = createLaunchReadinessGate();
-    if (process.platform === 'win32' && !process.versions.electron && !process.versions.bun
-      && 'registerHooks' in moduleApi && typeof moduleApi.registerHooks === 'function'
-      && process.env.HAPPY_DISABLE_RESIDENT_MODULES !== '1') {
+    if (residentModulesEnabled({ platform: process.platform, versions: process.versions, env: process.env,
+      hasRegisterHooks: 'registerHooks' in moduleApi && typeof moduleApi.registerHooks === 'function' })) {
       residentModules = startResidentModuleHost(projectPath());
     }
     const ownsUnresolvedJob = (pid: number) => standaloneWindows?.owner.ownsRoot(pid) ?? false;

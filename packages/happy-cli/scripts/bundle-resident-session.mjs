@@ -16,8 +16,9 @@ await build({
   platform: 'node',
   target: 'node22',
   format: 'esm',
-  // The daemon only serves this snapshot on Windows, where SRT rejects sandbox initialization
-  // before accessing the platform binaries. Bundling its JS keeps Lodash's module graph in memory.
+  // The daemon serves this snapshot on Windows and macOS. Windows SRT rejects sandbox initialization
+  // before accessing platform binaries, and macOS generates its Seatbelt profile, so neither looks up
+  // a package-relative asset. Bundling SRT's JS keeps Lodash's module graph in memory.
   external: ['node-pty', 'onnxruntime-node', '@anthropic-ai/claude-agent-sdk', 'b4a', 'bare-os'],
   banner: { js: 'import { createRequire as createResidentRequire } from "node:module"; const require = createResidentRequire(import.meta.url);' },
 })
