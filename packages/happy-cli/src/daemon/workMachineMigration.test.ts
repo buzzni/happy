@@ -225,8 +225,10 @@ describe('work machine export and import over the Studio transfer API', () => {
         expect(restored.deviceId).not.toBe(fixture.sourceDeviceId);
         expect(deviceSignatureValid(restored.proof, [
             'happy-work-machine-replace-v1', machineId, generation, restored.deviceId,
-            createHash('sha256').update(Buffer.from(restored.dataEncryptionKey, 'base64')).digest('hex'), restored.proof.issuedAt,
+            createHash('sha256').update(Buffer.from(restored.dataEncryptionKey, 'base64')).digest('base64url'), restored.proof.issuedAt,
         ])).toBe(true);
+        expect(Buffer.from(restored.dataEncryptionKey, 'base64')).toHaveLength(105);
+        expect(Buffer.from(restored.dataEncryptionKey, 'base64').toString('base64')).toBe(restored.dataEncryptionKey);
         const accessKey = JSON.parse(await readFile(join(fixture.targetHome, 'access.key'), 'utf8'));
         expect(accessKey.token).toBe('target-account-token');
         expect(Buffer.from(accessKey.encryption.machineKey, 'base64')).toHaveLength(32);
@@ -322,7 +324,7 @@ describe('work machine export and import over the Studio transfer API', () => {
         expect(result.deviceId).toBe(fixture.sourceDeviceId);
         expect(deviceSignatureValid(result.proof, [
             'happy-work-machine-restore-v1', machineId, 4, fixture.sourceDeviceId,
-            createHash('sha256').update(Buffer.from(result.dataEncryptionKey, 'base64')).digest('hex'), result.proof.issuedAt,
+            createHash('sha256').update(Buffer.from(result.dataEncryptionKey, 'base64')).digest('base64url'), result.proof.issuedAt,
         ])).toBe(true);
         const after = JSON.parse(await readFile(join(fixture.sourceHome, 'access.key'), 'utf8'));
         expect(after.token).toBe(before.token);

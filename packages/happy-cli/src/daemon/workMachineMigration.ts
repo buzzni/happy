@@ -117,7 +117,7 @@ function signScope(keys: DeviceKeys, scope: (issuedAt: number) => unknown[]): Wo
 
 /**
  * Replaces this home's machine data key and returns the new envelope (base64, as machine
- * registration sends it) with its sha256 (hex, over the envelope bytes) for the proof scope.
+ * registration sends it: 105 bytes) with the proof-scope digest, base64url sha256 over those bytes.
  * The previous access.key is kept once beside it.
  */
 async function rotateMachineDataKey(home: string, backupSuffix: string): Promise<{ dataEncryptionKey: string; digest: string }> {
@@ -134,7 +134,7 @@ async function rotateMachineDataKey(home: string, backupSuffix: string): Promise
             encryption: { publicKey: encodeBase64(credentials.encryption.publicKey), machineKey: encodeBase64(machineKey) },
             token: credentials.token,
         }, null, 2));
-        return { dataEncryptionKey: encodeBase64(envelope), digest: createHash('sha256').update(envelope).digest('hex') };
+        return { dataEncryptionKey: encodeBase64(envelope), digest: createHash('sha256').update(envelope).digest('base64url') };
     } finally {
         machineKey.fill(0);
     }

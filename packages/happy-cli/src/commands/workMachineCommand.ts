@@ -17,7 +17,7 @@ const USAGE = [
     '       happy work-machine target-approval <machineId> <jobId> <expiresAt> --account <accountId> --generation <n> --source-device <deviceId> [--max-bytes <n>]',
     '       happy work-machine export --studio <url> --job <jobId> --token <wmt_…>',
     '       happy work-machine import --studio <url> --job <jobId> --token <wmt_…>',
-    '       happy work-machine restore-proof <machineId> <generation>',
+    '       happy work-machine restore-proof <machineId> <current generation>',
 ].join('\n');
 /** The envelope's single-archive ceiling. */
 const MAX_ARCHIVE_BYTES = 32 * 1024 ** 3;
