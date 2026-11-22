@@ -911,7 +911,8 @@ export class ApiClient {
       }
       applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
       const client = new ApiSessionClient(this.bearer(), session, undefined, { ...options, providerUsageStore: this.usageSpool(session) });
-      client.bindWorkMachineCredential(principal.credential, token => { principal.token = token; });
+      client.bindWorkMachineCredential(principal.credential, token => { principal.token = token; },
+        () => this.permitWorkMachineSessionExecution());
       return client;
     }
     // The session id is confirmed exactly here for every flavor (claude, codex,

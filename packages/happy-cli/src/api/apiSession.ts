@@ -422,6 +422,8 @@ export interface ApiSessionClientOptions {
 export class ApiSessionClient extends EventEmitter {
     private token: string;
     private disposeWorkMachineCredential?: () => void;
+    /** Asks the server whether a work machine session may start a turn now; refused while draining or frozen. */
+    private permitWorkMachineTurn?: () => Promise<void>;
     readonly sessionId: string;
     /**
      * Identity of *this process's* attachment to the session, minted per client instance
@@ -1260,6 +1262,11 @@ export class ApiSessionClient extends EventEmitter {
 
         const initialSeq = this.lastSeq;
         let afterSeq = this.lastSeq;
+        // aplus specs/work-machine-migration plan 5.1: drain refuses new turns but still lets the
+        // generation read. A work machine session asks once per catch-up before a user message can
+        // start a turn; refused, that message and everything after it stay for the next generation.
+        let turnPermitted = !this.permitWorkMachineTurn;
+        let turnRefused = false;
         while (true) {
             const response = await axios.get<V3GetSessionMessagesResponse>(
                 `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
@@ -1305,6 +1312,19 @@ export class ApiSessionClient extends EventEmitter {
 
                 try {
                     const body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(message.content.c));
+                    if (!turnPermitted && UserMessageSchema.safeParse(body).success) {
+                        turnPermitted = await this.permitWorkMachineTurn!().then(() => true, () => false);
+                        if (this.shutdownReceiveSeq !== null) return;
+                        if (!turnPermitted) {
+                            logger.debug('[API] Work machine turn not permitted; leaving the message for a later read', {
+                                sessionId: this.sessionId,
+                                seq: message.seq,
+                            });
+                            maxSeq = message.seq - 1;
+                            turnRefused = true;
+                            break;
+                        }
+                    }
                     this.deliverInput(() => this.routeIncomingMessage(body, message.id, message.seq));
                 } catch (error) {
                     logger.debug('[API] Failed to decrypt fetched message', {
@@ -1316,6 +1336,7 @@ export class ApiSessionClient extends EventEmitter {
             }
 
             this.lastSeq = Math.max(this.lastSeq, maxSeq);
+            if (turnRefused) break;
             const hasMore = !!response.data.hasMore;
             if (hasMore && maxSeq === afterSeq) {
                 logger.debug('[API] fetchMessages pagination stalled, stopping to avoid infinite loop', {
@@ -2819,9 +2840,10 @@ export class ApiSessionClient extends EventEmitter {
         return this.options.trackShutdownStorage === true && this.storageBarrier.isCurrent(proof);
     }
 
-    bindWorkMachineCredential(credential: WorkMachineSessionCredentials, apply: (token: string) => void): void {
+    bindWorkMachineCredential(credential: WorkMachineSessionCredentials, apply: (token: string) => void, permitTurn: () => Promise<void>): void {
         if (this.disposeWorkMachineCredential || credential.sessionId !== this.sessionId
             || credential.initial.token !== this.token) throw new Error('Work machine session authorization mismatch');
+        this.permitWorkMachineTurn = permitTurn;
         this.disposeWorkMachineCredential = watchWorkMachineCredential({
             initial: credential.initial,
             renew: credential.renew,

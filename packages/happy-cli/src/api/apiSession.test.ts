@@ -3110,16 +3110,94 @@ describe('ApiSessionClient v3 messages API migration', () => {
     describe('on a work machine session credential', () => {
         // aplus specs/work-machine-migration plan 5.1: a frozen generation runs nothing. Its socket
         // can stay open after the freeze, so only the server's per-request read authorization decides.
-        const bound = () => {
+        const bound = (permitTurn: () => Promise<void> = async () => {}) => {
             const credential = { token: 'wmx_session_for_tests', expiresAt: Date.now() + 300_000 };
             const client = new ApiSessionClient(credential.token, session);
-            client.bindWorkMachineCredential({ sessionId: session.id, initial: credential, renew: async () => credential }, () => {});
+            client.bindWorkMachineCredential({ sessionId: session.id, initial: credential, renew: async () => credential }, () => {}, permitTurn);
             const onUserMessage = vi.fn();
             client.onUserMessage(onUserMessage);
             (client as any).lastSeq = 1;
             return { client, onUserMessage };
         };
         const userMessage = { role: 'user', content: { type: 'text', text: 'sent while the generation is frozen' } };
+        const sessionEvent = { role: 'agent', content: { type: 'event', id: 'event-2', data: { type: 'message', message: 'note' } } };
+        /** The server's durable rows; each read returns those after the requested cursor. */
+        const serveRows = (rows: Array<{ seq: number; body: unknown }>) => mockAxiosGet.mockImplementation(async (_url: string, config: { params: { after_seq: number } }) => ({
+            data: { hasMore: false, messages: rows.filter(row => row.seq > config.params.after_seq).map(row => ({
+                id: `msg-${row.seq}`, seq: row.seq, localId: null,
+                content: { t: 'encrypted', c: encryptContent(session, row.body) }, createdAt: 1000, updatedAt: 1000,
+            })) },
+        }));
+
+        // aplus specs/work-machine-migration plan 5.1: drain refuses new turns. A still-running
+        // generation reads while draining, so a fetched user message must not start a turn here.
+        it('leaves a fetched user message on the server while the permit to start a turn is refused', async () => {
+            const permitTurn = vi.fn<() => Promise<void>>()
+                .mockRejectedValueOnce(new Error('Work machine session execution was not authorized'))
+                .mockResolvedValue(undefined);
+            const { client, onUserMessage } = bound(permitTurn);
+            const onOtherMessage = vi.fn();
+            client.on('message', onOtherMessage);
+            serveRows([{ seq: 2, body: sessionEvent }, { seq: 3, body: userMessage }]);
+
+            await (client as any).fetchMessages();
+
+            expect(onOtherMessage).toHaveBeenCalledTimes(1);
+            expect(onUserMessage).not.toHaveBeenCalled();
+            expect((client as any).lastSeq).toBe(2);
+
+            await (client as any).fetchMessages();
+
+            expect(permitTurn).toHaveBeenCalledTimes(2);
+            expect(onUserMessage).toHaveBeenCalledTimes(1);
+            expect(onUserMessage).toHaveBeenCalledWith(expect.objectContaining({ serverSeq: 3 }));
+            expect(onOtherMessage).toHaveBeenCalledTimes(1);
+            expect((client as any).lastSeq).toBe(3);
+            await client.close();
+        });
+
+        it('routes a fetched user message once the permit to start a turn is granted', async () => {
+            const permitTurn = vi.fn(async () => {});
+            const { client, onUserMessage } = bound(permitTurn);
+            serveRows([{ seq: 2, body: userMessage }, { seq: 3, body: { ...userMessage, content: { type: 'text', text: 'second' } } }]);
+
+            await (client as any).fetchMessages();
+
+            expect(permitTurn).toHaveBeenCalledTimes(1);
+            expect(onUserMessage).toHaveBeenCalledTimes(2);
+            expect((client as any).lastSeq).toBe(3);
+            await client.close();
+        });
+
+        it('does not ask for a turn permit for a fetched batch without user messages', async () => {
+            const permitTurn = vi.fn(async () => {});
+            const { client } = bound(permitTurn);
+            const onOtherMessage = vi.fn();
+            client.on('message', onOtherMessage);
+            serveRows([{ seq: 2, body: sessionEvent }]);
+
+            await (client as any).fetchMessages();
+
+            expect(permitTurn).not.toHaveBeenCalled();
+            expect(onOtherMessage).toHaveBeenCalledTimes(1);
+            expect((client as any).lastSeq).toBe(2);
+            await client.close();
+        });
+
+        it('routes a fetched user message on an unprotected session without a turn permit', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const onUserMessage = vi.fn();
+            client.onUserMessage(onUserMessage);
+            (client as any).lastSeq = 1;
+            serveRows([{ seq: 2, body: userMessage }]);
+
+            await (client as any).fetchMessages();
+
+            expect(onUserMessage).toHaveBeenCalledTimes(1);
+            expect((client as any).lastSeq).toBe(2);
+            expect(mockAxiosPost).not.toHaveBeenCalledWith(expect.stringContaining('work-machine-permit'), expect.anything(), expect.anything());
+            await client.close();
+        });
 
         it('does not take input from a socket push the server would no longer let it read', async () => {
             const { client, onUserMessage } = bound();
