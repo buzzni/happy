@@ -1,9 +1,10 @@
 import { Readable } from 'node:stream';
-import type { FastifyReply } from 'fastify';
+import type { FastifyReply, FastifyRequest } from 'fastify';
 import { parseCanonicalOrgSetupTokenJson, automationExecutionQuestionRequestSchema, automationExecutionHoldCodeSchema } from '@slopus/happy-wire';
 import { z } from 'zod';
 import type { Fastify } from '../types';
-import { requireAccountPrincipal } from '@/app/api/utils/enableAuthentication';
+import { requireAccountPrincipal, requireWorkMachineWorkerAuth } from '@/app/api/utils/enableAuthentication';
+import { lockWorkMachineWorker, permitWorkMachineExecution } from '@/app/machine/workMachineExecution';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
 import { createAutomationExecutionSession, automationExecutionSessionRequestSchema,
   AutomationExecutionSessionError, automationExecutionExitRequestSchema, recordAutomationExecutionExit,
@@ -11,7 +12,7 @@ import { createAutomationExecutionSession, automationExecutionSessionRequestSche
 import { ExecutionBindingError } from '@/app/session/sessionExecutionBinding';
 import { listAutomationExecutionPage, readAutomationExecutionEvidencePage, readAutomationExecutionReference } from '@/app/automation/automationExecutionPage';
 import { db } from '@/storage/db';
-import { inTx } from '@/storage/inTx';
+import { inTx, type Tx } from '@/storage/inTx';
 import { claimAutomationExecutionQuestion, queueAutomationExecutionQuestion, listMachineAutomationQuestions, readMachineAutomationQuestion,
   holdMachineAutomationQuestion, listProjectAutomationQuestions, cancelAutomationExecutionQuestion } from '@/app/automation/automationExecutionQuestionService';
 
@@ -26,25 +27,56 @@ async function questionReply(reply: FastifyReply, work: () => Promise<unknown>) 
 const questionMachineParams = z.strictObject({ machineId: z.string().min(1).max(200), requestId: z.string().uuid() });
 const questionPageQuery = z.strictObject({ limit: z.coerce.number().int().min(1).max(20).default(20), cursor: z.string().min(1).max(1024).optional() });
 
+type WorkerRequest = Pick<FastifyRequest, 'workMachineDaemonGrant' | 'principal'> & { userId: string; params: { machineId: string } };
+
+/** A worker route answers the daemon credential of a work machine or, on any other machine, the account bearer. */
+function workerPrincipalRefused(request: WorkerRequest) {
+  return !request.workMachineDaemonGrant && request.principal?.kind !== 'account';
+}
+
+/**
+ * The machine's question queue, in a transaction that locks the generation as
+ * the other automation worker paths do: a work machine is served only through
+ * its current device credential, reads and holds continue while draining, and
+ * a claim is new work that stops at drain and, once handed out, records the
+ * first execution.
+ */
+function workerTransaction<T>(
+  request: WorkerRequest,
+  operation: (tx: Tx) => Promise<T>,
+  { startedWork }: { startedWork?: (result: T) => boolean } = {},
+): Promise<T> {
+  const grant = request.workMachineDaemonGrant;
+  const denied = () => new AutomationExecutionSessionError(403, 'AUTOMATION_QUESTION_MACHINE_DENIED');
+  return inTx(async tx => {
+    const worker = { accountId: request.userId, machineId: request.params.machineId };
+    if (!await lockWorkMachineWorker(tx, worker, grant, { newWork: !!startedWork })) throw denied();
+    const result = await operation(tx);
+    if (grant && startedWork?.(result) && !await permitWorkMachineExecution(tx, grant, new Date())) throw denied();
+    return result;
+  });
+}
+
 /** Registers a run-owned session; provider start remains a separate, journaled operation. */
 export function automationExecutionRoutes(app: Fastify) {
+  const authenticateWorker = requireWorkMachineWorkerAuth(app);
   app.get('/v1/machines/:machineId/automation-questions', {
-    preHandler: app.authenticate, schema: { params: questionMachineParams.omit({ requestId: true }), querystring: questionPageQuery },
+    preHandler: authenticateWorker, schema: { params: questionMachineParams.omit({ requestId: true }), querystring: questionPageQuery },
   }, async (request, reply) => {
-    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
-    return questionReply(reply, () => inTx(tx => listMachineAutomationQuestions(tx, request.userId, request.params.machineId, request.query)));
+    if (workerPrincipalRefused(request)) return requireAccountPrincipal(request, reply);
+    return questionReply(reply, () => workerTransaction(request, tx => listMachineAutomationQuestions(tx, request.userId, request.params.machineId, request.query)));
   });
   app.get('/v1/machines/:machineId/automation-questions/:requestId', {
-    preHandler: app.authenticate, schema: { params: questionMachineParams },
+    preHandler: authenticateWorker, schema: { params: questionMachineParams },
   }, async (request, reply) => {
-    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
-    return questionReply(reply, () => inTx(tx => readMachineAutomationQuestion(tx, request.userId, request.params.machineId, request.params.requestId)));
+    if (workerPrincipalRefused(request)) return requireAccountPrincipal(request, reply);
+    return questionReply(reply, () => workerTransaction(request, tx => readMachineAutomationQuestion(tx, request.userId, request.params.machineId, request.params.requestId)));
   });
   app.patch('/v1/machines/:machineId/automation-questions/:requestId', {
-    preHandler: app.authenticate, schema: { params: questionMachineParams, body: z.strictObject({ holdCode: automationExecutionHoldCodeSchema.nullable() }) },
+    preHandler: authenticateWorker, schema: { params: questionMachineParams, body: z.strictObject({ holdCode: automationExecutionHoldCodeSchema.nullable() }) },
   }, async (request, reply) => {
-    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
-    return questionReply(reply, () => inTx(tx => holdMachineAutomationQuestion(tx, request.userId, request.params.machineId, request.params.requestId, request.body.holdCode)));
+    if (workerPrincipalRefused(request)) return requireAccountPrincipal(request, reply);
+    return questionReply(reply, () => workerTransaction(request, tx => holdMachineAutomationQuestion(tx, request.userId, request.params.machineId, request.params.requestId, request.body.holdCode)));
   });
   app.get('/v1/projects/:projectId/execution-questions', {
     preHandler: app.authenticate, schema: { params: z.strictObject({ projectId: z.string().min(1).max(200) }),
@@ -61,14 +93,16 @@ export function automationExecutionRoutes(app: Fastify) {
     return questionReply(reply, () => inTx(tx => cancelAutomationExecutionQuestion(tx, request.userId, request.params.projectId, request.params.requestId, request.body.displaySessionId)));
   });
   app.post('/v1/machines/:machineId/automation-questions/:requestId/claim', {
-    preHandler: app.authenticate,
+    preHandler: authenticateWorker,
     schema: { params: z.strictObject({ machineId: z.string().min(1).max(200), requestId: z.string().uuid() }),
       body: z.strictObject({ claimToken: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }) },
   }, async (request, reply) => {
-    if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+    if (workerPrincipalRefused(request)) return requireAccountPrincipal(request, reply);
     if (!isServerBackedAutomationEnabled()) return reply.code(404).send({ error: 'feature-disabled' });
     try {
-      const result = await inTx(tx => claimAutomationExecutionQuestion(tx, request.userId, request.params.machineId, request.params.requestId, request.body.claimToken));
+      const result = await workerTransaction(request,
+        tx => claimAutomationExecutionQuestion(tx, request.userId, request.params.machineId, request.params.requestId, request.body.claimToken),
+        { startedWork: claim => claim.state === 'CLAIMED' || claim.state === 'RUNNING' });
       return reply.header('Cache-Control', 'no-store').send(result);
     } catch (error) {
       if (error instanceof AutomationExecutionSessionError) return reply.code(error.statusCode).send({ error: error.message });

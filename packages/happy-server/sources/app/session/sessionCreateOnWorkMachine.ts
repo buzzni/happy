@@ -2,7 +2,7 @@ import { Prisma, type Session } from '@prisma/client';
 import { inTx, afterTx } from '@/storage/inTx';
 import { eventRouter, buildNewSessionUpdate } from '@/app/events/eventRouter';
 import { randomKeyNaked } from '@/utils/randomKeyNaked';
-import { lockWorkMachineExecution, type WorkMachineDeviceGrant } from '@/app/machine/workMachineExecution';
+import { lockWorkMachineExecution, permitWorkMachineExecution, type WorkMachineDeviceGrant } from '@/app/machine/workMachineExecution';
 
 export interface WorkMachineSessionCreateBody {
     tag: string;
@@ -20,7 +20,9 @@ export interface WorkMachineSessionCreateBody {
  *
  * The live generation is locked in the same transaction as the insert:
  * creation is new work, so it is refused while the generation drains or is
- * frozen, and a handoff cannot slip between the check and the row. Repeating
+ * frozen, and a handoff cannot slip between the check and the row. Creating
+ * the row records the generation's first execution, which closes the way back
+ * to the previous device. Repeating
  * the request returns the conversation it created; a tag held by any other
  * conversation is a conflict rather than an adoption.
  */
@@ -35,6 +37,7 @@ export async function sessionCreateOnWorkMachine(
                 if (!await lockWorkMachineExecution(tx, grant, { newWork: true })) return 'denied' as const;
                 const existing = await tx.session.findUnique({ where: { accountId_tag: { accountId, tag: body.tag } } });
                 if (existing) return existing.workMachineId === machineId ? { session: existing } : 'conflict' as const;
+                if (!await permitWorkMachineExecution(tx, grant, new Date())) return 'denied' as const;
                 const session = await tx.session.create({ data: {
                     accountId, tag: body.tag, metadata: body.metadata, agentState: body.agentState, workMachineId: machineId,
                     dataEncryptionKey: body.dataEncryptionKey ? new Uint8Array(Buffer.from(body.dataEncryptionKey, 'base64')) : undefined,

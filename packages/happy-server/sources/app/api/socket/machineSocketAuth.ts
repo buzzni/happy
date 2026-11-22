@@ -102,6 +102,9 @@ export async function workMachineSocketMayAct(db: WorkMachineLookup, input: Mach
     } else if (daemonSocketEvents.has(event) && typeof data?.machineId === 'string') {
         target = data.machineId;
     } else if (isSessionEvent) {
+        // Handlers read one key or the other (usage-report reads `sessionId`),
+        // so an event naming two conversations has no single target.
+        if (data?.sid != null && data?.sessionId != null && data.sid !== data.sessionId) return false;
         const sid = data?.sid ?? data?.sessionId;
         target = typeof sid === 'string' ? sid : undefined;
     }

@@ -739,7 +739,12 @@ async function handleUpgrade(req: IncomingMessage, socket: NetSocket, head: Buff
       }
     }
 
-    const { sockets: machineSockets, degraded } = await findMachineSocketsForDispatch(eventRouter.server, claims.userId, machineId);
+    // Opening a tunnel is a read, like a preview GET: on a work machine it
+    // records no first execution, so a hot-reload socket that reconnects by
+    // itself does not close the way back.
+    const { sockets: machineSockets, degraded } = await findMachineSocketsForDispatch(
+        eventRouter.server, claims.userId, machineId, true,
+    );
     if (machineSockets.length === 0) {
         // `degraded` = the cross-replica lookup failed, so we do not know
         // whether the daemon is there. Same 502, distinct log line.

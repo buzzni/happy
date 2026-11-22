@@ -21,6 +21,9 @@ import { scriptAutomationRoutes } from '@/app/api/routes/scriptAutomationRoutes'
 import { v3SessionRoutes } from '@/app/api/routes/v3SessionRoutes';
 import { automationSocketHandler } from '@/app/api/socket/automationSocketHandler';
 import { workMachineExecutionRoutes } from '@/app/api/routes/workMachineExecutionRoutes';
+import { automationExecutionRoutes } from '@/app/api/routes/automationExecutionRoutes';
+import { v3SessionEventRoutes } from '@/app/api/routes/v3SessionEventRoutes';
+import { pushRoutes } from '@/app/api/routes/pushRoutes';
 import { enableAuthentication, enableSessionScopeAuthentication } from '@/app/api/utils/enableAuthentication';
 import { canonicalDigest } from '@/app/managed/canonicalDigest';
 import { createControlAssertionVerifier } from '@/app/managed/managedControlAssertion';
@@ -37,6 +40,7 @@ import * as machineSockets from '@/app/events/findMachineSockets';
 import { eventRouter } from '@/app/events/eventRouter';
 import { SCRIPT_CLAIM_LEASE_MS } from '@/app/automation/scriptInvocationService';
 import { SESSION_FOLLOWUP_CLAIM_MS } from '@/app/automation/sessionFollowupExecutionService';
+import { automationExecutionSessionId, SCRIPT_AUTOMATION_PROTOCOL_VERSION, SESSION_FOLLOWUP_WIRE_VERSION } from '@slopus/happy-wire';
 import * as authority from './workMachineExecution';
 import {
     authorizeWorkMachineExecution,
@@ -93,7 +97,7 @@ beforeAll(async () => {
 beforeEach(async () => {
     await db.workMachineExecution.update({
         where: { machineId },
-        data: { deviceId: original.deviceId, generation: original.generation, frozenAt: null, firstExecutionAt: null },
+        data: { deviceId: original.deviceId, generation: original.generation, previousDeviceId: null, frozenAt: null, firstExecutionAt: null },
     });
 });
 
@@ -164,11 +168,48 @@ describe('work machine execution authority', () => {
         await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
         try {
             expect((await invoke('readFile')).refused).toBe(false);
+            // Status the web client polls after a switch must not close the way back.
+            for (const method of ['daemon-session-state', 'mcp-status', 'getDirectoryTree', 'ripgrep', 'get-port',
+                'claude-list-rewind-points', 'codex-list-rewind-points', 'checkpoint:list', 'checkpoint:status', 'checkpoint:diff']) {
+                expect((await invoke(method)).refused, method).toBe(false);
+            }
             expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt).toBeNull();
             expect((await invoke('writeFile')).refused).toBe(true);
             await freezeWorkMachineExecution(db, original);
             expect((await invoke('readFile')).refused).toBe(true);
-            expect(emitted).toEqual([`${machineId}:readFile`]);
+            expect(emitted).toHaveLength(11);
+        } finally {
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+        }
+    });
+
+    it('lets a draining conversation answer and abort its turn but refuses new turn work', async () => {
+        const now = Date.now();
+        const emitted: string[] = [];
+        const socket = { data: { workMachineExecution: { ...original, sessionId: 'protected-session', purpose: 'session', expiresAt: now + 60_000 } },
+            timeout: () => ({ emitWithAck: async (_event: string, request: { method: string }) => { emitted.push(request.method); return {}; } }) };
+        const invoke = async (method: string) => (await executeDaemonRpcLocally({
+            io: { sockets: { sockets: new Map([['socket', socket]]) } } as never,
+            request: { requestId: crypto.randomUUID(), targetSocketId: 'socket', method: `protected-session:${method}`, params: {}, timeoutMs: 1000 },
+            onResult: () => {}, deps: { allowed: (async () => true) as never, now: () => now },
+        })).refused;
+        const firstExecution = async () => (await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt;
+        await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+        try {
+            // Stopping a turn runs nothing new.
+            expect(await invoke('abort')).toBe(false);
+            expect(await firstExecution()).toBeNull();
+            expect(await invoke('steer')).toBe(true);
+            expect(await invoke('constructor')).toBe(true);
+            expect(await firstExecution()).toBeNull();
+            // Approving a tool lets it run, so an answer counts as execution.
+            expect(await invoke('permission')).toBe(false);
+            expect(await firstExecution()).not.toBeNull();
+            expect(await invoke('permission')).toBe(false);
+            await freezeWorkMachineExecution(db, original);
+            expect(await invoke('abort')).toBe(true);
+            expect(await invoke('permission')).toBe(true);
+            expect(emitted).toEqual(['protected-session:abort', 'protected-session:permission', 'protected-session:permission']);
         } finally {
             await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
         }
@@ -178,15 +219,22 @@ describe('work machine execution authority', () => {
         const requestId = crypto.randomUUID();
         const secondId = crypto.randomUUID();
         await expect(authority.admitWorkMachineMcpCall(db, original, requestId)).resolves.toBe(true);
-        await expect(authority.admitWorkMachineMcpCall(db, original, requestId)).resolves.toBe(false);
+        // A retry after a lost answer is the same admission; another scope cannot take the request id.
+        await expect(authority.admitWorkMachineMcpCall(db, original, requestId)).resolves.toBe(true);
+        await expect(authority.admitWorkMachineMcpCall(db, { ...original, deviceId: 'other-pc' }, requestId)).resolves.toBe(false);
+        expect(await db.workMachineMcpCall.count({ where: { requestId } })).toBe(1);
         expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt).not.toBeNull();
         expect(await freezeWorkMachineExecution(db, original)).toBe(true);
         await expect(authority.admitWorkMachineMcpCall(db, original, secondId)).resolves.toBe(false);
-        await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe(false);
+        await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe('open-mcp-calls');
         await authority.finishWorkMachineMcpCall(db, { ...original, generation: 2 }, requestId);
-        await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe(false);
+        await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe('open-mcp-calls');
         await authority.finishWorkMachineMcpCall(db, original, requestId);
         await authority.finishWorkMachineMcpCall(db, original, requestId);
+        await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: null } });
+        // A finished call is not admitted again.
+        await expect(authority.admitWorkMachineMcpCall(db, original, requestId)).resolves.toBe(false);
+        await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
         await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe(true);
         await expect(authority.admitWorkMachineMcpCall(db, original, secondId)).resolves.toBe(false);
         await expect(authority.admitWorkMachineMcpCall(db, replacement, secondId)).resolves.toBe(true);
@@ -207,7 +255,7 @@ describe('work machine execution authority', () => {
         expect(await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } }))
             .toMatchObject({ firstExecutionAt: null });
         await expect(machineSockets.permitMachineDispatchSockets(db, accountId, machineId, [current, older], now)).resolves.toEqual([current]);
-        expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe(false);
+        expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe('first-execution-recorded');
         const ordinary = [{ id: 'ordinary', data: {} }];
         await expect(machineSockets.permitMachineDispatchSockets(db, accountId, 'ordinary-machine', ordinary, now)).resolves.toEqual(ordinary);
         await expect(machineSockets.permitMachineDispatchSockets(db, accountId, machineId, ordinary, now)).resolves.toEqual([]);
@@ -222,7 +270,7 @@ describe('work machine execution authority', () => {
         await expect(freezeWorkMachineExecution(db, original)).resolves.toBe(true);
         await expect(authorizeWorkMachineExecution(db, original)).resolves.toBe(false);
         await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe(true);
-        await expect(replaceWorkMachineExecution(db, original, 'late-device')).resolves.toBe(false);
+        await expect(replaceWorkMachineExecution(db, original, 'late-device')).resolves.toBe('generation-mismatch');
         await expect(authorizeWorkMachineExecution(db, original)).resolves.toBe(false);
         await expect(authorizeWorkMachineExecution(db, { ...replacement, deviceId: original.deviceId })).resolves.toBe(false);
         await expect(authorizeWorkMachineExecution(db, replacement)).resolves.toBe(true);
@@ -232,19 +280,64 @@ describe('work machine execution authority', () => {
     it('makes the replacement first execution permit and rollback mutually exclusive', async () => {
         await db.workMachineExecution.update({
             where: { machineId },
-            data: { deviceId: replacement.deviceId, generation: replacement.generation, frozenAt: null, firstExecutionAt: null },
+            data: {
+                deviceId: replacement.deviceId, generation: replacement.generation, previousDeviceId: original.deviceId,
+                frozenAt: null, firstExecutionAt: null,
+            },
         });
         const [allowed, restored] = await Promise.all([
             permitWorkMachineExecution(db, replacement, new Date('2026-11-22T00:00:00Z')),
             restoreWorkMachineExecution(db, replacement, original.deviceId),
         ]);
 
-        expect(Number(allowed) + Number(restored)).toBe(1);
+        expect(Number(allowed) + Number(restored === true)).toBe(1);
+        expect(restored === true || restored === 'first-execution-recorded').toBe(true);
         const current = await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } });
         expect(current.deviceId).toBe(allowed ? replacement.deviceId : original.deviceId);
         expect(current.generation).toBe(allowed ? replacement.generation : replacement.generation + 1);
         expect(current.firstExecutionAt !== null).toBe(allowed);
         await expect(permitWorkMachineExecution(db, original, new Date())).resolves.toBe(false);
+    });
+
+    it('restores only to the device the replace moved the authority away from', async () => {
+        const row = () => db.workMachineExecution.findUniqueOrThrow({ where: { machineId } });
+        // An enrolled generation was never handed off, so it has nowhere to return to.
+        expect(await restoreWorkMachineExecution(db, original, 'enrolled-elsewhere')).toBe('previous-device-mismatch');
+        expect(await freezeWorkMachineExecution(db, original)).toBe(true);
+        expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+        expect(await row()).toMatchObject({ previousDeviceId: original.deviceId });
+        expect(await restoreWorkMachineExecution(db, replacement, 'some-other-pc')).toBe('previous-device-mismatch');
+        expect(await row()).toMatchObject({ deviceId: replacement.deviceId, generation: replacement.generation });
+        expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe(true);
+        expect(await row()).toMatchObject({ deviceId: original.deviceId, generation: replacement.generation + 1, previousDeviceId: null });
+        // A restore does not chain back to the replacement.
+        expect(await restoreWorkMachineExecution(db, { ...original, generation: replacement.generation + 1 }, replacement.deviceId))
+            .toBe('previous-device-mismatch');
+    });
+
+    it('refuses to restore while the replacement holds an unfinished automation claim', async () => {
+        const project = await db.project.create({ data: { accountId, name: 'restore-open-claim' } });
+        const automation = await db.automation.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId,
+            payloadCiphertext: new Uint8Array(1), viewerKeyId: 'viewer', viewerKeyVersion: 1,
+            viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+        } });
+        try {
+            expect(await freezeWorkMachineExecution(db, original)).toBe(true);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+            const claimedAt = new Date();
+            const run = await db.automationRun.create({ data: {
+                automationId: automation.id, generation: 1, scheduledFor: claimedAt, machineAccountId: accountId, machineId,
+                status: 'CLAIMED', claimTokenHash: new Uint8Array(32).fill(7), claimExpiresAt: new Date(Date.now() + 60_000), claimedAt,
+            } });
+            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe('open-automation-runs');
+            expect(await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } }))
+                .toMatchObject({ deviceId: replacement.deviceId, generation: replacement.generation });
+            await db.automationRun.update({ where: { id: run.id }, data: { status: 'EXPIRED', completedAt: new Date() } });
+            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe(true);
+        } finally {
+            await db.project.delete({ where: { id: project.id } });
+        }
     });
 
     it('rejects a connected old daemon, its reconnect, and a user socket claiming machine RPCs after handoff', async () => {
@@ -521,7 +614,7 @@ describe('work machine execution authority', () => {
                 () => db.automationRun.update({ where: { id: 'claimed-run' }, data: { status: 'EXPIRED', completedAt: at(0) } }),
             ];
             for (const finish of finishes) {
-                expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(false);
+                expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe('open-automation-runs');
                 expect(await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } }))
                     .toMatchObject({ deviceId: original.deviceId, generation: 1 });
                 await finish();
@@ -692,8 +785,12 @@ describe('work machine execution authority', () => {
             });
             expect(unsigned.statusCode).toBe(403);
             expect((await control('drain', at(1), 'work-machine-freeze')).statusCode).toBe(403);
-            expect((await control('freeze', at(1))).statusCode).toBe(409);
-            expect((await control('drain', at(2))).statusCode).toBe(409);
+            const notDrained = await control('freeze', at(1));
+            expect(notDrained.statusCode).toBe(409);
+            expect(notDrained.json()).toMatchObject({ reason: 'not-draining' });
+            const otherGeneration = await control('drain', at(2));
+            expect(otherGeneration.statusCode).toBe(409);
+            expect(otherGeneration.json()).toMatchObject({ reason: 'generation-mismatch' });
 
             // Cancel before the handoff: drain, freeze, then resume in the same generation.
             const drained = { deviceId: source.id, generation: 1, draining: true, frozen: false };
@@ -717,12 +814,16 @@ describe('work machine execution authority', () => {
             const draining = await state();
             expect(draining).toMatchObject({ draining: true, frozen: false, firstExecution: true });
             expect(draining.openMcpCalls).toEqual([{ requestId, admittedAt: expect.any(Number) }]);
-            expect((await control('mcp-reconcile', { ...at(1), requestId })).statusCode).toBe(409);
+            const notFrozen = await control('mcp-reconcile', { ...at(1), requestId });
+            expect(notFrozen.statusCode).toBe(409);
+            expect(notFrozen.json()).toMatchObject({ reason: 'not-frozen' });
             expect((await control('freeze', at(1))).json()).toEqual(frozen);
             expect(await write(sourceToken, 'after-freeze')).toBe(403);
 
             const nextKey = envelope(2);
-            expect((await control('replace', replaceBody(1, nextKey))).statusCode).toBe(409);
+            const openCall = await control('replace', replaceBody(1, nextKey));
+            expect(openCall.statusCode).toBe(409);
+            expect(openCall.json()).toMatchObject({ reason: 'open-mcp-calls' });
             expect((await db.machine.findUniqueOrThrow({ where: { id: migrating } })).dataEncryptionKey).toEqual(new Uint8Array(envelope(1)));
             const reconciled = await control('mcp-reconcile', { ...at(1), requestId });
             expect(reconciled.statusCode).toBe(200);
@@ -746,7 +847,9 @@ describe('work machine execution authority', () => {
             } });
             expect((await state()).openAutomationRuns)
                 .toEqual([{ kind: 'automation-run', id: openRun.id, claimedAt: claimedAt.getTime() }]);
-            expect((await control('replace', replaceBody(1, nextKey))).statusCode).toBe(409);
+            const openClaim = await control('replace', replaceBody(1, nextKey));
+            expect(openClaim.statusCode).toBe(409);
+            expect(openClaim.json()).toMatchObject({ reason: 'open-automation-runs' });
             expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId: migrating } })).deviceId).toBe(source.id);
             await db.automationRun.update({ where: { id: openRun.id }, data: { status: 'COMPLETED', completedAt: new Date() } });
             expect((await state()).openAutomationRuns).toEqual([]);
@@ -761,7 +864,9 @@ describe('work machine execution authority', () => {
             const retried = await control('replace', replaceBody(1, nextKey));
             expect(retried.statusCode).toBe(200);
             expect(retried.json()).toEqual(replaced.json());
-            expect((await control('replace', replaceBody(1, envelope(4)))).statusCode).toBe(409);
+            const otherKey = await control('replace', replaceBody(1, envelope(4)));
+            expect(otherKey.statusCode).toBe(409);
+            expect(otherKey.json()).toMatchObject({ reason: 'key-mismatch' });
             const after = await db.machine.findUniqueOrThrow({ where: { id: migrating } });
             expect(after.dataEncryptionKey).toEqual(new Uint8Array(nextKey));
             expect(after.metadataVersion).toBe(before.metadataVersion + 1);
@@ -785,7 +890,9 @@ describe('work machine execution authority', () => {
             expect((await control('replace', replaceBody(3, envelope(6)))).json()).toEqual({ deviceId: target.id, generation: 4 });
             expect(await permit(await sessionToken(target.id, 4))).toBe(204);
             expect((await state()).firstExecution).toBe(true);
-            expect((await control('restore', restoreBody(4, envelope(7)))).statusCode).toBe(409);
+            const ranAlready = await control('restore', restoreBody(4, envelope(7)));
+            expect(ranAlready.statusCode).toBe(409);
+            expect(ranAlready.json()).toMatchObject({ reason: 'first-execution-recorded' });
             expect((await state()).deviceId).toBe(target.id);
         } finally {
             await app.close();
@@ -955,7 +1062,7 @@ describe('work machine execution authority', () => {
             expect((await mintState('ordinary-machine')).json()).toEqual({ fenced: true });
             expect((await readMcpScope(mcpScopePayload)).statusCode).toBe(403);
             expect((await readDaemonScope(daemonToken)).statusCode).toBe(403);
-            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(false);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe('open-mcp-calls');
             expect((await signedCall('finish', proof(call, 'work-machine-mcp-admit'))).statusCode).toBe(403);
             expect((await signedCall('finish', proof(call, 'work-machine-mcp-finish'))).statusCode).toBe(204);
             expect(await db.workMachineMcpCall.count({ where: { requestId: call.requestId, completedAt: { not: null } } })).toBe(1);
@@ -979,7 +1086,7 @@ describe('work machine execution authority', () => {
             expect((await turnPermit(newSessionBearer, 'absent-session')).statusCode).toBe(403);
             expect((await turnPermit(bearer)).statusCode).toBe(403);
             expect((await turnPermit(newSessionBearer)).statusCode).toBe(204);
-            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe(false);
+            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe('first-execution-recorded');
 
             const sourceId = 'ordinary-machine';
             const signingKey = generateKeyPairSync('ed25519');
@@ -1179,8 +1286,14 @@ describe('work machine execution authority', () => {
             await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
             expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
             expect((await create(current, 'device-old-generation')).statusCode).toBe(403);
-            const next = await create(await daemon(replacement), 'device-new-generation');
+            const firstExecution = async () => (await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt;
+            const replacementToken = await daemon(replacement);
+            expect((await create(replacementToken, 'device-unattached')).statusCode).toBe(409);
+            expect(await firstExecution()).toBeNull();
+            const next = await create(replacementToken, 'device-new-generation');
             expect(next.statusCode).toBe(200);
+            // A new conversation on the replacement is its work: the way back closes.
+            expect(await firstExecution()).not.toBeNull();
             expect(await db.session.count({ where: { tag: { in: ['device-draining', 'device-frozen', 'device-old-generation', 'device-ordinary', 'device-other', 'device-proof'] } } })).toBe(0);
         } finally {
             updates.mockRestore();
@@ -1240,7 +1353,7 @@ describe('work machine execution authority', () => {
             expect(await current('automation-run-heartbeat', runs[1])).toEqual({ ok: false, error: 'forbidden' });
             expect(await report(current, runs[1], null, 'report-frozen')).toEqual({ ok: false, error: 'forbidden' });
             // The handoff waits for the run's lease, which the frozen generation can no longer extend.
-            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(false);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe('open-automation-runs');
             await db.automationRun.update({ where: { id: runs[1].runId }, data: { runLeaseExpiresAt: new Date(Date.now() - 1) } });
             expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
             expect(await report(current, runs[1], null, 'report-old-generation')).toEqual({ ok: false, error: 'forbidden' });
@@ -1251,6 +1364,216 @@ describe('work machine execution authority', () => {
             await db.project.delete({ where: { id: project.id } });
             vi.unstubAllEnvs();
         }
+    });
+
+    it('records the replacement first execution when its socket claims automation work, not when a claim is refused', async () => {
+        vi.stubEnv('SAYCODE_AUTOMATION_ENABLED', 'true');
+        const project = await db.project.create({ data: {
+            accountId, name: 'replacement-claims', automationViewerKeyVersion: 1, config: { machineId },
+        } });
+        await db.machine.update({ where: { id: machineId }, data: { automationKeyVersion: 1 } });
+        const keys = {
+            viewerKeyVersion: 1, viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+        };
+        const automation = await db.automation.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, payloadVersion: 1,
+            payloadCiphertext: new Uint8Array(1), viewerKeyId: 'viewer-replacement', enabledAt: new Date(Date.now() - 60_000), ...keys,
+        } });
+        const followup = await db.sessionFollowup.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, sessionId: 'replacement-followup-session',
+            payloadCiphertext: new Uint8Array(1), viewerKeyId: 'viewer-followup', totalRounds: 3, currentRound: 1,
+            responseBoundarySeq: 0, lastObservedSeq: 0, ...keys,
+        } });
+        const handlers = new Map<string, (data: unknown, callback: (result: unknown) => void) => Promise<void>>();
+        automationSocketHandler(accountId, machineId, { on: (event: string, handler: never) => handlers.set(event, handler) } as never,
+            { ...replacement, purpose: 'daemon', expiresAt: Date.now() + 60_000 } as never);
+        const send = (event: string, data: object) => new Promise<{ ok: boolean; error?: string }>(resolve =>
+            void handlers.get(event)!(data, resolve as never));
+        const firstExecution = async () => (await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt;
+        try {
+            expect(await freezeWorkMachineExecution(db, original)).toBe(true);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+
+            expect(await send('automation-claim', { automationId: automation.id, generation: 99, scheduledFor: Date.now() }))
+                .toEqual({ ok: false, error: 'claim-denied' });
+            expect(await send('session-followup-claim', { wireVersion: SESSION_FOLLOWUP_WIRE_VERSION, followupId: followup.id, generation: 1, step: 99 }))
+                .toEqual({ ok: false, error: 'claim-denied' });
+            expect(await firstExecution()).toBeNull();
+
+            expect(await send('session-followup-claim', { wireVersion: SESSION_FOLLOWUP_WIRE_VERSION, followupId: followup.id, generation: 1, step: 1 }))
+                .toMatchObject({ ok: true });
+            expect(await firstExecution()).not.toBeNull();
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { firstExecutionAt: null } });
+            expect(await send('automation-claim', { automationId: automation.id, generation: 1, scheduledFor: Date.now() }))
+                .toMatchObject({ ok: true });
+            expect(await firstExecution()).not.toBeNull();
+            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe('first-execution-recorded');
+        } finally {
+            await db.project.delete({ where: { id: project.id } });
+            vi.unstubAllEnvs();
+        }
+    });
+
+    it('serves automation questions to the current device credential only: claims stop at drain and record the first execution', async () => {
+        const priorSecret = process.env.HANDY_MASTER_SECRET;
+        process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+        vi.stubEnv('SAYCODE_AUTOMATION_ENABLED', 'true');
+        const app = fastify();
+        app.setValidatorCompiler(validatorCompiler);
+        app.setSerializerCompiler(serializerCompiler);
+        const project = await db.project.create({ data: {
+            accountId, name: 'device-questions', automationViewerKeyVersion: 1, config: { machineId },
+        } });
+        await db.machine.update({ where: { id: machineId }, data: { automationKeyVersion: 1, automationContextIsolationVersion: 1 } });
+        const one = (size: number) => Buffer.concat([Buffer.from([1]), Buffer.alloc(size - 1)]).toString('base64');
+        const encrypted = { payloadVersion: 6, payloadCiphertext: one(41), viewerKeyId: 'k', viewerKeyVersion: 1,
+            viewerKeyEnvelope: one(105), machineKeyVersion: 1, machineKeyEnvelope: one(105) };
+        const automation = await db.automation.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, payloadVersion: 6,
+            revision: 2, generation: 3, payloadCiphertext: new Uint8Array(1), viewerKeyId: 'k', viewerKeyVersion: 1,
+            viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+        } });
+        const source = await db.automationRun.create({ data: {
+            id: 'question-source', automationId: automation.id, generation: 3, scheduledFor: new Date(0), machineAccountId: accountId, machineId,
+            status: 'COMPLETED', claimTokenHash: new Uint8Array(32), claimExpiresAt: new Date(0), claimedAt: new Date(0),
+            sessionId: automationExecutionSessionId('question-source'), displaySessionId: 'protected-session',
+            executionCreateBodyHash: 'hash', executionSeedMetadata: 'encrypted',
+            executionExitReceipt: { version: 1, provider: 'codex', observedAt: 1, receivedAt: 2, providerExitedCleanly: true,
+                foregroundDrained: true, backgroundDrained: true, writeProducersDrained: true },
+        } });
+        const question = await db.automationExecutionQuestion.create({ data: {
+            id: crypto.randomUUID(), requestedByAccountId: accountId, automationId: automation.id, sourceRunId: source.id,
+            generation: 3, revision: 2, displaySessionId: 'protected-session', machineAccountId: accountId, machineId,
+            encrypted, requestHash: 'hash',
+        } });
+        try {
+            await auth.init();
+            enableAuthentication(app as unknown as Fastify);
+            automationExecutionRoutes(app as unknown as Fastify);
+            const daemon = async (device: typeof original) => {
+                const now = Date.now();
+                return auth.workMachineExecutionIssuer!.mint({ ...device, purpose: 'daemon', expiresAt: now + 60_000 }, now);
+            };
+            const queue = `/v1/machines/${machineId}/automation-questions`;
+            const list = (token: string) => app.inject({ method: 'GET', url: queue, headers: { authorization: `Bearer ${token}` } });
+            const hold = (token: string) => app.inject({
+                method: 'PATCH', url: `${queue}/${question.id}`, payload: { holdCode: null }, headers: { authorization: `Bearer ${token}` },
+            });
+            const claim = (token: string) => app.inject({
+                method: 'POST', url: `${queue}/${question.id}/claim`, payload: { claimToken: 'q'.repeat(43) },
+                headers: { authorization: `Bearer ${token}` },
+            });
+            const current = await daemon(original);
+            const accountToken = await auth.createToken(accountId);
+
+            expect((await list(accountToken)).statusCode).toBe(403);
+            expect((await claim(accountToken)).statusCode).toBe(403);
+            expect((await list(await daemon({ ...original, deviceId: 'other-pc' }))).statusCode).toBe(403);
+            // A machine outside work-machine authority keeps its account bearer; a device credential cannot reach it.
+            await db.machine.create({ data: { id: 'question-legacy-machine', accountId, metadata: 'encrypted' } });
+            const legacyQueue = (token: string) => app.inject({
+                method: 'GET', url: '/v1/machines/question-legacy-machine/automation-questions', headers: { authorization: `Bearer ${token}` },
+            });
+            expect((await legacyQueue(current)).statusCode).toBe(403);
+            expect((await legacyQueue(accountToken)).statusCode).toBe(200);
+            expect((await list(current)).statusCode).toBe(200);
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+            expect((await list(current)).statusCode).toBe(200);
+            expect((await hold(current)).statusCode).toBe(200);
+            expect((await claim(current)).statusCode).toBe(403);
+            expect(await db.automationRun.count({ where: { id: question.id } })).toBe(0);
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+            expect((await list(current)).statusCode).toBe(403);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+            const next = await daemon(replacement);
+            const claimed = await claim(next);
+            expect(claimed.statusCode).toBe(200);
+            expect(claimed.json()).toMatchObject({ runId: question.id, state: 'CLAIMED' });
+            expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt).not.toBeNull();
+        } finally {
+            await app.close();
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+            await db.machine.update({ where: { id: machineId }, data: { automationContextIsolationVersion: 0 } });
+            await db.machine.deleteMany({ where: { id: 'question-legacy-machine' } });
+            await db.project.delete({ where: { id: project.id } });
+            vi.unstubAllEnvs();
+            if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
+            else process.env.HANDY_MASTER_SECRET = priorSecret;
+        }
+    });
+
+    it('accepts session events and push events of a protected conversation only with its current session credential', async () => {
+        const priorSecret = process.env.HANDY_MASTER_SECRET;
+        process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+        const app = fastify();
+        app.setValidatorCompiler(validatorCompiler);
+        app.setSerializerCompiler(serializerCompiler);
+        const ephemeral = vi.spyOn(eventRouter, 'emitEphemeral').mockImplementation(() => {});
+        try {
+            await auth.init();
+            enableAuthentication(app as unknown as Fastify);
+            enableSessionScopeAuthentication(app as unknown as Fastify, () => null);
+            v3SessionEventRoutes(app as unknown as Fastify);
+            pushRoutes(app as unknown as Fastify);
+            const session = async (device: typeof original) => {
+                const now = Date.now();
+                return auth.workMachineExecutionIssuer!.mint({
+                    ...device, sessionId: 'protected-session', purpose: 'session', expiresAt: now + 60_000,
+                }, now);
+            };
+            const event = (token: string) => app.inject({
+                method: 'POST', url: '/v3/sessions/protected-session/events', headers: { authorization: `Bearer ${token}` },
+                payload: { eventType: 'session-end', content: 'encrypted' },
+            });
+            const push = (token: string) => app.inject({
+                method: 'POST', url: '/v1/sessions/protected-session/push-event', headers: { authorization: `Bearer ${token}` },
+                payload: { kind: 'permission', title: 'title', body: 'body' },
+            });
+            const events = () => db.sessionEvent.count({ where: { sessionId: 'protected-session' } });
+            const current = await session(original);
+            const accountToken = await auth.createToken(accountId);
+
+            expect((await event(accountToken)).statusCode).toBe(403);
+            expect((await push(accountToken)).statusCode).toBe(403);
+            const before = await events();
+            expect((await event(current)).statusCode).toBe(200);
+            expect(await events()).toBe(before + 1);
+            expect((await push(current)).statusCode).toBe(200);
+
+            // In-turn writes continue while draining and stop at the freeze.
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+            expect((await event(current)).statusCode).toBe(200);
+            await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+            expect((await event(current)).statusCode).toBe(403);
+            expect((await push(current)).statusCode).toBe(403);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+            expect((await event(current)).statusCode).toBe(403);
+            expect((await event(await session(replacement))).statusCode).toBe(200);
+            expect(await events()).toBe(before + 3);
+        } finally {
+            ephemeral.mockRestore();
+            await app.close();
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+            if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
+            else process.env.HANDY_MASTER_SECRET = priorSecret;
+        }
+    });
+
+    it('refuses a session event that names two different conversations', async () => {
+        const claims = { ...original, sessionId: 'protected-session', purpose: 'session' as const, expiresAt: Date.now() + 60_000 };
+        const act = (payload: object, input: Partial<Parameters<typeof workMachineSocketMayAct>[1]> = {}) => workMachineSocketMayAct(db, {
+            accountId, socketMachineId: undefined, socketSessionId: 'protected-session', claims, event: 'usage-report',
+            payload, now: Date.now(), ...input,
+        });
+        expect(await act({ sessionId: 'protected-session' })).toBe(true);
+        expect(await act({ sid: 'protected-session', sessionId: 'protected-session' })).toBe(true);
+        // The usage handler writes `sessionId`; the check must not read `sid` instead.
+        expect(await act({ sid: 'protected-session', sessionId: 'other-conversation' })).toBe(false);
+        expect(await act({ sid: 'ordinary-conversation', sessionId: 'protected-session' }, { claims: null, socketSessionId: undefined }))
+            .toBe(false);
     });
 
     it('admits the automation socket events of the current device daemon socket only', async () => {
@@ -1331,13 +1654,38 @@ describe('work machine execution authority', () => {
             expect((await heartbeat(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
             expect((await abandon(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
             // The handoff waits for the run's lease, which the frozen generation can no longer extend.
-            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(false);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe('open-automation-runs');
             await db.scriptInvocation.update({ where: { id: 'device-running-frozen' }, data: { leaseExpiresAt: Date.now() - 1 } });
             expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
             expect((await abandon(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
             expect((await db.scriptInvocation.findUniqueOrThrow({ where: { id: 'device-running-frozen' } })).status).toBe('RUNNING');
-            expect((await list(await daemon(replacement))).statusCode).toBe(200);
+            const next = await daemon(replacement);
+            expect((await list(next)).statusCode).toBe(200);
+            const firstExecution = async () => (await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt;
+            expect(await firstExecution()).toBeNull();
+            // The replacement claims the run the old generation left queued: it ran work, so the way back closes.
+            await db.project.update({ where: { id: project.id }, data: {
+                config: { machineId }, automationViewerPublicKey: new Uint8Array(32), automationViewerKeyVersion: 1,
+            } });
+            await db.machine.update({ where: { id: machineId }, data: {
+                automationPublicKey: new Uint8Array(32), automationKeyVersion: 1, automationProtocolVersion: SCRIPT_AUTOMATION_PROTOCOL_VERSION,
+            } });
+            await db.scriptInvocation.update({ where: { id: queued.id }, data: {
+                snapshot: { machineId, machineAccountId: accountId, artifactId: 'device-artifact' },
+            } });
+            const claimed = await claim(next);
+            expect(claimed.statusCode).toBe(200);
+            expect(claimed.json().claim).not.toBeNull();
+            expect(await firstExecution()).not.toBeNull();
+            // A claim with nothing to run (the automation is paused) records nothing.
+            await db.workMachineExecution.update({ where: { machineId }, data: { firstExecutionAt: null } });
+            await db.automation.update({ where: { id: automation.id }, data: { paused: true } });
+            const empty = await claim(next);
+            expect(empty.statusCode).toBe(200);
+            expect(empty.json().claim).toBeNull();
+            expect(await firstExecution()).toBeNull();
         } finally {
+            await db.machine.update({ where: { id: machineId }, data: { automationPublicKey: null, automationProtocolVersion: 1 } });
             await app.close();
             await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
             await db.project.delete({ where: { id: project.id } });

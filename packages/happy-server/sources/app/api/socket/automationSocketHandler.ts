@@ -13,7 +13,7 @@ import {
     syncAutomations,
 } from '@/app/automation/automationExecutionService';
 import { inTx, type Tx } from '@/storage/inTx';
-import { lockLegacyWorkMachineExecution, lockWorkMachineExecution, type WorkMachineDeviceGrant } from '@/app/machine/workMachineExecution';
+import { lockWorkMachineWorker, permitWorkMachineExecution, type WorkMachineDeviceGrant } from '@/app/machine/workMachineExecution';
 import type { WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
 import { warn } from '@/utils/log';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
@@ -102,7 +102,8 @@ async function answer(
  * `device` is the daemon credential the machine socket authenticated with, if
  * any. A machine under work-machine authority runs automation only through
  * it: every call locks the live generation in its own transaction. Claims are
- * new work and stop at drain, leaving the slot untouched; the rest (sync, key,
+ * new work and stop at drain, leaving the slot untouched; a claim that goes
+ * through records the generation's first execution. The rest (sync, key,
  * start, heartbeat, delivery and the result report of a run already claimed)
  * continues until the freeze. Without a device credential the machine must
  * still be outside work-machine authority, as before.
@@ -114,15 +115,22 @@ export function automationSocketHandler(
     device: Extract<WorkMachineExecutionClaims, { purpose: 'daemon' }> | null = null,
 ): void {
     const grant: WorkMachineDeviceGrant | null = device && device.accountId === accountId && device.machineId === machineId ? device : null;
-    function workerTransaction<T extends Parameters<Callback>[0]>(operation: (tx: Tx) => Promise<T>, { newWork = false } = {}) {
+    function workerTransaction<T extends Parameters<Callback>[0]>(
+        operation: (tx: Tx) => Promise<T>,
+        { newWork = false, startsWork = false } = {},
+    ) {
         return inTx(async tx => {
-            const allowed = device
-                ? !!grant && device.expiresAt > Date.now() && await lockWorkMachineExecution(tx, grant, { newWork })
-                : await lockLegacyWorkMachineExecution(tx, accountId, machineId);
+            const allowed = await lockWorkMachineWorker(tx, { accountId, machineId }, device, { newWork: newWork || startsWork });
             if (!allowed) {
                 return { ok: false as const, error: 'forbidden' };
             }
-            return operation(tx);
+            const result = await operation(tx);
+            // A claim that went through is work this generation runs: it
+            // records the first execution, which closes the way back.
+            if (startsWork && device && result.ok && !await permitWorkMachineExecution(tx, device, new Date())) {
+                throw new Error('work-machine-permit-lost');
+            }
+            return result;
         });
     }
     /** A device attaches a run only to a conversation of its own work machine. */
@@ -195,7 +203,7 @@ export function automationSocketHandler(
         scheduledFor: new Date(integer(data?.scheduledFor, 0, Number.MAX_SAFE_INTEGER)),
         // specs/scheduled-missed-run-policy R11 — only an explicit true widens the window; anything else is a plain claim.
         ...(data?.catchUp === true ? { catchUp: true } : {}),
-    }), { newWork: true }), (value) => {
+    }), { startsWork: true }), (value) => {
         const { projectId } = value as { projectId: string };
         return emitProjectAutomationUpdate(projectId, {
             projectId,
@@ -332,7 +340,7 @@ export function automationSocketHandler(
             followupId: input.followupId,
             generation: input.generation,
             step: input.step,
-        }), { newWork: true });
+        }), { startsWork: true });
     }));
 
     on('session-followup-evaluate', async (data, callback) => answer(callback, () => {

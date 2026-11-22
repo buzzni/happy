@@ -21,8 +21,20 @@ import {
     WS_BINDING_RECHECK_MS,
     WS_RECHECK_DEADLINE_MS,
     wsOpenFailureStatus,
+    previewWebSocketRelay,
 } from '@/modules/preview/previewWebSocketRelay';
+import { signPreviewToken } from '@/modules/preview/previewToken';
+import { findMachineSocketsForDispatch } from '@/app/events/findMachineSockets';
+import fastify from 'fastify';
+import { connect } from 'node:net';
+import type { AddressInfo } from 'node:net';
 void _describe;
+
+// Passes through to the real lookup; a test reads the arguments the upgrade used.
+vi.mock('@/app/events/findMachineSockets', async (importOriginal) => {
+    const actual = await importOriginal<typeof import('@/app/events/findMachineSockets')>();
+    return { ...actual, findMachineSocketsForDispatch: vi.fn(actual.findMachineSocketsForDispatch) };
+});
 
 describe('parsePreviewUpgradeUrl', () => {
     it('parses machineId, port, subPath, and query', () => {
@@ -810,5 +822,38 @@ describe('viewer purpose over the WS upgrade', () => {
             requestViewerLease: viewerLease,
         });
         expect(projectLease).not.toHaveBeenCalled();
+    });
+});
+
+describe('preview WebSocket upgrade on a work machine', () => {
+    // Opening the tunnel is like a GET: a hot-reload socket reconnecting by
+    // itself must not record the replacement's first execution.
+    it('looks the daemon up as a read, so it records no first execution', async () => {
+        vi.stubEnv('HANDY_MASTER_SECRET', 'preview-ws-test-only');
+        const lookup = vi.mocked(findMachineSocketsForDispatch);
+        lookup.mockResolvedValueOnce({ sockets: [], degraded: false } as never);
+        const app = fastify();
+        previewWebSocketRelay(app as never);
+        try {
+            await app.listen({ port: 0, host: '127.0.0.1' });
+            const { port } = app.server.address() as AddressInfo;
+            const { token } = signPreviewToken({ userId: 'owner', machineId: 'work-pc', port: 6080 });
+            const response = await new Promise<string>((resolve, reject) => {
+                const socket = connect(port, '127.0.0.1', () => socket.write([
+                    `GET /v1/preview/work-pc/6080/hmr?ptoken=${token} HTTP/1.1`, `Host: 127.0.0.1:${port}`,
+                    'Connection: Upgrade', 'Upgrade: websocket', 'Sec-WebSocket-Version: 13',
+                    'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==', '', '',
+                ].join('\r\n')));
+                let received = '';
+                socket.on('data', chunk => { received += chunk.toString(); });
+                socket.on('close', () => resolve(received));
+                socket.on('error', reject);
+            });
+            expect(response).toMatch(/^HTTP\/1\.1 502/);
+            expect(lookup.mock.calls.at(-1)?.slice(1)).toEqual(['owner', 'work-pc', true]);
+        } finally {
+            await app.close();
+            vi.unstubAllEnvs();
+        }
     });
 });
