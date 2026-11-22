@@ -1,4 +1,6 @@
+import * as moduleApi from 'node:module';
 import { AGENT_PLAN_DESCRIPTOR_ENV } from '@/launcher/agentPlanLaunch';
+import { startResidentModuleHost } from './residentModuleHost';
 import { bindPersonalEndpointLease, assertPersonalEndpointWorkspace, personalEndpointEnvironment, releasePersonalEndpointEnvironment, personalEndpointMarker, PERSONAL_ENDPOINT_BINDING_ENV, type PersonalEndpointSelection } from './personalLlmEndpoint';
 
 import { createBrowserSessionReconnect } from './browserSessionReconnect';
@@ -153,7 +155,7 @@ import {
   SETUP_TOKEN_BINDING_ENV,
   SETUP_TOKEN_RESUME_REBOUND_ENV,
 } from './sessionEnv';
-import { sanitizeChildEnv } from '@/utils/childEnv';
+import { RESIDENT_MODULE_HOST_ENV, sanitizeChildEnv } from '@/utils/childEnv';
 import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import { createOrgLlmEndpointStudioClient } from './orgLlmEndpointStudio';
@@ -894,6 +896,7 @@ export async function startDaemon(): Promise<void> {
   let stopLogHousekeeping: () => void = () => undefined;
   let stopClaudeSwapSupervisor: () => void = () => undefined;
   let standaloneWindows: Awaited<ReturnType<typeof createStandaloneWindowsRuntime>>;
+  let residentModules: ReturnType<typeof startResidentModuleHost> | undefined;
   let stopUsageRecovery: () => Promise<void> = async () => undefined;
   let stopScriptWorker: () => Promise<void> = async () => undefined;
   let stopBrowserAttention: () => Promise<void> = async () => undefined;
@@ -1926,6 +1929,11 @@ export async function startDaemon(): Promise<void> {
     let releaseSetupTokenAccounts = (_managedAccountIds: string[]): void => {};
 
     const launchReadiness = createLaunchReadinessGate();
+    if (process.platform === 'win32' && !process.versions.electron && !process.versions.bun
+      && 'registerHooks' in moduleApi && typeof moduleApi.registerHooks === 'function'
+      && process.env.HAPPY_DISABLE_RESIDENT_MODULES !== '1') {
+      residentModules = startResidentModuleHost(projectPath());
+    }
     const ownsUnresolvedJob = (pid: number) => standaloneWindows?.owner.ownsRoot(pid) ?? false;
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
@@ -2912,6 +2920,8 @@ export async function startDaemon(): Promise<void> {
       const workspaceLaunch = { submitted: false, tracked: false };
       let exitObserved = false;
       try {
+      const residentDescriptor = ['claude', 'codex'].includes(args[0]) ? residentModules?.descriptor() : undefined;
+      if (residentDescriptor) env = { ...env, [RESIDENT_MODULE_HOST_ENV]: residentDescriptor };
       // Native preparation creates a suspended root; authorize execution at resume below.
       const prepareStartedAt = Date.now();
       if (standaloneWindows) { workspaceLaunch.submitted = true; onProcessSubmission?.(); }
@@ -6333,6 +6343,7 @@ export async function startDaemon(): Promise<void> {
           await terminalWorkers.stop();
           await writeScopeRuntime?.close();
           await standaloneWindows?.owner.close();
+          await residentModules?.close();
           await stopBrowserBridge();
           await cleanupDaemonState();
           try {
@@ -6772,6 +6783,7 @@ export async function startDaemon(): Promise<void> {
       await terminalWorkers.stop();
       await writeScopeRuntime?.close();
       await standaloneWindows?.owner.close();
+      await residentModules?.close();
       await stopBrowserBridge();
 
       // Preserve state file with stopped status and final session list
@@ -6839,6 +6851,7 @@ export async function startDaemon(): Promise<void> {
     await stopUsageRecovery();
     await stopBrowserAttention();
     await standaloneWindows?.owner.close().catch(() => {});
+    await residentModules?.close().catch(() => {});
     stopLogHousekeeping();
     stopClaudeSwapSupervisor();
     await stopScriptWorker().catch((shutdownError) => logger.debug('[script-automations] Shutdown report remains in outbox', shutdownError));

@@ -70,6 +70,7 @@ export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
     { prefix: 'HAPPY_BROWSER_TASK_UNAVAILABLE_REASON', kind: 'spawn-seed' },
     // Run-once, resume prompt, browser continuation: read by the runner before agent code runs (lessonSessionHost).
     { prefix: 'HAPPY_WORKSPACE_CONTEXT_CONTROL_', kind: 'spawn-seed' },
+    { prefix: 'HAPPY_RESIDENT_MODULE_HOST', kind: 'spawn-seed' },
     { prefix: 'HAPPY_AUTOMATION_', kind: 'spawn-seed' },
     { prefix: 'HAPPY_SCOPE_REPORT_', kind: 'session-scope' },
     { prefix: 'HAPPY_WRITE_SCOPE_', kind: 'session-scope' },
@@ -118,6 +119,7 @@ export const NON_INHERITABLE_ENV: readonly NonInheritableEnvEntry[] = [
  *    are dropped; the session's own scope stays.
  */
 export type ChildEnvBoundary = 'session' | 'in-session'
+export const RESIDENT_MODULE_HOST_ENV = 'HAPPY_RESIDENT_MODULE_HOST'
 
 /**
  * Secret-free record of which managed setup-token generation a session was started on.
