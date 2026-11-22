@@ -27,6 +27,7 @@ import { normalizeSessionSource, SESSION_SOURCE_ENV } from '@/utils/sessionSourc
 import { DELEGATED_ATTENDANCE_ENV, parseDelegatedAttendance } from '@/api/turnAttendance'
 import { ORG_ENDPOINT_BINDING_ENV, ORG_ENDPOINT_UNREPORTED_ENV, ORG_SUBAGENT_LAUNCH_ENV, ORG_SUBAGENT_OPERATION_ENV, sanitizeChildEnv, SETUP_TOKEN_BINDING_ENV } from '@/utils/childEnv'
 import { OUTPUT_FORMAT_ENV, parseOutputFormat } from '@/claude/structuredOutput'
+import { APP_PROFILE_ENV, parseAppProfile } from '@/claude/appProfile'
 import { INPUT_EVIDENCE_ENV, requestedInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings'
 import { AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV } from '@/launcher/agentPlanLaunch'
 import { AGENT_PLAN_THREADS_DIR_ENV } from '@/launcher/agentPlanThreads'
@@ -35,6 +36,14 @@ import { DELEGATED_FROM_MACHINE_ENV, DELEGATED_FROM_SESSION_ENV } from '@/utils/
 function isValidOutputFormatSeed(raw: string): boolean {
     try {
         return parseOutputFormat(JSON.parse(raw)) !== undefined
+    } catch {
+        return false
+    }
+}
+
+function isValidAppProfileSeed(raw: string): boolean {
+    try {
+        return parseAppProfile(JSON.parse(raw)) !== undefined
     } catch {
         return false
     }
@@ -70,7 +79,7 @@ export const BROWSER_CONTINUATION_ENV = 'HAPPY_AUTOMATION_BROWSER_CONTINUATION'
  */
 const AGENT_PLAN_SEED_KEYS = [AGENT_PLAN_DESCRIPTOR_ENV, AGENT_PLAN_SECRET_ENV, AGENT_PLAN_THREADS_DIR_ENV] as const
 type AgentPlanSeedKey = typeof AGENT_PLAN_SEED_KEYS[number]
-type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof PERSONAL_ENDPOINT_BINDING_ENV | typeof PERSONAL_ENDPOINT_LEASE_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | typeof ORG_SUBAGENT_LAUNCH_ENV | typeof ORG_SUBAGENT_OPERATION_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof APPROVED_WRITE_ROOTS_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
+type SessionScopedEnvironmentKey = SaycodeAgentEnvironmentKey | typeof OUTPUT_FORMAT_ENV | typeof APP_PROFILE_ENV | typeof CHECKPOINT_CONTEXT_KEY | typeof SETUP_TOKEN_BINDING_ENV | typeof ORG_ENDPOINT_BINDING_ENV | typeof PERSONAL_ENDPOINT_BINDING_ENV | typeof PERSONAL_ENDPOINT_LEASE_ENV | typeof ORG_ENDPOINT_UNREPORTED_ENV | typeof ORG_SUBAGENT_LAUNCH_ENV | typeof ORG_SUBAGENT_OPERATION_ENV | 'HAPPY_WRITE_SCOPE_SESSION' | 'HAPPY_SANDBOX_POLICY_MODE' | 'HAPPY_PROJECT_SANDBOX_CONFIG' | typeof ADDITIONAL_DIRECTORIES_ENV | typeof APPROVED_WRITE_ROOTS_ENV | typeof BROWSER_CONTINUATION_ENV | typeof INPUT_EVIDENCE_ENV | typeof MANUAL_PERSONAL_ENV | AgentPlanSeedKey
 
 export type SaycodeAgentEnvironment = Partial<Record<SessionScopedEnvironmentKey | typeof DAEMON_AGENT_GRANT_STATE_ENV, string>>
 
@@ -347,6 +356,10 @@ export function captureSaycodeAgentEnvironment(
     // runner consumes the seed again. Only a format that still parses is kept.
     const outputFormat = env[OUTPUT_FORMAT_ENV]
     if (outputFormat !== undefined && isValidOutputFormatSeed(outputFormat)) captured[OUTPUT_FORMAT_ENV] = outputFormat
+    // An app session keeps its profile across a resume (aplus agent-app-api T5). A corrupt one stays as a
+    // marker that is not JSON, so the resumed runner fails instead of running with no profile.
+    const appProfile = env[APP_PROFILE_ENV]
+    if (appProfile !== undefined) captured[APP_PROFILE_ENV] = isValidAppProfileSeed(appProfile) ? appProfile : 'invalid'
     // A Studio Chat(beta) session keeps being parked across the resumes an Agent Browser attention causes.
     if (env[BROWSER_CONTINUATION_ENV] === '1') captured[BROWSER_CONTINUATION_ENV] = '1'
     const binding = env[SETUP_TOKEN_BINDING_ENV]

@@ -26,6 +26,7 @@ import {
     readAppliedOrgLlmEndpoint,
 } from './sessionEnv'
 import { buildZaiClaudeEnvironment } from '../managed/zaiClaudeEnvironment'
+import { appProfileSeed, consumeAppProfileSeed } from '../claude/appProfile'
 import { injectMcpCallerGrant } from './mcpCallerGrantEnvelope'
 import { readAiAuthConnectionVersion } from '../usage/aiAuthSource'
 import { sanitizeChildEnv } from '../utils/childEnv'
@@ -366,6 +367,19 @@ describe('Saycode agent resume environment', () => {
         expect(buildResumedSessionSpawnEnvironment({
             inherited: { PATH: '/usr/bin', HAPPY_INITIAL_OUTPUT_FORMAT: seed }, explicit: {}, sessionId: 'session-3',
         }).HAPPY_INITIAL_OUTPUT_FORMAT).toBeUndefined()
+    })
+
+    it('captures the app profile so a resumed app session keeps it (aplus agent-app-api T5)', () => {
+        const profile = { version: 1 as const, mcpServers: ['shopping'], systemPrompt: '너는 쇼핑 도우미다.' }
+        const resumed = buildResumedSessionSpawnEnvironment({
+            inherited: { PATH: '/usr/bin' }, explicit: {}, agentEnvironment: captureSaycodeAgentEnvironment(appProfileSeed(profile)), sessionId: 'session-2',
+        })
+        expect(consumeAppProfileSeed(resumed)).toEqual(profile)
+        // A corrupt record fails the resumed runner instead of running it without the profile.
+        const corrupt = buildResumedSessionSpawnEnvironment({
+            inherited: { PATH: '/usr/bin' }, explicit: {}, agentEnvironment: captureSaycodeAgentEnvironment({ HAPPY_INITIAL_APP_PROFILE: '{"version":2}' }), sessionId: 'session-3',
+        })
+        expect(() => consumeAppProfileSeed(corrupt)).toThrow()
     })
 
     it('captures the Chat(beta) browser continuation mark so a resumed turn keeps its guidance', () => {
