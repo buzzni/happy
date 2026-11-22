@@ -41,7 +41,25 @@ Claude 시작 과정에서 로컬 Lodash 파일 읽기가 640회 관측됐다. �
 
 가상 질문, 시각, PID만 기록한다. 로그인 파일, 제어 인증값, 설정의 비밀, 실제 대화 내용은 검수 기록에 복사하지 않는다.
 
-릴리스 후 Linux에서는 작업 머신에서 Happy를 발행된 버전으로 업데이트한다. `happy daemon status`에서 새 버전으로 기동한 데몬을 확인하고, Saycode에서 해당 머신을 골라 Claude와 Codex 새 대화를 보낸다. 동기 ESM 로더 훅을 지원하는 Node가 필요하며, Windows 검수는 Node 22.23.1을 사용했다. Mac에서는 새 Happy가 포함된 Saycode 앱을 사용해 같은 흐름을 확인한다.
+## Mac·Linux 릴리스 후 실기 검수
+
+### Mac 데스크탑
+
+1. 이번 Happy 릴리스가 포함된 Saycode 버전을 설치하고 앱을 완전히 종료했다가 다시 연다. 앱 버전과 릴리스에 포함된 Happy 버전을 기록한다.
+2. 개인 사용에서는 내 PC에 연결한다. 조직 사용에서는 등록된 작업 PC 목록에서 지금 검수하는 Mac을 선택한다. 사용할 수 있는 모드마다 Claude와 Codex를 골라 각각 새 대화를 시작한다.
+3. 두 공급자의 첫 답변·후속 답변과 작업 표시 종료를 아래 공통 기준으로 확인한다. 모듈 기록은 앱이 선택한 Happy 홈의 `logs/daemon-session-startup.log`에서 확인한다. 기본 설치의 개인 사용 홈은 `~/.happy_local`이고, 조직 사용은 해당 작업 PC의 등록 프로필이 쓰는 홈을 확인한다.
+
+### 등록된 Linux 작업 머신
+
+1. 데몬이 사용하는 사용자와 Node 환경에서 Happy를 발행된 버전으로 업데이트한다. npm 전역 설치를 사용 중이면 `npm install -g '@buzzni/happy-cli@<릴리스 버전>' --prefer-online`에서 버전을 실제 발행값으로 바꿔 실행한다. `happy --version`과 `node -p "typeof require('node:module').registerHooks"`로 설치 버전과 로더 지원 여부를 확인한다. 로더 확인은 `function`이 기대값이다.
+2. 기존 운영 방식으로 데몬을 다시 기동한다. 서비스로 관리 중이면 같은 서비스를 사용한다. 데몬과 같은 Happy 홈에서 `happy daemon status`를 확인하고, `daemon.state.json`의 `startedWithCliVersion`이 업데이트한 버전과 같은지 확인한다. 버전과 PID만 기록한다.
+3. Saycode에서 등록된 Linux 머신을 선택하고 검수 프로젝트에서 Claude와 Codex 새 대화를 각각 시작한다. 일반 대화 시작 경로를 사용한다. 기본 Happy 홈의 로그는 `~/.happy/logs/daemon-session-startup.log`에 있고, 데몬에 `HAPPY_HOME_DIR`을 지정한 경우에는 그 홈의 로그를 사용한다.
+
+### 공통 판정 기준
+
+- Claude와 Codex 새 대화에 각각 `2+3의 답을 숫자만 적어줘`를 보내 `5`가 표시되는지 확인한다. 같은 대화에서 `방금 답에 1을 더한 값도 숫자만 적어줘`를 보내 `6`을 확인한다. 응답이 끝나면 작업 표시가 해제되어야 한다.
+- 전송 시각으로 각 시작 기록을 찾아 `[timing] resident Happy modules ready`와 대화 PID를 확인한다. 연속한 새 대화는 각각 다른 대화 PID를 쓰면서 동일한 Happy 데몬에서 시작해야 한다. Happy 홈의 `daemon.state.json`에 있는 데몬 PID를 검수 전후로 비교한다. 앱이나 데몬이 막 켜진 직후에는 준비가 아직 끝나지 않아 기존 경로로 시작할 수 있다. 데몬을 켜 둔 상태에서 새 대화를 한 번 더 보내 확인한다.
+- 첫 답변 속도는 보내기 클릭부터 첫 답변 텍스트가 보일 때까지 잰다. OS, 앱·Happy 버전, 계정 모드, 공급자·모델, 각 회차의 시간, 모듈 준비 로그 유무를 남긴다. 같은 조건의 반복 회차에서 기능 통과 여부와 첫 답변 시간을 각각 기록한다.
 
 ## PR과 배포 검증
 
