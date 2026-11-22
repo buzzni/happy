@@ -47,4 +47,4 @@ Claude 시작 과정에서 로컬 Lodash 파일 읽기가 640회 관측됐다. �
 
 Windows Node 22.23.1에서 최신 main을 바탕으로 만든 후보의 Happy CLI 타입 검사와 패키지 빌드가 통과했다. 상주 모듈 재사용·접근 제어·종료 후 폴백과 기존 Windows 실행 경로를 다루는 테스트 100개도 통과했다. 패키지에 실행기와 번들이 들어가고, 상주·기존 경로의 버전 출력과 Claude·Codex 명령 진입을 확인했다. Windows 시험판에서 최신 후보의 두 사용 모드와 정상 종료를 재검증한다. 로더 훅 호환성이나 설치본 상대 경로가 바뀌거나 직렬화한 스냅샷이 32 MiB 한도에 가까워지면 이 경계를 다시 검토한다.
 
-Happy CLI PR의 macOS·Linux 스모크 검사에서 상주 번들 시작과 번들 옆 seccomp 필터를 확인한다. 릴리스 승인 뒤 [Happy CLI 릴리스 절차](happy-cli-release.md)로 발행하고, Desktop 런타임 핀과 Windows 패키지를 갱신한다. Desktop 코드 PR은 머지 전에 해당 저장소의 macOS CI를 통과시킨다.
+Happy CLI PR의 macOS·Linux 스모크 검사에서 상주 번들 시작과 번들 옆 seccomp 필터를 확인한다. Linux의 VM 검증과 등록 작업 머신 실기 검증 절차는 [Linux 상주 번들 검증 런북](happy-linux-resident-verification.md)을 따른다. 릴리스 승인 뒤 [Happy CLI 릴리스 절차](happy-cli-release.md)로 발행하고, Desktop 런타임 핀과 Windows 패키지를 갱신한다. Desktop 코드 PR은 머지 전에 해당 저장소의 macOS CI를 통과시킨다.
