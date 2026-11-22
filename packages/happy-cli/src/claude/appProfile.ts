@@ -43,8 +43,8 @@ export function parseAppProfile(value: unknown): ClaudeAppProfile | undefined {
     }
     if (value.version !== 1) throw new Error('App profile version must be 1');
     const servers = value.mcpServers;
-    if (!Array.isArray(servers) || servers.length === 0 || servers.length > MAX_SERVERS) {
-        throw new Error(`App profile needs 1 to ${MAX_SERVERS} MCP servers`);
+    if (!Array.isArray(servers) || servers.length > MAX_SERVERS) {
+        throw new Error(`App profile takes at most ${MAX_SERVERS} MCP servers`);
     }
     if (!servers.every(name => typeof name === 'string' && name.length <= 64 && SERVER_NAME.test(name))) {
         throw new Error('App profile MCP server names must be plain names');

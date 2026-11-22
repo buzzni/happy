@@ -7,13 +7,14 @@ const profile = { version: 1 as const, mcpServers: ['shopping'], systemPrompt: '
 describe('parseAppProfile', () => {
     it('accepts a version 1 profile with server names and a prompt', () => {
         expect(parseAppProfile(profile)).toEqual(profile);
+        // An app without an MCP project answers from its prompt alone, with no tool at all.
+        expect(parseAppProfile({ ...profile, mcpServers: [] })).toEqual({ ...profile, mcpServers: [] });
         expect(parseAppProfile(undefined)).toBeUndefined();
     });
 
     it.each([
         ['a non-object', 'shopping'],
         ['another version', { ...profile, version: 2 }],
-        ['no servers', { ...profile, mcpServers: [] }],
         ['a server name that could reach another prefix', { ...profile, mcpServers: ['shop__ping'] }],
         ['a server name with spaces', { ...profile, mcpServers: ['my shop'] }],
         ['a repeated server', { ...profile, mcpServers: ['shopping', 'shopping'] }],

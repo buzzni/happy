@@ -48,7 +48,7 @@ describe('spawn app profile', () => {
     });
 
     it.each([
-        { label: 'a malformed profile', params: { ...runOnce, appProfile: { ...appProfile, mcpServers: [] } }, error: /App profile/ },
+        { label: 'a malformed profile', params: { ...runOnce, appProfile: { ...appProfile, mcpServers: ['a__b'] } }, error: /App profile/ },
         { label: 'a session that is not run-once', params: { directory: '/tmp/project', agent: 'claude', appProfile }, error: /run-once/ },
         { label: 'a provider other than Claude', params: { ...runOnce, agent: 'codex', appProfile }, error: /Claude/ },
     ])('refuses $label before spawning', async ({ params, error }) => {
