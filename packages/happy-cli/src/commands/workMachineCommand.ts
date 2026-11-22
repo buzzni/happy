@@ -9,7 +9,8 @@ import {
 import {
     createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
 } from '@/daemon/workMachineMigration';
-import { readCredentials, readSettings, updateSettings } from '@/persistence';
+import { stopTrackedSessionProcesses } from '@/daemon/workMachineSessionStop';
+import { readCredentials, readDaemonState, readSettings, updateSettings } from '@/persistence';
 
 const USAGE = [
     'Usage: happy work-machine prepare <machineId>',
@@ -85,6 +86,8 @@ export async function handleWorkMachineCommand(args: string[]): Promise<void> {
         await requireStoppedDaemon(operation === 'export' ? 'exporting this work machine' : 'importing a work machine');
         const endpoint = { home: happyHomeDir, studioUrl: options.studio, jobId: options.job, token: options.token, ...providerHomes() };
         if (operation === 'export') {
+            // Its sessions outlive the daemon; each leaves its clean-stop record as it exits.
+            await stopTrackedSessionProcesses((await readDaemonState())?.trackedSessions ?? []);
             console.log(JSON.stringify(await exportWorkMachine(endpoint)));
             return;
         }

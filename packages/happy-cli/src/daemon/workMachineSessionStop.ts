@@ -11,11 +11,18 @@
  * none, and the export refuses a session without one.
  *
  * `HAPPY_HOME/work-machine-sessions/<sessionId>.json`, 0600.
+ *
+ * Session processes outlive the daemon (it keeps `trackedSessions` for the next one), so the export
+ * first stops those it can identify the way the daemon itself recovers them, and waits for each.
  */
 import { mkdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { z } from 'zod';
+import { isPidAlive, type PersistedTrackedSession } from '@/persistence';
+import { getProcessStartedAt } from '@/utils/processStartTime';
+import { classifyRecoveredTrackedProcess } from './orphanAdoption';
 
 const identifier = z.string().regex(/^[A-Za-z0-9_-]{1,200}$/);
 export const workMachineSessionStopSchema = z.object({
@@ -96,3 +103,33 @@ export function createWorkMachineInputLedger() {
     };
 }
 export type WorkMachineInputLedger = ReturnType<typeof createWorkMachineInputLedger>;
+
+/**
+ * Sends SIGTERM to each still-running process the stopped daemon tracked (its pid not taken over by
+ * a later process) and waits until it has exited; returns the stopped session ids. A process whose
+ * identity cannot be checked, or that does not exit in time, stops the export: it may still be running
+ * a turn or writing into a project.
+ */
+export async function stopTrackedSessionProcesses(
+    tracked: readonly PersistedTrackedSession[], options: { timeoutMs?: number } = {},
+): Promise<string[]> {
+    const stopping: PersistedTrackedSession[] = [];
+    for (const session of tracked) {
+        const label = `Session ${session.happySessionId ?? 'starting'} (pid ${session.pid})`;
+        const identity = classifyRecoveredTrackedProcess({ pid: session.pid, recordedStartedAt: session.startedAt, isPidAlive, getProcessStartedAt });
+        if (identity === 'unverified') throw new Error(`${label} is running and cannot be identified; stop it, then export again`);
+        if (identity !== 'verified') continue;
+        process.kill(session.pid, 'SIGTERM');
+        stopping.push(session);
+    }
+    const deadline = Date.now() + (options.timeoutMs ?? 60_000);
+    for (const session of stopping) {
+        while (isPidAlive(session.pid)) {
+            if (Date.now() >= deadline) {
+                throw new Error(`Session ${session.happySessionId ?? 'starting'} (pid ${session.pid}) did not exit after SIGTERM; wait for it or stop it, then export again`);
+            }
+            await sleep(100);
+        }
+    }
+    return stopping.flatMap(session => session.happySessionId ? [session.happySessionId] : []);
+}

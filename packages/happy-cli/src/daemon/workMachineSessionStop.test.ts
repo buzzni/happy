@@ -1,10 +1,12 @@
+import { spawn, type ChildProcess } from 'node:child_process';
+import { once } from 'node:events';
 import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
-    clearWorkMachineSessionStop, createWorkMachineInputLedger, readWorkMachineSessionStop, workMachineSessionStopPath,
-    writeWorkMachineSessionStop,
+    clearWorkMachineSessionStop, createWorkMachineInputLedger, readWorkMachineSessionStop, stopTrackedSessionProcesses,
+    workMachineSessionStopPath, writeWorkMachineSessionStop,
 } from './workMachineSessionStop';
 
 describe('work machine input ledger', () => {
@@ -106,5 +108,43 @@ describe('work machine session stop record', () => {
         await writeFile(path, '{', { mode: 0o600 });
         await expect(readWorkMachineSessionStop(path, 'session-a')).rejects.toThrow('stop record of session session-a is invalid');
         expect(await readFile(path, 'utf8')).toBe('{');
+    });
+});
+
+describe('stopping the daemon\'s session processes before export', () => {
+    const children: ChildProcess[] = [];
+    afterEach(() => { for (const child of children.splice(0)) child.kill('SIGKILL'); });
+
+    /** A stand-in session process; `onTerm` is its SIGTERM handler body. */
+    const sessionProcess = async (onTerm: string) => {
+        const child = spawn(process.execPath, ['-e', `process.on('SIGTERM', () => { ${onTerm} }); setInterval(() => {}, 1000); console.log('ready')`],
+            { stdio: ['ignore', 'pipe', 'ignore'] });
+        children.push(child);
+        await once(child.stdout!, 'data');
+        return child;
+    };
+    const exited = (child: ChildProcess) => child.exitCode !== null || child.signalCode !== null;
+
+    it('signals a tracked session process it can identify and waits until it has exited', async () => {
+        const child = await sessionProcess('setTimeout(() => process.exit(0), 300);');
+
+        const stopped = await stopTrackedSessionProcesses([{ pid: child.pid!, startedAt: Date.now() + 5_000, happySessionId: 'session-a', startedBy: 'daemon' }]);
+
+        expect(stopped).toEqual(['session-a']);
+        expect(() => process.kill(child.pid!, 0)).toThrow();
+    });
+
+    it('leaves a pid that a later process took over', async () => {
+        const child = await sessionProcess('process.exit(0);');
+
+        expect(await stopTrackedSessionProcesses([{ pid: child.pid!, startedAt: Date.now() - 60_000, startedBy: 'daemon' }])).toEqual([]);
+        expect(exited(child)).toBe(false);
+    });
+
+    it('refuses when a session process does not exit in time', async () => {
+        const child = await sessionProcess('/* ignores the stop */');
+
+        await expect(stopTrackedSessionProcesses([{ pid: child.pid!, startedAt: Date.now() + 5_000, happySessionId: 'session-a', startedBy: 'daemon' }], { timeoutMs: 500 }))
+            .rejects.toThrow(`Session session-a (pid ${child.pid}) did not exit`);
     });
 });
