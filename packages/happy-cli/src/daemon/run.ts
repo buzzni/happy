@@ -23,6 +23,7 @@ import { createMachineTypeMarker } from './machineTypeMarker';
 import { createSharedPcAutoConfirm } from './sharedPcAutoConfirm';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
 import { openWorkMachineCredentials, readWorkMachineExecutionBinding, watchWorkMachineCredential } from './workMachineCredential';
+import { prepareWorkMachineNewSession } from './workMachineNewSession';
 import { deliverAutomationConversation } from './automations/automationConversationRunner';
 import { scopeResumeSelection } from './sessionWriteScopeRestart';
 import { createSessionWriteScopeRuntime, isSessionWriteScopeLaunch, type SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
@@ -2571,6 +2572,18 @@ export async function startDaemon(): Promise<void> {
         // can attach a child to an existing session.
         if (preparedMachineLaunch) Object.assign(extraEnv, preparedMachineLaunch.reconnectEnvironment);
         else if (options.reconnectEnvironment) Object.assign(extraEnv, options.reconnectEnvironment);
+        else {
+          // A protected machine's child cannot create a conversation; the daemon creates it with its device credential.
+          const workMachineSession = await prepareWorkMachineNewSession({
+            protectedMachine: !!workMachine, options, credentials, metadata: daemonCreatedSessionMetadata(options),
+            persist: async session => (await persistDaemonCreatedSession(session)).status === 'committed',
+          });
+          if (workMachineSession.kind === 'refused') {
+            logger.warn(`[DAEMON RUN] ${workMachineSession.errorMessage}`);
+            return { type: 'error', errorMessage: workMachineSession.errorMessage };
+          }
+          if (workMachineSession.kind === 'created') Object.assign(extraEnv, workMachineSession.environment);
+        }
         if (options.saycodeSystemPromptEnabled !== undefined) {
           extraEnv.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = String(
             options.saycodeSystemPromptEnabled,

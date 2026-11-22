@@ -4,6 +4,7 @@ import * as os from 'node:os'
 import ts from 'typescript'
 import { describe, expect, it, vi } from 'vitest'
 import { buildPersonalEndpointEnvironment, PERSONAL_ENDPOINT_BINDING_ENV, personalEndpointMarker } from './personalLlmEndpoint'
+import { prepareWorkMachineNewSession } from './workMachineNewSession'
 import { buildManagedSessionSpawnEnvironment, buildSpawnRequestEnvironment, overlayManagedCredentialEnvironment, stripManagedCredentialConflicts, verifyAiAuthSelection } from './sessionEnv'
 
 // Execute the actual daemon closure with process/network boundaries replaced. This catches
@@ -51,6 +52,8 @@ function fixture() {
         ownedPipeOnlyLaunch: undefined, contextOwnedChildren: new Map(), resolveRegularSpawnAgentArgs: () => ['claude'],
         applyAppliedAiAuthSourceEnv: (value: object) => value, applyConfirmedPromptDeliveryFlag: (value: object) => value,
         buildManagedSessionSpawnEnvironment, verifyAiAuthSelection, writeScopeRuntime: undefined, spawnTrackedHappyProcess: spawn,
+        workMachine: null, prepareWorkMachineNewSession, daemonCreatedSessionMetadata: () => ({ path: '/fixture' }),
+        persistDaemonCreatedSession: async () => ({ status: 'committed' }),
     }
     const start = compiled.runInNewContext(deps) as (input: typeof options) => Promise<Result>
     return { start: () => start(options), release, acquire, overlay, inject, spawn, env }
