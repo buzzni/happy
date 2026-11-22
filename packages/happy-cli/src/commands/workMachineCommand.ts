@@ -7,7 +7,7 @@ import {
     workMachineExecutionBindingSchema,
 } from '@/daemon/workMachineCredential';
 import {
-    createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
+    checkWorkMachineExport, createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
 } from '@/daemon/workMachineMigration';
 import { stopTrackedSessionProcesses } from '@/daemon/workMachineSessionStop';
 import { readCredentials, readDaemonState, readSettings, updateSettings } from '@/persistence';
@@ -16,26 +16,28 @@ const USAGE = [
     'Usage: happy work-machine prepare <machineId>',
     '       happy work-machine bind <machineId> <accountId> <generation>',
     '       happy work-machine target-approval <machineId> <jobId> <expiresAt> --account <accountId> --generation <n> --source-device <deviceId> [--max-bytes <n>]',
-    '       happy work-machine export --studio <url> --job <jobId> --token <wmt_…>',
+    '       happy work-machine export --studio <url> --job <jobId> --token <wmt_…> [--check]',
     '       happy work-machine import --studio <url> --job <jobId> --token <wmt_…>',
     '       happy work-machine restore-proof <machineId> <current generation>',
 ].join('\n');
 /** The envelope's single-archive ceiling. */
 const MAX_ARCHIVE_BYTES = 32 * 1024 ** 3;
 
-/** Positional arguments and `--name value` options; anything else is a usage error. */
-function parseArguments(args: string[], allowed: string[]): { positional: string[]; options: Record<string, string> } {
+/** Positional arguments, `--name value` options and bare `--flag`s; anything else is a usage error. */
+function parseArguments(args: string[], allowed: string[], allowedFlags: string[] = []) {
     const positional: string[] = [];
     const options: Record<string, string> = {};
+    const flags = new Set<string>();
     for (let index = 0; index < args.length; index += 1) {
         const name = args[index].startsWith('--') ? args[index].slice(2) : null;
         if (name === null) { positional.push(args[index]); continue; }
+        if (allowedFlags.includes(name) && !flags.has(name)) { flags.add(name); continue; }
         const value = args[index + 1];
         if (!allowed.includes(name) || value === undefined || name in options) throw new Error(USAGE);
         options[name] = value;
         index += 1;
     }
-    return { positional, options };
+    return { positional, options, flags };
 }
 
 const positiveInteger = (value: string | undefined) => {
@@ -81,10 +83,15 @@ export async function handleWorkMachineCommand(args: string[]): Promise<void> {
         return;
     }
     if (operation === 'export' || operation === 'import') {
-        const { positional, options } = parseArguments(rest, ['studio', 'job', 'token']);
+        const { positional, options, flags } = parseArguments(rest, ['studio', 'job', 'token'], operation === 'export' ? ['check'] : []);
         if (positional.length || !options.studio || !options.job || !options.token) throw new Error(USAGE);
-        await requireStoppedDaemon(operation === 'export' ? 'exporting this work machine' : 'importing a work machine');
         const endpoint = { home: happyHomeDir, studioUrl: options.studio, jobId: options.job, token: options.token, ...providerHomes() };
+        // A dry run while the source still drains: nothing is stopped, sealed or uploaded.
+        if (flags.has('check')) {
+            console.log(JSON.stringify(await checkWorkMachineExport(endpoint)));
+            return;
+        }
+        await requireStoppedDaemon(operation === 'export' ? 'exporting this work machine' : 'importing a work machine');
         if (operation === 'export') {
             // Its sessions outlive the daemon; each leaves its clean-stop record as it exits.
             await stopTrackedSessionProcesses((await readDaemonState())?.trackedSessions ?? []);

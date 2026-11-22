@@ -4,7 +4,8 @@
  *
  * - target-approval: the target binds a fresh per-job recipient key to its device signing key.
  * - export: on the stopped source, seals the planned selection with the existing archive envelope,
- *   uploads it in parts and submits the manifest the source device signs.
+ *   uploads it in parts and submits the manifest the source device signs. `--check` runs the same
+ *   selection and credential scan without stopping anything, sealing or uploading.
  * - import: on the target, verifies the manifest signature and every part, restores into staging,
  *   places the data at the same absolute paths without overwriting anything, writes the session
  *   recovery records, rotates the machine data key and reports the execution-replace proof.
@@ -177,6 +178,20 @@ async function sourcePlan(client: ReturnType<typeof openWorkMachineTransfer>, in
         throw new Error('The target approval in the plan is for a different job, machine, generation or source device');
     }
     return { plan, binding, approval };
+}
+
+/**
+ * `export --check`: the export's selection and credential scan while the source still runs (during
+ * drain), so a blocker shows before freeze. Nothing is sealed, uploaded or signed, and the sessions'
+ * stop records are not required yet: they exist only once the session processes have stopped.
+ */
+export async function checkWorkMachineExport(input: TransferEndpoint & { claudeConfigDir: string; codexHome: string }): Promise<{ sessions: string[]; paths: string[] }> {
+    const { plan } = await sourcePlan(openWorkMachineTransfer(input), input);
+    const selection = await selectWorkMachineTransfer({
+        happyHome: input.home, claudeConfigDir: input.claudeConfigDir, codexHome: input.codexHome,
+        projectPaths: plan.projectPaths, sessionIds: plan.sessions.map(session => session.sessionId), requireStopRecords: false,
+    });
+    return { sessions: selection.sessions.map(session => session.sessionId), paths: selection.roots };
 }
 
 export async function exportWorkMachine(input: TransferEndpoint & {

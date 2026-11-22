@@ -10,7 +10,7 @@ import { getProjectPath } from '@/claude/utils/path';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
 import { getWorkMachineDeviceId, saveWorkMachineExecutionBinding, workMachineSigningIdentity } from './workMachineCredential';
 import {
-    createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
+    checkWorkMachineExport, createWorkMachineRestoreProof, createWorkMachineTargetApproval, exportWorkMachine, importWorkMachine,
 } from './workMachineMigration';
 import { workMachineSessionStopPath, writeWorkMachineSessionStop } from './workMachineSessionStop';
 
@@ -244,6 +244,23 @@ describe('work machine export and import over the Studio transfer API', () => {
         studio.restored = null;
         await importWorkMachine(fixture.importInput);
         expect(studio.restored).toEqual(restored);
+    });
+
+    it('checks the export during drain without stop records, uploads or a saved seal', async () => {
+        const fixture = await machinesFixture(root, studio);
+        await rm(join(fixture.sourceHome, 'work-machine-sessions'), { recursive: true });
+
+        const checked = await checkWorkMachineExport(fixture.exportInput);
+
+        expect(checked).toEqual({ sessions: ['claude-session', 'codex-session'], paths: [fixture.project, fixture.claudeRecord, fixture.codexRecord].sort() });
+        expect(studio.puts.size).toBe(0);
+        expect(studio.manifest).toBeNull();
+        await expect(lstat(join(fixture.sourceHome, 'work-machine-transfer', jobId, 'export'))).rejects.toMatchObject({ code: 'ENOENT' });
+
+        await writeFile(join(fixture.project, '.npmrc'), '//registry.npmjs.org/:_authToken=npm_secretvalue\n');
+        const failure = await checkWorkMachineExport(fixture.exportInput).catch((error: Error) => error);
+        expect((failure as Error).message).toContain(join(fixture.project, '.npmrc'));
+        expect((failure as Error).message).not.toContain('npm_secretvalue');
     });
 
     it('resumes an interrupted upload without sending verified parts again', async () => {

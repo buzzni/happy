@@ -163,6 +163,37 @@ describe('work machine transfer archive selection', () => {
         await expect(select(fixture)).rejects.toThrow(join(fixture.project, '.env.local'));
     });
 
+    it.each([
+        ['a remote URL with a bare token', '.git/config', '[remote "origin"]\n\turl = https://ghp_abcdefghijklmnopqrstuvwxyz0123@github.com/x/y\n'],
+        ['a credential helper', '.git/config', '[credential]\n\thelper = store --file /tmp/creds\n'],
+        ['an extra header', '.git/config', '[http]\n\textraheader = AUTHORIZATION: basic eDp5\n'],
+        ['a submodule credential helper', '.git/modules/lib/config', '[credential "https://example.invalid"]\n\thelper = !echo password=x\n'],
+        ['a worktree extra header', '.git/worktrees/w1/config.worktree', '[http]\n\textraHeader = Authorization: Bearer abc\n'],
+        ['an npm token', '.npmrc', '//registry.npmjs.org/:_authToken=npm_abcdefghijklmnop\n'],
+        ['a nested npm token', 'packages/app/.npmrc', '_auth=dXNlcjpwYXNz\n'],
+        ['a private key file', 'deploy/id_ed25519', '-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n'],
+        ['a PEM key', 'certs/server.key', '-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEA\n-----END RSA PRIVATE KEY-----\n'],
+    ])('aborts naming the file when the project carries %s, never its value', async (_label, relative, contents) => {
+        const fixture = await machineFixture(root);
+        await mkdir(join(fixture.project, relative, '..'), { recursive: true });
+        await writeFile(join(fixture.project, relative), contents);
+
+        const failure = await select(fixture).catch((error: Error) => error);
+        expect(failure).toBeInstanceOf(Error);
+        expect((failure as Error).message).toContain(join(fixture.project, relative));
+        for (const secret of ['ghp_abc', 'creds', 'eDp5', 'password=x', 'Bearer abc', 'npm_abc', 'dXNlcjpwYXNz', 'b3BlbnNzaC1', 'MIIEpAIB']) {
+            expect((failure as Error).message).not.toContain(secret);
+        }
+    });
+
+    it('keeps ordinary Git remotes, a public key and a plain .npmrc', async () => {
+        const fixture = await machineFixture(root);
+        await writeFile(join(fixture.project, '.git', 'config'), '[remote "origin"]\n\turl = git@github.com:x/y.git\n[remote "mirror"]\n\turl = https://git@example.invalid/x/y\n');
+        await writeFile(join(fixture.project, '.npmrc'), 'registry=https://registry.npmjs.org/\n');
+        await writeFile(join(fixture.project, 'id_ed25519.pub'), 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI user@host\n');
+        await expect(select(fixture)).resolves.toBeTruthy();
+    });
+
     it('aborts when a Git remote embeds a login', async () => {
         const fixture = await machineFixture(root);
         await writeFile(join(fixture.project, '.git', 'config'), '[remote "origin"]\n\turl = https://user:ghp_secret@github.com/x/y\n');

@@ -7,7 +7,9 @@
  * their Claude/Codex provider records. Nothing else under HAPPY_HOME, CLAUDE_CONFIG_DIR or
  * CODEX_HOME is ever enumerated, so account/device keys, AI logins and execution credentials stay
  * behind by construction. Files that may still carry an execution credential (provider records,
- * env-like files, Git config) are scanned and the export stops, naming the file, never the value.
+ * env-like files, .npmrc, Git config of the project, its submodules and worktrees) are scanned, and
+ * every other project file is checked for a PEM private key header; the export stops naming the
+ * file, never the value.
  * A conversation in this machine's sessions.json that the plan leaves out (and that is not
  * archived) stops the export too: it would not open on the target.
  *
@@ -66,20 +68,28 @@ const archivedRecord = z.object({ metadata: z.object({ lifecycleState: z.literal
 
 /** Logins that may sit inside a project tree and never travel. */
 const LOGIN_FILES = new Set(['.git-credentials', '.netrc', '.credentials.json']);
-const SCANNED_NAME = /^\.env(\..*)?$|\.env$|^\.mcp\.json$/;
+const SCANNED_NAME = /^\.env(\..*)?$|\.env$|^\.mcp\.json$|^\.npmrc$/;
+const PRIVATE_KEY = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/;
 const CREDENTIAL_PATTERNS = [
     /\bwm[xt]_[A-Za-z0-9_-]{8,}/,
     /authorization["']?\s*[:=]\s*["']?\s*bearer\s+[A-Za-z0-9._~+/=-]{8,}/i,
     /extraheader\s*=\s*authorization/i,
     /\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@"']+:[^\s/@"']+@/i,
+    // A token as the whole userinfo (https://ghp_…@github.com); a short user name such as git@ is not one.
+    /\bhttps?:\/\/[^\s/:@"']{16,}@/i,
+    PRIVATE_KEY,
 ];
+/** Git config (the project's, a submodule's, a worktree's): credential helpers and extra HTTP headers. */
+const GIT_CONFIG = /\/\.git\/(?:.+\/)?config(?:\.worktree)?$/;
+const GIT_CONFIG_PATTERNS = [/^\s*(?:helper|extraheader)\s*=/im];
+const NPMRC_PATTERNS = [/(?:^|:)_(?:authToken|auth|password)\s*=/m];
 /** A base64url JSON payload with a signature segment: caller grants, connector capabilities, JWTs. */
 const SIGNED_TOKEN = /\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g;
 
 const within = (root: string, path: string) => path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`);
 
-function containsCredential(text: string): boolean {
-    if (CREDENTIAL_PATTERNS.some(pattern => pattern.test(text))) return true;
+function containsCredential(text: string, patterns: readonly RegExp[] = CREDENTIAL_PATTERNS): boolean {
+    if (patterns.some(pattern => pattern.test(text))) return true;
     for (const match of text.matchAll(SIGNED_TOKEN)) {
         try {
             const payload = JSON.parse(Buffer.from(match[0].split('.')[0], 'base64url').toString('utf8'));
@@ -89,13 +99,29 @@ function containsCredential(text: string): boolean {
     return false;
 }
 
+const credentialFound = (path: string) => new Error(`Credential material found in ${path}; remove it before exporting`);
+
 async function assertNoCredential(path: string): Promise<void> {
+    const patterns = [...CREDENTIAL_PATTERNS, ...(GIT_CONFIG.test(path) ? GIT_CONFIG_PATTERNS : []),
+        ...(basename(path) === '.npmrc' ? NPMRC_PATTERNS : [])];
     // Overlap keeps a token split across two reads whole (tokens are capped at 4 KiB).
     let carry = '';
     for await (const chunk of createReadStream(path, { encoding: 'utf8', highWaterMark: 1024 * 1024 })) {
         const text = carry + (chunk as string);
-        if (containsCredential(text)) throw new Error(`Credential material found in ${path}; remove it before exporting`);
+        if (containsCredential(text, patterns)) throw credentialFound(path);
         carry = text.slice(-8192);
+    }
+}
+
+/** Key files (id_rsa, *.pem, *.key) open with their PEM header; the rest of an unscanned file is not read. */
+async function assertNotPrivateKey(path: string): Promise<void> {
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+        const head = Buffer.alloc(4096);
+        const { bytesRead } = await file.read(head, 0, head.length, 0);
+        if (PRIVATE_KEY.test(head.subarray(0, bytesRead).toString('latin1'))) throw credentialFound(path);
+    } finally {
+        await file.close();
     }
 }
 
@@ -125,7 +151,8 @@ async function collectTree(root: string, scanAll: boolean, entries: string[]): P
         // Sockets, FIFOs and devices belong to running processes, pid and Git lock files to dead ones.
         if (!info.isFile() || name.endsWith('.pid') || LOGIN_FILES.has(name)
             || (name.endsWith('.lock') && path.includes('/.git/'))) return;
-        if (scanAll || SCANNED_NAME.test(name) || path.endsWith('/.git/config')) await assertNoCredential(path);
+        if (scanAll || SCANNED_NAME.test(name) || GIT_CONFIG.test(path)) await assertNoCredential(path);
+        else await assertNotPrivateKey(path);
         entries.push(path);
     };
     await visit(root);
