@@ -154,6 +154,22 @@ export async function readOwnedSpawnPrincipal(
     return { machineId: state.machineId, happyAccountId: accountId, epoch: state.epoch };
 }
 
+/** Owner contact rechecks identity before each signature and reply, and a null answer revokes a child's binding for good.
+ * So the server confirms a registration once; later checks re-read only the local registration. A failure is never remembered. */
+export function createOwnedContactIdentity(
+    happyOrigin: string, registration: OwnedSpawnRuntimeDependencies['registration'], fetcher: typeof fetch = fetch,
+): () => Promise<{ machineId: string; happyAccountId: string; epoch: string } | null> {
+    const confirmed = new Map<string, { machineId: string; happyAccountId: string; epoch: string }>();
+    return async () => {
+        try {
+            const state = await registration(), key = JSON.stringify([state.credentials.token, state.machineId, state.epoch]);
+            const principal = confirmed.get(key) ?? await readOwnedSpawnPrincipal(happyOrigin, registration, fetcher);
+            confirmed.set(key, principal);
+            return principal;
+        } catch { return null; }
+    };
+}
+
 export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): OwnedSpawnRuntime {
     const journal = createOwnedSpawnJournal(deps.home), fetcher = deps.fetch ?? fetch;
     let local: { machineId: string; happyAccountId: string; epoch: string } | null = null;
