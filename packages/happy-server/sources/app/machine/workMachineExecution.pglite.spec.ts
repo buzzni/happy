@@ -1180,8 +1180,14 @@ describe('work machine execution authority', () => {
             await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
             expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
             expect((await create(current, 'device-old-generation')).statusCode).toBe(403);
-            const next = await create(await daemon(replacement), 'device-new-generation');
+            const firstExecution = async () => (await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt;
+            const replacementToken = await daemon(replacement);
+            expect((await create(replacementToken, 'device-unattached')).statusCode).toBe(409);
+            expect(await firstExecution()).toBeNull();
+            const next = await create(replacementToken, 'device-new-generation');
             expect(next.statusCode).toBe(200);
+            // A new conversation on the replacement is its work: the way back closes.
+            expect(await firstExecution()).not.toBeNull();
             expect(await db.session.count({ where: { tag: { in: ['device-draining', 'device-frozen', 'device-old-generation', 'device-ordinary', 'device-other', 'device-proof'] } } })).toBe(0);
         } finally {
             updates.mockRestore();
