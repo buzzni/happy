@@ -53,7 +53,10 @@ ALTER TABLE "Session" ADD COLUMN "workMachineId" TEXT;
 CREATE INDEX "Session_workMachineId_accountId_idx" ON "Session" ("workMachineId", "accountId");
 CREATE INDEX "SessionOwnershipBinding_machineId_machineAccountId_idx"
     ON "SessionOwnershipBinding" ("machineId", "machineAccountId");
+-- Added NOT VALID so the ALTER does not scan "Session" under its lock; the
+-- separate VALIDATE checks existing rows without blocking writes.
 ALTER TABLE "Session"
     ADD CONSTRAINT "Session_workMachineId_accountId_fkey"
     FOREIGN KEY ("workMachineId", "accountId") REFERENCES "WorkMachineExecution"("machineId", "accountId")
-    ON DELETE RESTRICT ON UPDATE RESTRICT;
+    ON DELETE RESTRICT ON UPDATE RESTRICT NOT VALID;
+ALTER TABLE "Session" VALIDATE CONSTRAINT "Session_workMachineId_accountId_fkey";
