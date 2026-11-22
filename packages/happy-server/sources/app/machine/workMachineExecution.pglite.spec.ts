@@ -21,6 +21,7 @@ import { scriptAutomationRoutes } from '@/app/api/routes/scriptAutomationRoutes'
 import { v3SessionRoutes } from '@/app/api/routes/v3SessionRoutes';
 import { automationSocketHandler } from '@/app/api/socket/automationSocketHandler';
 import { workMachineExecutionRoutes } from '@/app/api/routes/workMachineExecutionRoutes';
+import { automationExecutionRoutes } from '@/app/api/routes/automationExecutionRoutes';
 import { enableAuthentication, enableSessionScopeAuthentication } from '@/app/api/utils/enableAuthentication';
 import { canonicalDigest } from '@/app/managed/canonicalDigest';
 import { createControlAssertionVerifier } from '@/app/managed/managedControlAssertion';
@@ -37,7 +38,7 @@ import * as machineSockets from '@/app/events/findMachineSockets';
 import { eventRouter } from '@/app/events/eventRouter';
 import { SCRIPT_CLAIM_LEASE_MS } from '@/app/automation/scriptInvocationService';
 import { SESSION_FOLLOWUP_CLAIM_MS } from '@/app/automation/sessionFollowupExecutionService';
-import { SCRIPT_AUTOMATION_PROTOCOL_VERSION, SESSION_FOLLOWUP_WIRE_VERSION } from '@slopus/happy-wire';
+import { automationExecutionSessionId, SCRIPT_AUTOMATION_PROTOCOL_VERSION, SESSION_FOLLOWUP_WIRE_VERSION } from '@slopus/happy-wire';
 import * as authority from './workMachineExecution';
 import {
     authorizeWorkMachineExecution,
@@ -1397,6 +1398,96 @@ describe('work machine execution authority', () => {
         } finally {
             await db.project.delete({ where: { id: project.id } });
             vi.unstubAllEnvs();
+        }
+    });
+
+    it('serves automation questions to the current device credential only: claims stop at drain and record the first execution', async () => {
+        const priorSecret = process.env.HANDY_MASTER_SECRET;
+        process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+        vi.stubEnv('SAYCODE_AUTOMATION_ENABLED', 'true');
+        const app = fastify();
+        app.setValidatorCompiler(validatorCompiler);
+        app.setSerializerCompiler(serializerCompiler);
+        const project = await db.project.create({ data: {
+            accountId, name: 'device-questions', automationViewerKeyVersion: 1, config: { machineId },
+        } });
+        await db.machine.update({ where: { id: machineId }, data: { automationKeyVersion: 1, automationContextIsolationVersion: 1 } });
+        const one = (size: number) => Buffer.concat([Buffer.from([1]), Buffer.alloc(size - 1)]).toString('base64');
+        const encrypted = { payloadVersion: 6, payloadCiphertext: one(41), viewerKeyId: 'k', viewerKeyVersion: 1,
+            viewerKeyEnvelope: one(105), machineKeyVersion: 1, machineKeyEnvelope: one(105) };
+        const automation = await db.automation.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, payloadVersion: 6,
+            revision: 2, generation: 3, payloadCiphertext: new Uint8Array(1), viewerKeyId: 'k', viewerKeyVersion: 1,
+            viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+        } });
+        const source = await db.automationRun.create({ data: {
+            id: 'question-source', automationId: automation.id, generation: 3, scheduledFor: new Date(0), machineAccountId: accountId, machineId,
+            status: 'COMPLETED', claimTokenHash: new Uint8Array(32), claimExpiresAt: new Date(0), claimedAt: new Date(0),
+            sessionId: automationExecutionSessionId('question-source'), displaySessionId: 'protected-session',
+            executionCreateBodyHash: 'hash', executionSeedMetadata: 'encrypted',
+            executionExitReceipt: { version: 1, provider: 'codex', observedAt: 1, receivedAt: 2, providerExitedCleanly: true,
+                foregroundDrained: true, backgroundDrained: true, writeProducersDrained: true },
+        } });
+        const question = await db.automationExecutionQuestion.create({ data: {
+            id: crypto.randomUUID(), requestedByAccountId: accountId, automationId: automation.id, sourceRunId: source.id,
+            generation: 3, revision: 2, displaySessionId: 'protected-session', machineAccountId: accountId, machineId,
+            encrypted, requestHash: 'hash',
+        } });
+        try {
+            await auth.init();
+            enableAuthentication(app as unknown as Fastify);
+            automationExecutionRoutes(app as unknown as Fastify);
+            const daemon = async (device: typeof original) => {
+                const now = Date.now();
+                return auth.workMachineExecutionIssuer!.mint({ ...device, purpose: 'daemon', expiresAt: now + 60_000 }, now);
+            };
+            const queue = `/v1/machines/${machineId}/automation-questions`;
+            const list = (token: string) => app.inject({ method: 'GET', url: queue, headers: { authorization: `Bearer ${token}` } });
+            const hold = (token: string) => app.inject({
+                method: 'PATCH', url: `${queue}/${question.id}`, payload: { holdCode: null }, headers: { authorization: `Bearer ${token}` },
+            });
+            const claim = (token: string) => app.inject({
+                method: 'POST', url: `${queue}/${question.id}/claim`, payload: { claimToken: 'q'.repeat(43) },
+                headers: { authorization: `Bearer ${token}` },
+            });
+            const current = await daemon(original);
+            const accountToken = await auth.createToken(accountId);
+
+            expect((await list(accountToken)).statusCode).toBe(403);
+            expect((await claim(accountToken)).statusCode).toBe(403);
+            expect((await list(await daemon({ ...original, deviceId: 'other-pc' }))).statusCode).toBe(403);
+            // A machine outside work-machine authority keeps its account bearer; a device credential cannot reach it.
+            await db.machine.create({ data: { id: 'question-legacy-machine', accountId, metadata: 'encrypted' } });
+            const legacyQueue = (token: string) => app.inject({
+                method: 'GET', url: '/v1/machines/question-legacy-machine/automation-questions', headers: { authorization: `Bearer ${token}` },
+            });
+            expect((await legacyQueue(current)).statusCode).toBe(403);
+            expect((await legacyQueue(accountToken)).statusCode).toBe(200);
+            expect((await list(current)).statusCode).toBe(200);
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+            expect((await list(current)).statusCode).toBe(200);
+            expect((await hold(current)).statusCode).toBe(200);
+            expect((await claim(current)).statusCode).toBe(403);
+            expect(await db.automationRun.count({ where: { id: question.id } })).toBe(0);
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+            expect((await list(current)).statusCode).toBe(403);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+            const next = await daemon(replacement);
+            const claimed = await claim(next);
+            expect(claimed.statusCode).toBe(200);
+            expect(claimed.json()).toMatchObject({ runId: question.id, state: 'CLAIMED' });
+            expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt).not.toBeNull();
+        } finally {
+            await app.close();
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+            await db.machine.update({ where: { id: machineId }, data: { automationContextIsolationVersion: 0 } });
+            await db.machine.deleteMany({ where: { id: 'question-legacy-machine' } });
+            await db.project.delete({ where: { id: project.id } });
+            vi.unstubAllEnvs();
+            if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
+            else process.env.HANDY_MASTER_SECRET = priorSecret;
         }
     });
 
