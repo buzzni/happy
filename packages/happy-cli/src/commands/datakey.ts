@@ -220,6 +220,7 @@ async function handleHarden(): Promise<void> {
         token: credentials.token,
         publicKey: credentials.encryption.publicKey,
         machineKey: credentials.encryption.machineKey,
+        viewerPublicKey: credentials.encryption.viewerPublicKey,
       })
     },
     discardPendingRotation: () => rm(pendingMachineKeyRotationFile(), { force: true }),

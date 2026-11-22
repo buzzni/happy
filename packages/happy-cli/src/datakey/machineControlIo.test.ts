@@ -73,6 +73,18 @@ describe('createMachineControlIo', () => {
         expect(readMachineIdentity()).toMatchObject({ machineId: 'machine-1', machineKey: encodeBase64(machineKey) });
     });
 
+    // aplus-dev-studio specs/script-automation-viewer-key R3
+    it('keeps the automation viewer public key in the replaced access.key', async () => {
+        const machineKey = new Uint8Array(32).fill(7);
+        const publicKey = new Uint8Array(32).fill(2);
+        const viewerPublicKey = new Uint8Array(32).fill(9);
+
+        await replaceCredentialsDataKey({ token: 'token', publicKey, machineKey: new Uint8Array(32).fill(8) });
+        await io.writeCredentials({ token: 'token', encryption: { type: 'dataKey', publicKey, machineKey, viewerPublicKey } });
+
+        expect((await readCredentials())!.encryption).toEqual({ type: 'dataKey', publicKey, machineKey, viewerPublicKey });
+    });
+
     it('reads the account envelope and metadata version, and a missing machine as null', async () => {
         get.mockResolvedValueOnce({ data: { machine: { dataEncryptionKey: 'envelope', metadataVersion: 4 } } });
         await expect(io.fetchMachine('machine-1')).resolves.toEqual({ dataEncryptionKey: 'envelope', metadataVersion: 4 });

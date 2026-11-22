@@ -387,7 +387,8 @@ const credentialsSchema = z.object({
     publicKey: z.string().base64(),
     machineKey: z.string().base64(),
     // Read leniently: an unexpected value must not cost the whole credential.
-    neverEscrowed: z.boolean().optional()
+    neverEscrowed: z.boolean().optional(),
+    viewerPublicKey: z.unknown().optional()
   }).nullish()
 })
 
@@ -409,8 +410,20 @@ export type Credentials = {
      * key generated under strict machine control, which the server has never
      * been sent. Absent means the server may hold a copy.
      */
-    neverEscrowed?: true
+    neverEscrowed?: true,
+    /**
+     * aplus-dev-studio specs/script-automation-viewer-key R1 — the automation
+     * viewer public key the account secret derives, kept when the secret left
+     * this file. Absent when this machine never held the secret.
+     */
+    viewerPublicKey?: Uint8Array
   }
+}
+
+function viewerPublicKeyField(value: unknown): { viewerPublicKey?: Uint8Array } {
+  if (typeof value !== 'string' || !z.string().base64().safeParse(value).success) return {};
+  const key = new Uint8Array(Buffer.from(value, 'base64'));
+  return key.length === 32 ? { viewerPublicKey: key } : {};
 }
 
 /**
@@ -443,7 +456,8 @@ export function parseCredentials(raw: unknown): Credentials | null {
           type: 'dataKey',
           publicKey: new Uint8Array(Buffer.from(credentials.encryption.publicKey, 'base64')),
           machineKey: new Uint8Array(Buffer.from(credentials.encryption.machineKey, 'base64')),
-          ...(credentials.encryption.neverEscrowed === true ? { neverEscrowed: true as const } : {})
+          ...(credentials.encryption.neverEscrowed === true ? { neverEscrowed: true as const } : {}),
+          ...viewerPublicKeyField(credentials.encryption.viewerPublicKey)
         }
       }
     }
@@ -508,7 +522,7 @@ export async function writeCredentialsDataKey(credentials: { publicKey: Uint8Arr
  * the old file or the new one and never half of either.
  */
 export async function replaceCredentialsDataKey(credentials: {
-  publicKey: Uint8Array, machineKey: Uint8Array, token: string, neverEscrowed?: boolean
+  publicKey: Uint8Array, machineKey: Uint8Array, token: string, neverEscrowed?: boolean, viewerPublicKey?: Uint8Array
 }): Promise<void> {
   if (!existsSync(configuration.happyHomeDir)) {
     await mkdir(configuration.happyHomeDir, { recursive: true, mode: PRIVATE_DIR_MODE })
@@ -517,7 +531,8 @@ export async function replaceCredentialsDataKey(credentials: {
     encryption: {
       publicKey: encodeBase64(credentials.publicKey),
       machineKey: encodeBase64(credentials.machineKey),
-      ...(credentials.neverEscrowed ? { neverEscrowed: true } : {})
+      ...(credentials.neverEscrowed ? { neverEscrowed: true } : {}),
+      ...(credentials.viewerPublicKey ? { viewerPublicKey: encodeBase64(credentials.viewerPublicKey) } : {})
     },
     token: credentials.token
   }, null, 2));
