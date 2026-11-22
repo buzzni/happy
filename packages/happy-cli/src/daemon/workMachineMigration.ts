@@ -67,6 +67,7 @@ const exportStateSchema = manifestSchema.omit({ jobId: true, machineId: true, so
     .extend({ md5: z.array(z.string()) });
 const recipientFileSchema = z.object({ approval: z.unknown(), recipientSecret: z.string() });
 const restoredSchema = z.object({ deviceId, dataEncryptionKey: z.string(), proof: z.unknown(), manifestSha256: sha256Hex });
+const placingSchema = z.object({ manifestSha256: sha256Hex, placed: z.array(z.string()) });
 const restoreProofSchema = z.object({
     deviceId, dataEncryptionKey: z.string(),
     proof: z.object({ issuedAt: z.number(), publicKey: z.string(), signature: z.string() }),
@@ -321,9 +322,9 @@ export async function assertWorkMachineTargetHome(home: string, configuredMachin
     }
 }
 
-async function assertNothingToOverwrite(home: string, manifest: Manifest): Promise<void> {
+async function assertNothingToOverwrite(home: string, manifest: Manifest, placed: ReadonlySet<string>): Promise<void> {
     for (const path of manifest.paths) {
-        if (await exists(path)) throw new Error(`Refusing to overwrite an existing path on this machine: ${path}`);
+        if (!placed.has(path) && await exists(path)) throw new Error(`Refusing to overwrite an existing path on this machine: ${path}`);
     }
     const { sessions } = await readSessionStore(home);
     const taken = manifest.sessions.find(session => session.sessionId in sessions);
@@ -449,8 +450,13 @@ export async function importWorkMachine(input: TransferEndpoint & {
     const { manifest, sha256 } = verifiedManifest(await client.manifest(), approval, input.jobId);
     const placedPath = join(importDirectory, 'placed.json');
     if (!await exists(placedPath)) {
+        // Paths an interrupted run of this same manifest already moved in: a rerun finishes the rest
+        // instead of refusing its own work. A path is listed only after its move completed.
+        const placingPath = join(importDirectory, 'placing.json');
+        const placing = placingSchema.safeParse(await readJson(placingPath));
+        const placed = new Set(placing.success && placing.data.manifestSha256 === sha256 ? placing.data.placed : []);
         await assertWorkMachineTargetHome(input.home, input.configuredMachineId, approval.machineId);
-        await assertNothingToOverwrite(input.home, manifest);
+        await assertNothingToOverwrite(input.home, manifest, placed);
         await assertDiskSpace(importDirectory, manifest);
         const { sealed, receipt } = await downloadArchive(client, manifest, importDirectory);
         const recipientSecret = Buffer.from(recipientFile.data.recipientSecret, 'base64url');
@@ -464,8 +470,13 @@ export async function importWorkMachine(input: TransferEndpoint & {
         try {
             const records = await extractWorkMachineArchive({ archivePath: archive.archivePath, roots: manifest.paths, staging });
             await assertRestorableRoots(manifest, records, staging, input);
-            await assertNothingToOverwrite(input.home, manifest);
-            for (const path of manifest.paths) await movePath(join(staging, 'fs', path), path);
+            await assertNothingToOverwrite(input.home, manifest, placed);
+            for (const path of manifest.paths) {
+                if (placed.has(path) && await exists(path)) continue;
+                await movePath(join(staging, 'fs', path), path);
+                placed.add(path);
+                await replacePrivateFile(placingPath, JSON.stringify({ manifestSha256: sha256, placed: [...placed] }));
+            }
             const store = await readSessionStore(input.home);
             await replacePrivateFile(join(input.home, 'sessions.json'), JSON.stringify({ ...store, sessions: { ...store.sessions, ...records } }));
         } finally {
