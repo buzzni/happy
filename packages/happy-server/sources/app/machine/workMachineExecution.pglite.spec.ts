@@ -37,6 +37,7 @@ import * as machineSockets from '@/app/events/findMachineSockets';
 import { eventRouter } from '@/app/events/eventRouter';
 import { SCRIPT_CLAIM_LEASE_MS } from '@/app/automation/scriptInvocationService';
 import { SESSION_FOLLOWUP_CLAIM_MS } from '@/app/automation/sessionFollowupExecutionService';
+import { SESSION_FOLLOWUP_WIRE_VERSION } from '@slopus/happy-wire';
 import * as authority from './workMachineExecution';
 import {
     authorizeWorkMachineExecution,
@@ -1248,6 +1249,55 @@ describe('work machine execution authority', () => {
             expect(await claim(worker({ ...replacement, purpose: 'daemon', expiresAt }), automations[2].id)).toMatchObject({ ok: true });
         } finally {
             await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+            await db.project.delete({ where: { id: project.id } });
+            vi.unstubAllEnvs();
+        }
+    });
+
+    it('records the replacement first execution when its socket claims automation work, not when a claim is refused', async () => {
+        vi.stubEnv('SAYCODE_AUTOMATION_ENABLED', 'true');
+        const project = await db.project.create({ data: {
+            accountId, name: 'replacement-claims', automationViewerKeyVersion: 1, config: { machineId },
+        } });
+        await db.machine.update({ where: { id: machineId }, data: { automationKeyVersion: 1 } });
+        const keys = {
+            viewerKeyVersion: 1, viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+        };
+        const automation = await db.automation.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, payloadVersion: 1,
+            payloadCiphertext: new Uint8Array(1), viewerKeyId: 'viewer-replacement', enabledAt: new Date(Date.now() - 60_000), ...keys,
+        } });
+        const followup = await db.sessionFollowup.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, sessionId: 'replacement-followup-session',
+            payloadCiphertext: new Uint8Array(1), viewerKeyId: 'viewer-followup', totalRounds: 3, currentRound: 1,
+            responseBoundarySeq: 0, lastObservedSeq: 0, ...keys,
+        } });
+        const handlers = new Map<string, (data: unknown, callback: (result: unknown) => void) => Promise<void>>();
+        automationSocketHandler(accountId, machineId, { on: (event: string, handler: never) => handlers.set(event, handler) } as never,
+            { ...replacement, purpose: 'daemon', expiresAt: Date.now() + 60_000 } as never);
+        const send = (event: string, data: object) => new Promise<{ ok: boolean; error?: string }>(resolve =>
+            void handlers.get(event)!(data, resolve as never));
+        const firstExecution = async () => (await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt;
+        try {
+            expect(await freezeWorkMachineExecution(db, original)).toBe(true);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+
+            expect(await send('automation-claim', { automationId: automation.id, generation: 99, scheduledFor: Date.now() }))
+                .toEqual({ ok: false, error: 'claim-denied' });
+            expect(await send('session-followup-claim', { wireVersion: SESSION_FOLLOWUP_WIRE_VERSION, followupId: followup.id, generation: 1, step: 99 }))
+                .toEqual({ ok: false, error: 'claim-denied' });
+            expect(await firstExecution()).toBeNull();
+
+            expect(await send('session-followup-claim', { wireVersion: SESSION_FOLLOWUP_WIRE_VERSION, followupId: followup.id, generation: 1, step: 1 }))
+                .toMatchObject({ ok: true });
+            expect(await firstExecution()).not.toBeNull();
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { firstExecutionAt: null } });
+            expect(await send('automation-claim', { automationId: automation.id, generation: 1, scheduledFor: Date.now() }))
+                .toMatchObject({ ok: true });
+            expect(await firstExecution()).not.toBeNull();
+            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).not.toBe(true);
+        } finally {
             await db.project.delete({ where: { id: project.id } });
             vi.unstubAllEnvs();
         }
