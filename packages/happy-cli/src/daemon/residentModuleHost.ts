@@ -5,8 +5,10 @@ import { createServer } from 'node:http'
 import { join } from 'node:path'
 
 /** Loads verified installation code once. Session data and project files never reach this listener. */
-export function startResidentModuleHost(root: string) {
-  const source = join(root, 'dist', 'win32-resident')
+export function startResidentModuleHost(root: string, platform = process.platform) {
+  const dist = join(root, 'dist')
+  // macOS and Linux retain the installed module graph and native sandbox assets.
+  const source = platform === 'win32' ? join(dist, 'win32-resident') : dist
   const token = randomBytes(32).toString('hex')
   let descriptor: string | undefined
   let stopping = false
