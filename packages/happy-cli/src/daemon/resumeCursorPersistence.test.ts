@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import {
     RESUME_CURSOR_PERSIST_INTERVAL_MS,
     decideResumeCursorPersist,
+    withReportedProviderIdentity,
 } from './resumeCursorPersistence';
 
 // 2026-08-24 finding: on a live prod machine 15 of 86 persisted sessions were
@@ -108,5 +109,26 @@ describe('decideResumeCursorPersist', () => {
             lastPersistAt: undefined,
             now,
         })).toBe(true);
+    });
+});
+
+// aplus specs/work-machine-migration 5.4: the record is written at session start, before the provider
+// names its conversation, and a stopped (frozen) work machine's export has only this record to read.
+describe('withReportedProviderIdentity', () => {
+    const metadata: { path: string; flavor: string; claudeSessionId?: string; codexThreadId?: string } = { path: '/work/project', flavor: 'claude' };
+
+    it('adds the reported provider conversation to the record metadata', () => {
+        expect(withReportedProviderIdentity(metadata, { claudeSessionId: 'claude-1' }))
+            .toEqual({ path: '/work/project', flavor: 'claude', claudeSessionId: 'claude-1' });
+    });
+
+    it('leaves a record that already names it unchanged', () => {
+        expect(withReportedProviderIdentity({ ...metadata, codexThreadId: 'thread-1' }, { codexThreadId: 'thread-1' })).toBeNull();
+        expect(withReportedProviderIdentity(metadata, undefined)).toBeNull();
+    });
+
+    it('writes a changed identity at once, even when the cursor has not moved', () => {
+        expect(decideResumeCursorPersist({ cursor: 12, persistedCursor: 12, lastPersistAt: 1_000_000, now: 1_000_001, metadataChanged: true })).toBe(true);
+        expect(decideResumeCursorPersist({ cursor: undefined, persistedCursor: 12, now: 1_000_001, metadataChanged: true })).toBe(false);
     });
 });

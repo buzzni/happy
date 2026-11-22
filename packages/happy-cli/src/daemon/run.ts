@@ -200,7 +200,7 @@ import {
   resolveAutomationDirectoryMatch,
   shareInFlight,
 } from './resumeGuards';
-import { decideResumeCursorPersist } from './resumeCursorPersistence';
+import { decideResumeCursorPersist, withReportedProviderIdentity, type ProviderIdentity } from './resumeCursorPersistence';
 import { createSessionRetention, retentionProtects } from './sessionRetention';
 import { readStaleRuntimeRestartConfig, sweepStaleRuntimeSessions } from './staleRuntimeSessionRestart';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
@@ -1842,6 +1842,7 @@ export async function startDaemon(): Promise<void> {
         launchedBackgroundJob?: boolean;
         lastProcessedSeq?: number;
         mode?: 'local' | 'remote';
+        providerIdentity?: ProviderIdentity;
         updatedAt: number;
       },
       reporter?: { hostPid?: number },
@@ -1945,10 +1946,14 @@ export async function startDaemon(): Promise<void> {
         pendingUserInput: trackedSession.runtime.pendingUserInput ?? false,
       });
 
+      // The record names the provider conversation once the session does (withReportedProviderIdentity).
+      const metadata = trackedSession.happySessionMetadataFromLocalWebhook;
+      const identified = metadata ? withReportedProviderIdentity(metadata, runtime.providerIdentity) : null;
+      if (identified) trackedSession.happySessionMetadataFromLocalWebhook = identified;
       // The cursor only exists in memory until something writes it. A daemon
       // killed without its clean-stop handlers takes it to the grave and the
       // session can never be resumed — see persistResumeCursorIfDue.
-      persistResumeCursorIfDue(trackedSession);
+      persistResumeCursorIfDue(trackedSession, identified !== null);
     };
 
     let resolveManagedAiCredentialEnvironment = async (
@@ -3183,7 +3188,7 @@ export async function startDaemon(): Promise<void> {
      * running: the persisted record keeps its start-time snapshot and resume
      * refuses with `SESSION_CURSOR_MISSING` forever.
      */
-    const persistResumeCursorIfDue = (session: TrackedSession): void => {
+    const persistResumeCursorIfDue = (session: TrackedSession, metadataChanged = false): void => {
       const sessionId = session.happySessionId;
       const metadata = session.happySessionMetadataFromLocalWebhook;
       if (!sessionId || !session.encryption || !metadata) return;
@@ -3195,6 +3200,7 @@ export async function startDaemon(): Promise<void> {
         persistedCursor: session.persistedLastProcessedSeq,
         lastPersistAt: resumeCursorPersistedAt.get(sessionId),
         now,
+        metadataChanged,
       })) return;
 
       persistSession(sessionId, {
@@ -6825,13 +6831,17 @@ export async function startDaemon(): Promise<void> {
         `[lesson-host] shutdown: ${(error as Error).message}`,
       ));
 
-      // Update daemon state before shutting down
-      await apiMachine.updateDaemonState((state: DaemonState | null) => ({
-        ...state,
-        status: 'shutting-down',
-        shutdownRequestedAt: Date.now(),
-        shutdownSource: source
-      }));
+      // Update daemon state before shutting down. Best effort and bounded: the server never
+      // answers a frozen work machine generation, and the stop must still finish cleanly.
+      await Promise.race([
+        apiMachine.updateDaemonState((state: DaemonState | null) => ({
+          ...state,
+          status: 'shutting-down',
+          shutdownRequestedAt: Date.now(),
+          shutdownSource: source
+        })),
+        new Promise(resolve => setTimeout(resolve, 3_000).unref()),
+      ]);
 
       // Give time for metadata update to send
       await new Promise(resolve => setTimeout(resolve, 100));

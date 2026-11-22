@@ -865,6 +865,12 @@ export class ApiSessionClient extends EventEmitter {
 
                 if (data.body.t === 'new-message') {
                     if (this.shutdownReceiveSeq !== null) return;
+                    // A work machine generation that froze can still hold this socket. Its input comes
+                    // only through the read the server authorizes per request (refused once frozen).
+                    if (this.disposeWorkMachineCredential) {
+                        this.receiveSync.invalidate();
+                        return;
+                    }
                     this.receivePollDelayMs = ApiSessionClient.RECEIVE_POLL_INTERVAL_MS;
                     this.receivePollTicksRemaining = 1;
                     const messageSeq = data.body.message?.seq;
@@ -2375,6 +2381,9 @@ export class ApiSessionClient extends EventEmitter {
             // swallows messages that arrive while the session has no process.
             lastProcessedSeq: Math.min(this.runtimeProcessedSeqCap ?? this.lastSeq, this.shutdownReceiveSeq ?? Infinity),
             mode: this.currentMode,
+            // The daemon's resume record names the provider conversation from here (a work machine export reads it).
+            ...(typeof this.metadata?.claudeSessionId === 'string' ? { claudeSessionId: this.metadata.claudeSessionId } : {}),
+            ...(typeof this.metadata?.codexThreadId === 'string' ? { codexThreadId: this.metadata.codexThreadId } : {}),
         }).then(settled, settled);
     }
 
