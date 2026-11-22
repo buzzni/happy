@@ -124,13 +124,22 @@ export async function authorizeWorkMachineSession(
     return session !== null;
 }
 
-/** Keep a verified write in the old generation from crossing a concurrent transition. */
-export async function lockWorkMachineExecution(db: Pick<ExecutionDb, '$queryRaw'>, grant: WorkMachineDeviceGrant): Promise<boolean> {
+/**
+ * Keep a verified write in the old generation from crossing a concurrent
+ * transition. Work already under way continues while draining; `newWork`
+ * (a new conversation, an automation claim) also needs the generation to be
+ * outside drain.
+ */
+export async function lockWorkMachineExecution(
+    db: Pick<ExecutionDb, '$queryRaw'>,
+    grant: WorkMachineDeviceGrant,
+    { newWork = false }: { newWork?: boolean } = {},
+): Promise<boolean> {
     const current = await db.$queryRaw<{ machineId: string }[]>`
         SELECT "machineId" FROM "WorkMachineExecution"
         WHERE "machineId" = ${grant.machineId} AND "accountId" = ${grant.accountId}
           AND "deviceId" = ${grant.deviceId} AND "generation" = ${grant.generation}
-          AND "frozenAt" IS NULL
+          AND "frozenAt" IS NULL AND (${!newWork} OR "drainingAt" IS NULL)
         FOR SHARE
     `;
     return current.length === 1;

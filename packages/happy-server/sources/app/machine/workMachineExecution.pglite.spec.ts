@@ -34,6 +34,7 @@ import {
 } from '@/app/api/socket/machineSocketAuth';
 import { createWorkMachineExecutionTokenIssuer } from '@/app/auth/workMachineExecutionToken';
 import * as machineSockets from '@/app/events/findMachineSockets';
+import { eventRouter } from '@/app/events/eventRouter';
 import * as authority from './workMachineExecution';
 import {
     authorizeWorkMachineExecution,
@@ -975,6 +976,71 @@ describe('work machine execution authority', () => {
         } finally {
             await app.close();
             vi.unstubAllEnvs();
+            if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
+            else process.env.HANDY_MASTER_SECRET = priorSecret;
+        }
+    });
+
+    it('creates a new conversation attached to the work machine only with the current device daemon credential', async () => {
+        const priorSecret = process.env.HANDY_MASTER_SECRET;
+        process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+        const app = fastify();
+        app.setValidatorCompiler(validatorCompiler);
+        app.setSerializerCompiler(serializerCompiler);
+        const updates = vi.spyOn(eventRouter, 'emitUpdate').mockImplementation(() => {});
+        try {
+            await auth.init();
+            enableAuthentication(app as unknown as Fastify);
+            enableSessionScopeAuthentication(app as unknown as Fastify, () => null);
+            sessionRoutes(app as unknown as Fastify);
+            const daemon = (device: typeof original, target = machineId) => {
+                const now = Date.now();
+                return auth.workMachineExecutionIssuer!.mint({ ...device, machineId: target, purpose: 'daemon', expiresAt: now + 60_000 }, now);
+            };
+            const create = (token: string, tag: string, extra: object = {}) => app.inject({
+                method: 'POST', url: '/v1/sessions', headers: { authorization: `Bearer ${token}` },
+                payload: { tag, metadata: 'encrypted-new', dataEncryptionKey: Buffer.from('key').toString('base64'), ...extra },
+            });
+            const current = await daemon(original);
+
+            const created = await create(current, 'device-new-1');
+            expect(created.statusCode).toBe(200);
+            const row = await db.session.findUniqueOrThrow({ where: { id: created.json().session.id } });
+            expect(row).toMatchObject({ accountId, tag: 'device-new-1', workMachineId: machineId, metadata: 'encrypted-new' });
+            expect(updates).toHaveBeenCalledWith(expect.objectContaining({ userId: accountId, recipientFilter: { type: 'user-scoped-only' } }));
+            const retried = await create(current, 'device-new-1');
+            expect(retried.statusCode).toBe(200);
+            expect(retried.json().session.id).toBe(row.id);
+
+            // A tag already used by a conversation outside this work machine is not adopted.
+            await db.session.create({ data: { id: 'unattached-tag', tag: 'device-unattached', accountId, metadata: 'encrypted' } });
+            expect((await create(current, 'device-unattached')).statusCode).toBe(409);
+            // Proof-bound creation stays on its own path; the daemon credential cannot carry one.
+            expect((await create(current, 'device-proof', { ownershipProof: {} })).statusCode).toBe(403);
+            // An account token cannot attach a conversation to the work machine.
+            const legacy = await create(await auth.createToken(accountId), 'legacy-new');
+            expect(legacy.statusCode).toBe(200);
+            expect((await db.session.findUniqueOrThrow({ where: { id: legacy.json().session.id } })).workMachineId).toBeNull();
+            // A machine without device authority and a device that is not current are refused.
+            expect((await create(await daemon(original, 'ordinary-machine'), 'device-ordinary')).statusCode).toBe(403);
+            expect((await create(await daemon({ ...original, deviceId: 'other-pc' }), 'device-other')).statusCode).toBe(403);
+
+            for (const [state, data] of [['draining', { drainingAt: new Date() }], ['frozen', { frozenAt: new Date() }]] as const) {
+                await db.workMachineExecution.update({ where: { machineId }, data });
+                expect((await create(current, `device-${state}`)).statusCode).toBe(403);
+                expect((await create(current, 'device-new-1')).statusCode).toBe(403);
+            }
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null, frozenAt: null } });
+            await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+            expect((await create(current, 'device-old-generation')).statusCode).toBe(403);
+            const next = await create(await daemon(replacement), 'device-new-generation');
+            expect(next.statusCode).toBe(200);
+            expect(await db.session.count({ where: { tag: { in: ['device-draining', 'device-frozen', 'device-old-generation', 'device-ordinary', 'device-other', 'device-proof'] } } })).toBe(0);
+        } finally {
+            updates.mockRestore();
+            await app.close();
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
             if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
             else process.env.HANDY_MASTER_SECRET = priorSecret;
         }

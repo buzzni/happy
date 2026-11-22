@@ -11,7 +11,8 @@ import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { allocateUserSeq } from "@/storage/seq";
 import { sessionDelete } from "@/app/session/sessionDelete";
 import { sessionArchive } from "@/app/session/sessionArchive";
-import { requireSessionScopeAuth, requireAccountPrincipal, requireWorkMachineSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
+import { requireSessionScopeAuth, requireAccountPrincipal, requireWorkMachineSessionScopeAuth, verifyWorkMachineDaemonBearer } from "@/app/api/utils/enableAuthentication";
+import { sessionCreateOnWorkMachine } from "@/app/session/sessionCreateOnWorkMachine";
 import { createExecutionBoundSession, ExecutionBindingError } from "@/app/session/sessionExecutionBinding";
 import { createOwnershipBoundSession, OwnershipError } from "@/app/session/sessionOwnershipBinding";
 
@@ -522,7 +523,15 @@ export function sessionRoutes(app: Fastify) {
                 ownershipProof: z.unknown().optional(),
             }).passthrough()
         },
-        preHandler: app.authenticate
+        // A protected machine's daemon creates conversations with its device
+        // credential; whether that device is current is decided in the
+        // creating transaction, not here.
+        preHandler: async (request, reply) => {
+            const grant = await verifyWorkMachineDaemonBearer(request);
+            if (!grant) return app.authenticate(request, reply);
+            request.userId = grant.accountId;
+            request.workMachineDaemonGrant = grant;
+        }
     }, async (request, reply) => {
         const userId = request.userId;
         const { tag, metadata, dataEncryptionKey } = request.body;
@@ -531,6 +540,25 @@ export function sessionRoutes(app: Fastify) {
         }
         // Socket filtering and the final daemon binding must be accepted before enabling creation.
         if (request.body.piiProtection === true || (request.body.piiMode !== undefined && request.body.piiMode !== 'none')) return reply.code(409).send({ error: 'pii-protection-not-ready' });
+
+        const workMachineGrant = request.workMachineDaemonGrant;
+        if (workMachineGrant) {
+            const refused = () => reply.code(403).send({ error: 'Work machine device authorization required' });
+            if (['executionProof', 'ownershipProof'].some(key => Object.prototype.hasOwnProperty.call(request.body, key))) return refused();
+            const result = await sessionCreateOnWorkMachine(workMachineGrant, {
+                tag, metadata, agentState: request.body.agentState, dataEncryptionKey,
+            });
+            if (result === 'denied') return refused();
+            if (result === 'conflict') return reply.code(409).send({ error: 'Session tag conflict' });
+            const { session } = result;
+            return reply.send({ session: {
+                id: session.id, seq: session.seq, metadata: session.metadata, metadataVersion: session.metadataVersion,
+                agentState: session.agentState, agentStateVersion: session.agentStateVersion,
+                dataEncryptionKey: session.dataEncryptionKey ? Buffer.from(session.dataEncryptionKey).toString('base64') : null,
+                active: session.active, activeAt: session.lastActiveAt.getTime(),
+                createdAt: session.createdAt.getTime(), updatedAt: session.updatedAt.getTime(), lastMessage: null,
+            } });
+        }
 
         const hasOwnership = Object.prototype.hasOwnProperty.call(request.body, 'ownershipProof');
         if (hasOwnership || Object.prototype.hasOwnProperty.call(request.body, 'executionProof')) {
