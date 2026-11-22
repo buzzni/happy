@@ -18,6 +18,7 @@ import { machinesRoutes } from '@/app/api/routes/machinesRoutes';
 import { sessionRoutes } from '@/app/api/routes/sessionRoutes';
 import { sessionOwnershipRoutes } from '@/app/api/routes/sessionOwnershipRoutes';
 import { scriptAutomationRoutes } from '@/app/api/routes/scriptAutomationRoutes';
+import { v3SessionRoutes } from '@/app/api/routes/v3SessionRoutes';
 import { workMachineExecutionRoutes } from '@/app/api/routes/workMachineExecutionRoutes';
 import { enableAuthentication, enableSessionScopeAuthentication } from '@/app/api/utils/enableAuthentication';
 import { canonicalDigest } from '@/app/managed/canonicalDigest';
@@ -448,6 +449,181 @@ describe('work machine execution authority', () => {
         }
     }, 15_000);
 
+    it('drains, freezes, hands off and restores a work machine through idempotent control routes', async () => {
+        const priorSecret = process.env.HANDY_MASTER_SECRET;
+        process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+        const app = fastify();
+        app.setValidatorCompiler(validatorCompiler);
+        app.setSerializerCompiler(serializerCompiler);
+        const studio = generateKeyPairSync('ed25519');
+        const kid = 'handoff-key';
+        const audience = 'handoff-happy';
+        const verifier = createControlAssertionVerifier({
+            audience,
+            verifierKeys: JSON.stringify({ [kid]: studio.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url') }),
+        });
+        const device = () => {
+            const keys = generateKeyPairSync('ed25519');
+            const der = keys.publicKey.export({ format: 'der', type: 'spki' });
+            return { keys, publicKey: der.toString('base64url'), id: createHash('sha256').update(der).digest('base64url') };
+        };
+        const source = device();
+        const target = device();
+        const migrating = 'migrating-machine';
+        const sessionId = 'migrating-session';
+        const envelope = (fill: number) => { const bytes = Buffer.alloc(105, fill); bytes[0] = 0; return bytes; };
+        await db.machine.create({ data: { id: migrating, accountId, metadata: 'encrypted', dataEncryptionKey: envelope(1) } });
+        await db.workMachineExecution.create({ data: { machineId: migrating, accountId, deviceId: source.id, generation: 1 } });
+        await db.session.create({ data: { id: sessionId, tag: sessionId, accountId, metadata: 'encrypted', workMachineId: migrating } });
+        try {
+            await auth.init();
+            enableAuthentication(app as unknown as Fastify);
+            enableSessionScopeAuthentication(app as unknown as Fastify, () => null);
+            workMachineExecutionRoutes(app as unknown as Fastify, () => verifier);
+            v3SessionRoutes(app as unknown as Fastify);
+            const bearer = await auth.createToken(accountId);
+            const accountTokenDigest = createHash('sha256').update(bearer).digest('hex');
+            const control = (action: string, payload: object, op = `work-machine-${action}`) => {
+                const now = Date.now();
+                const bytes = Buffer.from(JSON.stringify({
+                    kid, aud: audience, purpose: 'happy-managed-control', op,
+                    bodyDigest: canonicalDigest({ accountTokenDigest, machineId: migrating, ...payload }),
+                    iat: now, exp: now + 5000,
+                }));
+                const route = action === 'mcp-reconcile' ? 'mcp-reconcile' : `execution-${action}`;
+                return app.inject({
+                    method: 'POST', url: `/v1/work-machines/${migrating}/${route}`, payload,
+                    headers: {
+                        authorization: `Bearer ${bearer}`,
+                        'x-happy-control-assertion': `${bytes.toString('base64url')}.${sign(null, bytes, studio.privateKey).toString('base64url')}`,
+                    },
+                });
+            };
+            const state = async () => (await control('state', {}, 'work-machine-execution-state')).json();
+            const handoffProof = (
+                signer: ReturnType<typeof device>, tag: 'replace' | 'restore', generation: number, nextDeviceId: string, key: Buffer,
+            ) => {
+                const issuedAt = Date.now();
+                const digest = createHash('sha256').update(key).digest('base64url');
+                const scope = [`happy-work-machine-${tag}-v1`, migrating, generation, nextDeviceId, digest, issuedAt];
+                return {
+                    issuedAt, publicKey: signer.publicKey,
+                    signature: sign(null, Buffer.from(JSON.stringify(scope)), signer.keys.privateKey).toString('base64url'),
+                };
+            };
+            const replaceBody = (generation: number, key: Buffer, signer = target, signedKey = key) => ({
+                deviceId: source.id, generation, replacementDeviceId: target.id, dataEncryptionKey: key.toString('base64'),
+                proof: handoffProof(signer, 'replace', generation, target.id, signedKey),
+            });
+            const restoreBody = (generation: number, key: Buffer) => ({
+                deviceId: target.id, generation, originalDeviceId: source.id, dataEncryptionKey: key.toString('base64'),
+                proof: handoffProof(source, 'restore', generation, source.id, key),
+            });
+            const sessionToken = (deviceId: string, generation: number) => {
+                const now = Date.now();
+                return auth.workMachineExecutionIssuer!.mint({
+                    accountId, machineId: migrating, deviceId, generation, sessionId, purpose: 'session', expiresAt: now + 60_000,
+                }, now);
+            };
+            const permit = async (token: string) => (await app.inject({
+                method: 'POST', url: `/v1/sessions/${sessionId}/work-machine-permit`, headers: { authorization: `Bearer ${token}` },
+            })).statusCode;
+            const write = async (token: string, localId: string) => (await app.inject({
+                method: 'POST', url: `/v3/sessions/${sessionId}/messages`, headers: { authorization: `Bearer ${token}` },
+                payload: { messages: [{ content: 'encrypted-body', localId }] },
+            })).statusCode;
+            const at = (generation: number, deviceId = source.id) => ({ deviceId, generation });
+
+            expect(await state()).toEqual({
+                mode: 'device', deviceId: source.id, generation: 1, frozen: false, draining: false, firstExecution: false, openMcpCalls: [],
+            });
+            const unsigned = await app.inject({
+                method: 'POST', url: `/v1/work-machines/${migrating}/execution-drain`, payload: at(1),
+                headers: { authorization: `Bearer ${bearer}` },
+            });
+            expect(unsigned.statusCode).toBe(403);
+            expect((await control('drain', at(1), 'work-machine-freeze')).statusCode).toBe(403);
+            expect((await control('freeze', at(1))).statusCode).toBe(409);
+            expect((await control('drain', at(2))).statusCode).toBe(409);
+
+            // Cancel before the handoff: drain, freeze, then resume in the same generation.
+            const drained = { deviceId: source.id, generation: 1, draining: true, frozen: false };
+            const frozen = { ...drained, frozen: true };
+            const active = { ...drained, draining: false };
+            for (const [action, expected] of [['drain', drained], ['freeze', frozen], ['resume', active]] as const) {
+                const first = await control(action, at(1));
+                expect(first.statusCode).toBe(200);
+                expect(first.json()).toEqual(expected);
+                const retry = await control(action, at(1));
+                expect(retry.statusCode).toBe(200);
+                expect(retry.json()).toEqual(expected);
+            }
+
+            const sourceToken = await sessionToken(source.id, 1);
+            expect((await control('drain', at(1))).json()).toEqual(drained);
+            expect(await permit(sourceToken)).toBe(403);
+            expect(await write(sourceToken, 'in-turn-reply')).toBe(200);
+            const requestId = crypto.randomUUID();
+            expect(await authority.admitWorkMachineMcpCall(db, { accountId, machineId: migrating, ...at(1) }, requestId)).toBe(true);
+            const draining = await state();
+            expect(draining).toMatchObject({ draining: true, frozen: false, firstExecution: true });
+            expect(draining.openMcpCalls).toEqual([{ requestId, admittedAt: expect.any(Number) }]);
+            expect((await control('mcp-reconcile', { ...at(1), requestId })).statusCode).toBe(409);
+            expect((await control('freeze', at(1))).json()).toEqual(frozen);
+            expect(await write(sourceToken, 'after-freeze')).toBe(403);
+
+            const nextKey = envelope(2);
+            expect((await control('replace', replaceBody(1, nextKey))).statusCode).toBe(409);
+            expect((await db.machine.findUniqueOrThrow({ where: { id: migrating } })).dataEncryptionKey).toEqual(new Uint8Array(envelope(1)));
+            const reconciled = await control('mcp-reconcile', { ...at(1), requestId });
+            expect(reconciled.statusCode).toBe(200);
+            expect(reconciled.json()).toEqual({ requestId, reconciledAt: expect.any(Number) });
+            expect((await control('mcp-reconcile', { ...at(1), requestId })).json()).toEqual(reconciled.json());
+            expect((await control('mcp-reconcile', { ...at(1), requestId: crypto.randomUUID() })).statusCode).toBe(404);
+            expect((await state()).openMcpCalls).toEqual([]);
+
+            expect((await control('replace', replaceBody(1, nextKey, source))).statusCode).toBe(403);
+            expect((await control('replace', replaceBody(1, nextKey, target, envelope(3)))).statusCode).toBe(403);
+            expect((await control('replace', { ...replaceBody(1, nextKey), dataEncryptionKey: 'not-an-envelope' })).statusCode).toBe(400);
+            const before = await db.machine.findUniqueOrThrow({ where: { id: migrating } });
+            const replaced = await control('replace', replaceBody(1, nextKey));
+            expect(replaced.statusCode).toBe(200);
+            expect(replaced.json()).toEqual({ deviceId: target.id, generation: 2 });
+            const retried = await control('replace', replaceBody(1, nextKey));
+            expect(retried.statusCode).toBe(200);
+            expect(retried.json()).toEqual(replaced.json());
+            expect((await control('replace', replaceBody(1, envelope(4)))).statusCode).toBe(409);
+            const after = await db.machine.findUniqueOrThrow({ where: { id: migrating } });
+            expect(after.dataEncryptionKey).toEqual(new Uint8Array(nextKey));
+            expect(after.metadataVersion).toBe(before.metadataVersion + 1);
+            expect(after.daemonStateVersion).toBe(before.daemonStateVersion + 1);
+            expect(await state()).toEqual({
+                mode: 'device', deviceId: target.id, generation: 2, frozen: false, draining: false, firstExecution: false, openMcpCalls: [],
+            });
+            expect(await permit(sourceToken)).toBe(403);
+
+            // Roll back before the replacement runs anything.
+            const originalKey = envelope(5);
+            const restored = await control('restore', restoreBody(2, originalKey));
+            expect(restored.statusCode).toBe(200);
+            expect(restored.json()).toEqual({ deviceId: source.id, generation: 3 });
+            expect((await control('restore', restoreBody(2, originalKey))).json()).toEqual(restored.json());
+            expect((await db.machine.findUniqueOrThrow({ where: { id: migrating } })).dataEncryptionKey).toEqual(new Uint8Array(originalKey));
+
+            // Hand off again; once the replacement has a first execution permit, rollback is refused.
+            for (const action of ['drain', 'freeze'] as const) expect((await control(action, at(3))).statusCode).toBe(200);
+            expect((await control('replace', replaceBody(3, envelope(6)))).json()).toEqual({ deviceId: target.id, generation: 4 });
+            expect(await permit(await sessionToken(target.id, 4))).toBe(204);
+            expect((await state()).firstExecution).toBe(true);
+            expect((await control('restore', restoreBody(4, envelope(7)))).statusCode).toBe(409);
+            expect((await state()).deviceId).toBe(target.id);
+        } finally {
+            await app.close();
+            if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
+            else process.env.HANDY_MASTER_SECRET = priorSecret;
+        }
+    });
+
     it('issues scoped credentials only with both control-plane proof and current device authority', async () => {
         const priorSecret = process.env.HANDY_MASTER_SECRET;
         process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
@@ -498,7 +674,10 @@ describe('work machine execution authority', () => {
             expect((await state('ordinary-machine', stateProof(machineId))).statusCode).toBe(403);
             expect((await state('ordinary-machine', stateProof('ordinary-machine'))).json()).toEqual({ mode: 'legacy' });
             expect((await state(machineId, stateProof(machineId))).json())
-                .toEqual({ mode: 'device', deviceId: original.deviceId, generation: 1, frozen: false });
+                .toEqual({
+                    mode: 'device', deviceId: original.deviceId, generation: 1,
+                    frozen: false, draining: false, firstExecution: false, openMcpCalls: [],
+                });
             const mintState = (targetMachineId: string, signedTarget: string = targetMachineId) => app.inject({
                 method: 'POST',
                 url: '/v1/work-machines/mcp-mint-state',
@@ -580,7 +759,10 @@ describe('work machine execution authority', () => {
             expect((await signedCall('finish', proof(call, 'work-machine-mcp-finish'))).statusCode).toBe(204);
             expect(await db.workMachineMcpCall.count({ where: { requestId: call.requestId, completedAt: { not: null } } })).toBe(1);
             expect((await state(machineId, stateProof(machineId))).json())
-                .toEqual({ mode: 'device', deviceId: original.deviceId, generation: 1, frozen: true });
+                .toEqual({
+                    mode: 'device', deviceId: original.deviceId, generation: 1,
+                    frozen: true, draining: false, firstExecution: true, openMcpCalls: [],
+                });
             expect((await readMachine(machineId)).statusCode).toBe(403);
             expect((await machineIdentity(machineId, daemonToken)).statusCode).toBe(403);
 
