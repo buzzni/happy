@@ -27,10 +27,11 @@ filters=(--filter "@buzzni/happy-cli..." --filter "happy-server-self-host...")
 if [ ! -f node_modules/.rehearsal-lock ] || ! cmp -s pnpm-lock.yaml node_modules/.rehearsal-lock; then
     pnpm install --frozen-lockfile --ignore-scripts "${filters[@]}"
     node patches/fix-pglite-prisma-bytes.cjs
-    (cd packages/happy-server && npx prisma generate --schema=prisma/schema.prisma >/dev/null)
     (cd packages/happy-cli && node scripts/unpack-tools.cjs && pnpm rebuild node-pty >/dev/null)
     cp pnpm-lock.yaml node_modules/.rehearsal-lock
 fi
+# The schema changes without the lockfile; a cached client would miss new columns.
+(cd packages/happy-server && npx prisma generate --schema=prisma/schema.prisma >/dev/null)
 pnpm --filter @slopus/happy-wire build >/dev/null
 cd packages/happy-cli
 exec npx vitest run --project integration-work-machine-rehearsal "$@"
