@@ -36,6 +36,7 @@ import {
 } from '@/app/events/findMachineSockets';
 import { log } from '@/utils/log';
 import { randomUUID } from 'node:crypto';
+import { readTerminalOwnerKey, registerTerminalManagement } from './terminalManagement';
 import {
     addTerminalSession,
     getTerminalSession,
@@ -183,6 +184,9 @@ function pageFields(data: any): { more?: boolean; nextSeq?: number; droppedChars
 }
 
 export function terminalRelayHandler(userId: string, socket: Socket): void {
+    registerTerminalManagement(socket, userId, (socketId, sessionId) => {
+        emitToSocket(socketId, 'terminal-close-fwd', { sessionId });
+    });
     socket.on('terminal-open', async (data: any, ack?: (response: any) => void) => {
         const reply = (resp: any) => { if (typeof ack === 'function') ack(resp); };
         try {
@@ -192,8 +196,12 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
                 return;
             }
 
-            if (await countActiveSessionsForUser(userId) >= MAX_TERMINALS_PER_USER) {
-                reply({ ok: false, error: 'Too many active terminals' });
+            const ownerKey = readTerminalOwnerKey(socket, data?.ownerKey);
+            const active = await countActiveSessionsForUser(userId);
+            if (active >= MAX_TERMINALS_PER_USER) {
+                reply({ ok: false, error: 'Too many active terminals', ...(data?.capacityVersion === 1
+                    ? { capacity: { version: 1, limit: MAX_TERMINALS_PER_USER, active, manageable: !!ownerKey } }
+                    : {}) });
                 return;
             }
 
@@ -222,6 +230,7 @@ export function terminalRelayHandler(userId: string, socket: Socket): void {
                 clientSocketId: socket.id,
                 daemonSocketId: daemonSocket.id,
                 createdAt: Date.now(),
+                ...(ownerKey ? { ownerKey } : {}),
             });
             let daemonAck: unknown;
             try {

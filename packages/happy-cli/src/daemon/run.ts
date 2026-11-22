@@ -6,6 +6,7 @@ import { readBrowserTaskPidStartTime } from './browserTaskSessionOwner';
 import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship } from './ownedSpawnRuntime';
+import { ownershipHappyOrigin, ownershipTrustEnv } from './sessionOwnershipTrust';
 import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
 import { drainBashRpcs } from '@/modules/common/bashRpcScheduler';
@@ -50,7 +51,7 @@ import { runManagedScript } from './automations/managedScriptRunner';
 
 import { ApiClient } from '@/api/api';
 import { TrackedSession, SessionEncryptionData } from './types';
-import { MachineMetadata, DaemonState, Metadata, Machine } from '@/api/types';
+import { MachineMetadata, DaemonState, Metadata, Machine, SPAWN_SESSION_KEY_CAPABILITY } from '@/api/types';
 import {
   type RecoverSessionOptions,
   type RecoverSessionResult,
@@ -482,6 +483,7 @@ export const initialMachineMetadata: MachineMetadata = {
   channelSupport: CHANNEL_SUPPORT_CAPABILITY,
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
   ...(agentPlanCapabilityForPlatform(process.platform) ? { agentPlan: agentPlanCapabilityForPlatform(process.platform) } : {}),
+  ...(configuration.machineControl === 'strict' ? {} : { spawnSessionKey: SPAWN_SESSION_KEY_CAPABILITY }),
   structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
   writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
   listFilesPage: LIST_FILES_PAGE_CAPABILITY,
@@ -6054,6 +6056,8 @@ export async function startDaemon(): Promise<void> {
     // Default OFF: the route refuses and agent-caller-binding answers only owned-journal sources.
     // A token's account never changes, so only a confirmed answer is remembered; registration is re-read every time.
     const accountByToken = new Map<string, string>();
+    // D5: a released daemon verifies A+ ownership documents with the pinned public trust unless the environment names its own.
+    const ownershipOrigin = ownershipHappyOrigin(configuration.serverUrl), ownershipEnv = ownershipTrustEnv(process.env, ownershipOrigin);
     callerLaunches = createAgentCallerLaunches({ enabled: process.env[OWNER_CONTACT_SWITCH] === '1',
       identity: async () => {
         try {
@@ -6063,8 +6067,8 @@ export async function startDaemon(): Promise<void> {
           return { machineId: state.machineId, happyAccountId, epoch: state.epoch };
         } catch { return null; }
       },
-      trust: () => readOwnerContactTrust(process.env, configuration.serverUrl), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });
-    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: configuration.serverUrl, env: process.env,
+      trust: () => readOwnerContactTrust({ HAPPY_APLUS_STUDIO_ORIGIN: process.env.HAPPY_APLUS_STUDIO_ORIGIN, ...ownershipEnv }, ownershipOrigin), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });
+    const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: ownershipOrigin, env: ownershipEnv,
       registration: ownedRegistration,
       // The Windows trial launch carries no capability pipe, so its owned children keep the daemon-held binding.
       launchCallers: { query: raw => callerLaunches!.query(raw), currentCaller: sessionId => callerLaunches!.currentCaller(sessionId),
@@ -6140,6 +6144,10 @@ export async function startDaemon(): Promise<void> {
       } }),
       ownedSpawn,
       orgSubagent,
+      readSessionEncryption: sessionId => {
+        const persisted = readPersistedSessions()[sessionId];
+        return persisted ? { encryptionKey: persisted.encryptionKey, encryptionVariant: persisted.encryptionVariant } : null;
+      },
       daemonSessionState: createDaemonSessionStateHandler(getCurrentChildren),
       byosOfflineReceive,
       difficultyRouting: difficultyRoutingHost,

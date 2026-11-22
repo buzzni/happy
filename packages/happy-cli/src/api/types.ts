@@ -283,6 +283,11 @@ export const MachineMetadataSchema = z.object({
    */
   agentPlan: z.object({ version: z.literal(1), claude: z.literal(1).optional(), claudeModels:z.array(z.string().min(1).max(200)).max(100).optional(), codexModels: z.array(z.string().min(1).max(200)).max(100).optional() }).optional(),
   /**
+   * aplus-dev-studio specs/agent-app-api — `spawn-happy-session` accepts `returnSessionKey` and answers with the
+   * session's key. Absent on an older daemon (which drops the field) and on a strict machine (which refuses it).
+   */
+  spawnSessionKey: z.object({ version: z.literal(1) }).optional(),
+  /**
    * Saycode specs/claude-cli-benchmark-followups R2 — `spawn-happy-session` accepts `outputFormat`
    * for these agents. Absent on an older daemon, which would drop the field and run the session
    * without it, so a client must not send one. `agents` is a plain string array so a newer value
@@ -911,3 +916,6 @@ export type AgentTransientRetry = {
   scheduledAt: number
   retryAt: number
 }
+
+/** aplus-dev-studio specs/agent-app-api — advertised as machine metadata `spawnSessionKey`. */
+export const SPAWN_SESSION_KEY_CAPABILITY = { version: 1 as const };

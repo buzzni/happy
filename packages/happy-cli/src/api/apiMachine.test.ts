@@ -2083,6 +2083,41 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    // aplus-dev-studio specs/agent-app-api — the server asks for a session key only from a daemon that says it
+    // returns one; a strict machine never does, its contract being that the server cannot read session content.
+    it.each([
+        { mode: undefined, advertised: { version: 1 } },
+        { mode: 'strict' as const, advertised: undefined },
+    ])('advertises spawnSessionKey only off strict machine control ($mode)', async ({ mode, advertised }) => {
+        const control = configuration as { machineControl?: 'compat' | 'strict' };
+        if (mode) control.machineControl = mode;
+        try {
+            vi.useFakeTimers();
+            const published: any[] = [];
+            mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+                if (event === 'machine-update-metadata') {
+                    published.push(data.metadata);
+                    return { result: 'success', version: 1, metadata: data.metadata };
+                }
+                if (event === 'machine-update-state') {
+                    return { result: 'success', version: 1, daemonState: data.daemonState };
+                }
+                return { result: 'success' };
+            });
+            const machine = makeMachine();
+            const client = new ApiMachineClient('fake-token', machine);
+            client.connect();
+
+            socketHandlers.connect![0]!();
+            await vi.waitFor(() => expect(published.length).toBeGreaterThan(0));
+            expect(machine.metadata?.spawnSessionKey).toEqual(advertised);
+
+            client.shutdown();
+        } finally {
+            delete control.machineControl;
+        }
+    });
+
     // aplus-dev-studio specs/remote-file-list-pages — the web picks listFilesPage only on a
     // daemon that says it serves it; an older daemon answers only after the reconnect grace.
     it('advertises listFilesPage on a machine registered before the advertisement existed', async () => {

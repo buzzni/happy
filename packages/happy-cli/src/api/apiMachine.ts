@@ -22,7 +22,7 @@ import { createWorktreeOpsHandlers } from '@/daemon/worktreeOps';
 import { io, Socket } from 'socket.io-client';
 import { logger } from '@/ui/logger';
 import { configuration } from '@/configuration';
-import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody } from './types';
+import { MachineMetadata, DaemonState, Machine, Update, UpdateMachineBody, SPAWN_SESSION_KEY_CAPABILITY } from './types';
 import type { DaemonRestartLifecycle } from './types';
 import { DAEMON_RESTARTING_CODE, withRestartLifecycle, withTerminalSurvival } from '@/daemon/restartDrainLifecycle';
 import type { TerminalSurvivalState } from '@/daemon/terminalWorker/workerHost';
@@ -105,6 +105,17 @@ const STRICT_VIEWER_REFUSAL = {
     outcome: 'rejected' as const,
     code: 'STRICT_VIEWER_UNAVAILABLE',
     message: 'A machine in strict mode carries its remote screen only over the sealed viewer channel',
+};
+/**
+ * viewer-channel-strict-design.md H0. A project binding is built from what happy-server sends — its
+ * workspace paths included — so on a strict machine it cannot keep the server off the daemon's own
+ * remote-screen stack (STRICT_RESERVED_RELAY_PORTS). Those ports are never a project's, so the
+ * project relay refuses them before it looks at the binding.
+ */
+const STRICT_RESERVED_PORT_REFUSAL = {
+    outcome: 'rejected' as const,
+    code: 'STRICT_RESERVED_PORT',
+    message: 'This machine runs in strict mode and does not relay its remote-screen or browser-debugging ports',
 };
 /** What a relay terminal's open ack advertises (specs/desktop-terminal-reliability/ Phase 3). */
 const RELAY_TERMINAL_CAPS = { resume: true, snapshot: true, pagedResume: true };
@@ -601,6 +612,23 @@ type IsolatedViewerStartResult = {
     reused: boolean;
 } & ViewerBrowserState;
 
+/**
+ * aplus-dev-studio specs/agent-app-api — the session key a server-started session was sealed with, handed back in the
+ * spawn reply (itself sealed to the machine key). On a dataKey account each session has its own key the server never
+ * receives otherwise; a legacy session uses the account secret the server already holds, so none is sent. No field at
+ * all when the session never reported a key: the caller treats that like an older daemon and fails rather than wait.
+ */
+function sessionKeyReply(
+    sessionId: string,
+    encryption: { encryptionKey: string; encryptionVariant: 'legacy' | 'dataKey' } | null,
+): { sessionKey?: { variant: 'dataKey'; key: string } | { variant: 'legacy' } } {
+    if (!encryption) {
+        logger.debug(`[API MACHINE] Session key requested for ${sessionId}, but the session reported none`);
+        return {};
+    }
+    return { sessionKey: encryption.encryptionVariant === 'dataKey' ? { variant: 'dataKey', key: encryption.encryptionKey } : { variant: 'legacy' } };
+}
+
 type MachineRpcHandlers = {
     sessionRetention?: import('@/daemon/sessionRetention').SessionRetention;
     /** aplus-dev-studio specs/cross-machine-agent-delegation. Absent = no links, no lane, no advertisement. */
@@ -609,6 +637,8 @@ type MachineRpcHandlers = {
     orgSubagent?: ReturnType<typeof createOrgSubagentRuntime>;
     daemonSessionState?: (request: unknown) => Promise<DaemonSessionStateResponse>;
     spawnSession: (options: SpawnSessionOptions) => Promise<SpawnSessionResult>;
+    /** The key a session reported when it started (persisted sessions), for `returnSessionKey`. Null when it never reported one. */
+    readSessionEncryption?: (sessionId: string) => { encryptionKey: string; encryptionVariant: 'legacy' | 'dataKey' } | null;
     resumeSession?: (sessionId: string, options?: {
         model?: string;
         permissionMode?: string;
@@ -1242,6 +1272,7 @@ export class ApiMachineClient {
         sessionRetention,
         daemonSessionState,
         spawnSession,
+        readSessionEncryption,
         resumeSession,
         recoverSession,
         stopSession,
@@ -1478,6 +1509,7 @@ export class ApiMachineClient {
                 agentPlan,
                 outputFormat,
                 launchMcpServers,
+                returnSessionKey,
             } = params || {};
             logger.debug(`[API MACHINE] Spawning session: dir=${directory}, hasUserCreds=${!!(happyToken && happySecret)}`);
 
@@ -1553,6 +1585,13 @@ export class ApiMachineClient {
             if (browserContinuation !== undefined && typeof browserContinuation !== 'boolean') {
                 throw new Error('Browser continuation must be a boolean');
             }
+            if (returnSessionKey !== undefined && typeof returnSessionKey !== 'boolean') {
+                throw new Error('Return-session-key must be a boolean');
+            }
+            // aplus-dev-studio specs/agent-app-api: a strict machine promises the server cannot read session content.
+            if (returnSessionKey && configuration.machineControl === 'strict') {
+                throw new Error('A strict machine does not hand a session key to the server');
+            }
             if (browserContinuation && !exitAfterFirstTurn) {
                 throw new Error('Browser continuation is only for a run-once session');
             }
@@ -1626,6 +1665,7 @@ export class ApiMachineClient {
                             ? { appliedOrgLlmEndpoint: result.appliedOrgLlmEndpoint }
                             : {}),
                         ...(result.launchMcpDropped?.length ? { launchMcpDropped: result.launchMcpDropped } : {}),
+                        ...(returnSessionKey ? sessionKeyReply(result.sessionId, readSessionEncryption?.(result.sessionId) ?? null) : {}),
                     };
 
                 case 'requestToApproveDirectoryCreation':
@@ -2680,6 +2720,9 @@ export class ApiMachineClient {
         binding: unknown,
         port: number,
     ): Promise<{ outcome: 'enforced' | 'unbound' } | { outcome: 'rejected'; code: string; message: string }> {
+        if (configuration.machineControl === 'strict' && STRICT_RESERVED_RELAY_PORTS.has(port)) {
+            return STRICT_RESERVED_PORT_REFUSAL;
+        }
         if (binding === undefined || binding === null) {
             // A strict machine relays only requests bound to a registered preview runtime: unbound, the
             // relay would let happy-server reach any local port in plaintext.
@@ -2704,6 +2747,10 @@ export class ApiMachineClient {
      * by then is reported as EVIDENCE_BUSY rather than left to ack late.
      */
     private async answerPreviewRuntimeLease(params: any, ack: (response: any) => void): Promise<void> {
+        if (configuration.machineControl === 'strict' && STRICT_RESERVED_RELAY_PORTS.has(params?.port)) {
+            ack({ type: 'error', code: STRICT_RESERVED_PORT_REFUSAL.code, message: STRICT_RESERVED_PORT_REFUSAL.message });
+            return;
+        }
         const deps = this.previewLeaseDeps({ probeDeadlineMs: MINT_LEASE_ANSWER_DEADLINE_MS });
         if (!deps) {
             ack({
@@ -4709,6 +4756,11 @@ export class ApiMachineClient {
             const advertisedAgentPlan = this.managedHandlers ? undefined : agentPlanCapabilityForPlatform(process.platform);
             const agentPlanStale = JSON.stringify(this.machine.metadata?.agentPlan)
                 !== JSON.stringify(advertisedAgentPlan);
+            const advertisedSpawnSessionKey = this.managedHandlers || configuration.machineControl === 'strict'
+                ? undefined
+                : SPAWN_SESSION_KEY_CAPABILITY;
+            const spawnSessionKeyStale = JSON.stringify(this.machine.metadata?.spawnSessionKey)
+                !== JSON.stringify(advertisedSpawnSessionKey);
             // Managed runtimes do not serve `writeFile`, so nothing there would answer an attempt.
             const advertisedWriteFileAttempt = this.managedHandlers ? undefined : WRITE_FILE_ATTEMPT_CAPABILITY;
             const writeFileAttemptStale = JSON.stringify(this.machine.metadata?.writeFileAttempt)
@@ -4784,7 +4836,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || viewerChannelStale || agentDelegationStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || spawnSessionKeyStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || viewerChannelStale || agentDelegationStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4820,6 +4872,7 @@ export class ApiMachineClient {
                     channelSupport: advertisedChannelSupport,
                     aiAuthSelection: advertisedAiAuthSelection,
                     agentPlan: advertisedAgentPlan,
+                    spawnSessionKey: advertisedSpawnSessionKey,
                     structuredOutput: advertisedStructuredOutput,
                     writeFileAttempt: advertisedWriteFileAttempt,
                     listFilesPage: advertisedListFilesPage,
@@ -5044,6 +5097,13 @@ const VIEWER_CONFIRM_DEAD_MS = 3_000;
 
 /** Chrome's conventional CDP port, then a small range for extra profiles. */
 const CDP_PORT_RANGE = [9222, 9223, 9224, 9225, 9226, 9227, 9228] as const;
+
+/**
+ * Password-less VNC, its websockify front and Chrome's debugging port: each hands over the screen or
+ * the whole browser to whoever reaches it. Fixed lists rather than the live lease records, so a stack
+ * that outlived a daemon restart is covered too.
+ */
+const STRICT_RESERVED_RELAY_PORTS: ReadonlySet<number> = new Set([...VIEWER_VNC_PORTS, ...VIEWER_WEB_PORTS, ...CDP_PORT_RANGE]);
 
 /**
  * A distinct CDP port per profile. Reusing one port makes the second Chrome
