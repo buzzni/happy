@@ -3,6 +3,7 @@ CREATE TABLE "WorkMachineExecution" (
     "accountId" TEXT NOT NULL,
     "generation" INTEGER NOT NULL CHECK ("generation" > 0),
     "deviceId" TEXT NOT NULL,
+    "drainingAt" TIMESTAMP(3),
     "frozenAt" TIMESTAMP(3),
     "firstExecutionAt" TIMESTAMP(3),
 
@@ -26,6 +27,7 @@ CREATE TABLE "WorkMachineMcpCall" (
     "generation" INTEGER NOT NULL CHECK ("generation" > 0),
     "admittedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "completedAt" TIMESTAMP(3),
+    "reconciledAt" TIMESTAMP(3),
     CONSTRAINT "WorkMachineMcpCall_pkey" PRIMARY KEY ("requestId"),
     CONSTRAINT "WorkMachineMcpCall_machineId_accountId_fkey"
         FOREIGN KEY ("machineId", "accountId") REFERENCES "WorkMachineExecution"("machineId", "accountId")

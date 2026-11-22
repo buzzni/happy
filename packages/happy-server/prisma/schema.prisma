@@ -343,6 +343,7 @@ model WorkMachineExecution {
     machine          Machine   @relation(fields: [machineId, accountId], references: [id, accountId], onDelete: Restrict, onUpdate: Restrict)
     generation       Int
     deviceId         String
+    drainingAt       DateTime?
     frozenAt         DateTime?
     firstExecutionAt DateTime?
     sessions         Session[]
@@ -362,6 +363,7 @@ model WorkMachineMcpCall {
     generation  Int
     admittedAt  DateTime @default(now())
     completedAt DateTime?
+    reconciledAt DateTime?
 
     @@index([machineId, completedAt])
 }

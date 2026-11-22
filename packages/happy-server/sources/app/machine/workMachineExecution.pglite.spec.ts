@@ -97,6 +97,19 @@ afterAll(async () => {
 });
 
 describe('work machine execution authority', () => {
+    it('blocks new permits during drain while allowing session writes and MCP admission', async () => {
+        await db.$executeRaw`UPDATE "WorkMachineExecution" SET "drainingAt" = now() WHERE "machineId" = ${machineId}`;
+        try {
+            expect(await permitWorkMachineExecution(db, original, new Date())).toBe(false);
+            expect(await authority.authorizeWorkMachineSession(db, { ...original, sessionId: 'protected-session' })).toBe(true);
+            const requestId = crypto.randomUUID();
+            expect(await authority.admitWorkMachineMcpCall(db, original, requestId)).toBe(true);
+            await authority.finishWorkMachineMcpCall(db, original, requestId);
+        } finally {
+            await db.$executeRaw`UPDATE "WorkMachineExecution" SET "drainingAt" = NULL WHERE "machineId" = ${machineId}`;
+        }
+    });
+
     it('blocks handoff until admitted connector work has a confirmed outcome', async () => {
         const requestId = crypto.randomUUID();
         const secondId = crypto.randomUUID();

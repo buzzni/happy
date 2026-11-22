@@ -201,12 +201,13 @@ export async function permitWorkMachineExecution(
     db: ExecutionDb,
     grant: WorkMachineDeviceGrant,
     permittedAt: Date,
+    allowDraining = false,
 ): Promise<boolean> {
     const existing = await db.$queryRaw<{ machineId: string }[]>`
         SELECT "machineId" FROM "WorkMachineExecution"
         WHERE "machineId" = ${grant.machineId} AND "accountId" = ${grant.accountId}
           AND "deviceId" = ${grant.deviceId} AND "generation" = ${grant.generation}
-          AND "frozenAt" IS NULL AND "firstExecutionAt" IS NOT NULL
+          AND "frozenAt" IS NULL AND (${allowDraining} OR "drainingAt" IS NULL) AND "firstExecutionAt" IS NOT NULL
         FOR SHARE
     `;
     if (existing.length === 1) return true;
@@ -215,7 +216,7 @@ export async function permitWorkMachineExecution(
         SET "firstExecutionAt" = COALESCE("firstExecutionAt", ${permittedAt})
         WHERE "machineId" = ${grant.machineId} AND "accountId" = ${grant.accountId}
           AND "deviceId" = ${grant.deviceId} AND "generation" = ${grant.generation}
-          AND "frozenAt" IS NULL
+          AND "frozenAt" IS NULL AND (${allowDraining} OR "drainingAt" IS NULL)
         RETURNING "machineId"
     `;
     return changed.length === 1;
@@ -229,7 +230,7 @@ export async function admitWorkMachineMcpCall(
 ): Promise<boolean> {
     try {
         return await db.$transaction(async tx => {
-            if (!await permitWorkMachineExecution(tx, device, new Date())) return false;
+            if (!await permitWorkMachineExecution(tx, device, new Date(), true)) return false;
             const inserted = await tx.workMachineMcpCall.createMany({
                 data: { ...matchGrant(device), requestId },
                 skipDuplicates: true,
