@@ -1,6 +1,6 @@
 import nacl from 'tweetnacl';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, bindRpcRequest, terminalFrameKeyInfo } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, TERMINAL_BINDING_CAPABILITY, VIEWER_CHANNEL_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY, bindRpcRequest, terminalFrameKeyInfo } from '@slopus/happy-wire';
 import { configuration } from '@/configuration';
 import {
     ApiMachineClient,
@@ -2231,6 +2231,42 @@ describe('ApiMachineClient socket reconnection', () => {
         await vi.waitFor(() => expect(machine.metadata?.terminalBinding).toEqual(expected));
 
         client.shutdown();
+    });
+
+    // aplus-dev-studio viewer-channel-strict-design §4-6 — the switch that turns clients to the sealed
+    // remote-screen channel: only where viewer tunnels can end at it (a strict machine with a native viewer
+    // stack the preview tunnel reaches) and a machine key exists to bind the open. Under compat the tunnel
+    // still ends at websockify.
+    it.each([
+        { mode: 'strict' as const, variant: 'dataKey' as const, setup: {}, expected: VIEWER_CHANNEL_CAPABILITY },
+        { mode: 'compat' as const, variant: 'dataKey' as const, setup: {}, expected: undefined },
+        { mode: 'strict' as const, variant: 'legacy' as const, setup: {}, expected: undefined },
+        { mode: 'strict' as const, variant: 'dataKey' as const, setup: { managedHandlers: {} }, expected: undefined },
+        { mode: 'strict' as const, variant: 'dataKey' as const, setup: { browserSessionBroker: {} }, expected: undefined },
+        { mode: 'strict' as const, variant: 'dataKey' as const, setup: { windowsStandaloneTrial: true }, expected: undefined },
+    ])('advertises the sealed viewer channel on a $mode $variant machine ($setup)', async ({ mode, variant, setup, expected }) => {
+        const control = configuration as { machineControl?: 'compat' | 'strict' };
+        control.machineControl = mode;
+        try {
+            vi.useFakeTimers();
+            mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+                if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+                if (event === 'machine-update-state') return { result: 'success', version: 1, daemonState: data.daemonState };
+                return { result: 'success' };
+            });
+            const machine = { ...makeMachine(), encryptionVariant: variant };
+            machine.metadata = { ...machine.metadata!, browserViewerChannel: expected ? undefined : VIEWER_CHANNEL_CAPABILITY };
+            const client = new ApiMachineClient('fake-token', machine);
+            Object.assign(client as any, setup);
+            client.connect();
+
+            socketHandlers.connect![0]!();
+            await vi.waitFor(() => expect(machine.metadata?.browserViewerChannel).toEqual(expected));
+
+            client.shutdown();
+        } finally {
+            delete control.machineControl;
+        }
     });
 
     // aplus-dev-studio specs/cross-machine-agent-delegation R11 — only a daemon that wired the links advertises them.
