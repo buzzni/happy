@@ -7,7 +7,7 @@ import { createBrowserSessionReconnect } from './browserSessionReconnect';
 import { readBrowserTaskPidStartTime } from './browserTaskSessionOwner';
 import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
-import { createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship, readOwnedSpawnPrincipal } from './ownedSpawnRuntime';
+import { createOwnedContactIdentity, createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship } from './ownedSpawnRuntime';
 import { ownershipHappyOrigin, ownershipTrustEnv } from './sessionOwnershipTrust';
 import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
@@ -6075,11 +6075,7 @@ export async function startDaemon(): Promise<void> {
     // D5: a released daemon verifies A+ ownership documents with the pinned public trust unless the environment names its own.
     const ownershipOrigin = ownershipHappyOrigin(configuration.serverUrl), ownershipEnv = ownershipTrustEnv(process.env, ownershipOrigin);
     callerLaunches = createAgentCallerLaunches({ enabled: process.env[OWNER_CONTACT_SWITCH] === '1',
-      identity: async () => {
-        try {
-          return await readOwnedSpawnPrincipal(ownershipOrigin, ownedRegistration);
-        } catch { return null; }
-      },
+      identity: createOwnedContactIdentity(ownershipOrigin, ownedRegistration),
       trust: () => readOwnerContactTrust({ HAPPY_APLUS_STUDIO_ORIGIN: process.env.HAPPY_APLUS_STUDIO_ORIGIN, ...ownershipEnv }, ownershipOrigin), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });
     const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: ownershipOrigin, env: ownershipEnv,
       registration: ownedRegistration,
