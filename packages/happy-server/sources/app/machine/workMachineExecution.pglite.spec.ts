@@ -1119,4 +1119,79 @@ describe('work machine execution authority', () => {
         await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
         expect(await act('automation-run-report')).toBe(false);
     });
+
+    it('lets the current device run script automation over HTTP: claims stop at drain, claimed runs report until the freeze', async () => {
+        const priorSecret = process.env.HANDY_MASTER_SECRET;
+        process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+        const app = fastify();
+        app.setValidatorCompiler(validatorCompiler);
+        app.setSerializerCompiler(serializerCompiler);
+        const project = await db.project.create({ data: { accountId, name: 'device-script' } });
+        const automation = await db.automation.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, payloadVersion: 3,
+            payloadCiphertext: new Uint8Array(1), viewerKeyId: 'viewer', viewerKeyVersion: 1,
+            viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+        } });
+        await db.scriptArtifact.create({ data: { id: 'device-artifact', projectId: project.id, digest: 'digest', encrypted: {} } });
+        await db.scriptAutomationRevision.create({ data: {
+            automationId: automation.id, revision: 1, artifactId: 'device-artifact', digest: 'digest',
+            payloadCiphertext: 'encrypted', admission: {}, ready: true,
+        } });
+        const invocation = (id: string, status: string, token?: string) => db.scriptInvocation.create({ data: {
+            id, automationId: automation.id, revision: 1, generation: 1, trigger: 'manual', requestedBy: accountId,
+            idempotencyKey: id, bodyHash: 'hash', snapshot: { machineId, machineAccountId: accountId }, inputCiphertext: 'encrypted',
+            createdAt: Date.now(), status, ...(token ? { claimHash: createHash('sha256').update(token).digest('hex'), leaseExpiresAt: Date.now() + 300_000 } : {}),
+        } });
+        const queued = await invocation('device-queued', 'QUEUED');
+        const runningToken = 'r'.repeat(43);
+        const frozenToken = 'f'.repeat(43);
+        await invocation('device-running', 'RUNNING', runningToken);
+        await invocation('device-running-frozen', 'RUNNING', frozenToken);
+        try {
+            await auth.init();
+            enableAuthentication(app as unknown as Fastify);
+            scriptAutomationRoutes(app as unknown as Fastify, { enabled: () => true, transaction: work => db.$transaction(work) });
+            const daemon = async (device: typeof original) => {
+                const now = Date.now();
+                return auth.workMachineExecutionIssuer!.mint({ ...device, purpose: 'daemon', expiresAt: now + 60_000 }, now);
+            };
+            const current = await daemon(original);
+            const call = (token: string, method: 'GET' | 'POST', path: string, payload?: object, target = machineId) => app.inject({
+                method, url: `/v1/machines/${target}${path}`, headers: { authorization: `Bearer ${token}` }, ...(payload ? { payload } : {}),
+            });
+            // The cursor skips this test's automation, whose fixture admission is not a valid listing.
+            const list = (token: string, target?: string) => call(token, 'GET', `/script-automations?after=${automation.id}`, undefined, target);
+            const claim = (token: string) => call(token, 'POST', `/script-automations/${automation.id}/claim`, {});
+            const heartbeat = (token: string, runId: string, claimToken: string) =>
+                call(token, 'POST', `/script-runs/${runId}/heartbeat`, { token: claimToken });
+            const abandon = (token: string, runId: string, claimToken: string) =>
+                call(token, 'POST', `/script-runs/${runId}/abandon`, { token: claimToken });
+
+            expect((await list(current)).statusCode).toBe(200);
+            expect((await list(await auth.createToken(accountId))).statusCode).toBe(403);
+            expect((await list(current, 'ordinary-machine')).statusCode).toBe(403);
+            expect((await list(await daemon({ ...original, deviceId: 'other-pc' }))).statusCode).toBe(403);
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+            expect((await claim(current)).statusCode).toBe(403);
+            expect(await db.scriptInvocation.findUniqueOrThrow({ where: { id: queued.id } })).toMatchObject({ status: 'QUEUED', claimHash: null });
+            expect((await heartbeat(current, 'device-running', runningToken)).statusCode).toBe(200);
+            expect((await abandon(current, 'device-running', runningToken)).statusCode).toBe(200);
+            expect((await db.scriptInvocation.findUniqueOrThrow({ where: { id: 'device-running' } })).status).not.toBe('RUNNING');
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+            expect((await heartbeat(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
+            expect((await abandon(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+            expect((await abandon(current, 'device-running-frozen', frozenToken)).statusCode).toBe(403);
+            expect((await db.scriptInvocation.findUniqueOrThrow({ where: { id: 'device-running-frozen' } })).status).toBe('RUNNING');
+            expect((await list(await daemon(replacement))).statusCode).toBe(200);
+        } finally {
+            await app.close();
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+            await db.project.delete({ where: { id: project.id } });
+            if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
+            else process.env.HANDY_MASTER_SECRET = priorSecret;
+        }
+    });
 });
