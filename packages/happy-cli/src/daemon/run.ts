@@ -5772,6 +5772,11 @@ export async function startDaemon(): Promise<void> {
           allowedRoot: automationAllowedRoot,
         }),
         notifyGithubTrigger: ({ title, body, url }) => {
+          // A protected daemon's device credential cannot read the account's push tokens.
+          if (api.usesWorkMachineExecutionGrant()) {
+            logger.debug('[GITHUB TRIGGER] push skipped: work machine device credential has no account push client');
+            return;
+          }
           api.push().sendToAllDevices(title, body, { kind: 'github-trigger', url });
         },
         resolveGithubIssueProgressMarkerIdentity: (input) => resolveGithubIssueProgressMarkerIdentity({
