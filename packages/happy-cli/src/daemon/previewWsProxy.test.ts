@@ -1,5 +1,6 @@
 import { describe, it, expect, afterEach, vi } from 'vitest'
 import net, { AddressInfo } from 'node:net'
+import { Duplex } from 'node:stream'
 import { PreviewWsProxy } from './previewWsProxy'
 
 /** Collects the events the proxy would emit back to happy-server. */
@@ -219,5 +220,41 @@ describe('PreviewWsProxy cancellation while still connecting', () => {
     expect(proxy.size).toBe(0)
 
     await new Promise<void>((resolve) => server.close(() => resolve()))
+  })
+
+  // viewer-channel-strict-design.md §4-1 — a strict viewer tunnel ends at an in-process endpoint, not a
+  // TCP port: nothing may connect to the local port, and the tunnel must behave exactly as a TCP one.
+  it('pipes through an upstream the caller hands it, without connecting to the port', async () => {
+    const written: Buffer[] = []
+    const upstream = new Duplex({
+      read() {},
+      write(chunk, _encoding, callback) {
+        written.push(chunk)
+        callback()
+      },
+    })
+    setImmediate(() => upstream.emit('connect'))
+    const connect = vi.spyOn(net, 'connect')
+    const emitter = new RecordingEmitter()
+    const proxy = new PreviewWsProxy(emitter)
+
+    const ack = await proxy.open(
+      { tunnelId: 't-in-process', port: 6080, dataB64: Buffer.from('UPGRADE').toString('base64') },
+      () => upstream,
+    )
+
+    expect(ack).toEqual({ ok: true })
+    expect(connect).not.toHaveBeenCalled()
+    expect(Buffer.concat(written).toString()).toBe('UPGRADE')
+    proxy.data({ tunnelId: 't-in-process', dataB64: Buffer.from('FRAME').toString('base64') })
+    expect(Buffer.concat(written).toString()).toBe('UPGRADEFRAME')
+    upstream.push(Buffer.from('REPLY'))
+    await waitFor(() => emitter.data.length === 1)
+    expect(Buffer.from(emitter.data[0].dataB64, 'base64').toString()).toBe('REPLY')
+    upstream.destroy()
+    await waitFor(() => emitter.closed.includes('t-in-process'))
+    expect(proxy.size).toBe(0)
+    proxy.closeAll()
+    connect.mockRestore()
   })
 })
