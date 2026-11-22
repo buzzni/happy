@@ -3093,6 +3093,45 @@ describe('ApiSessionClient v3 messages API migration', () => {
         expect(mockAxiosGet).not.toHaveBeenCalled();
     });
 
+    describe('on a work machine session credential', () => {
+        // aplus specs/work-machine-migration plan 5.1: a frozen generation runs nothing. Its socket
+        // can stay open after the freeze, so only the server's per-request read authorization decides.
+        const bound = () => {
+            const credential = { token: 'wmx_session_for_tests', expiresAt: Date.now() + 300_000 };
+            const client = new ApiSessionClient(credential.token, session);
+            client.bindWorkMachineCredential({ sessionId: session.id, initial: credential, renew: async () => credential }, () => {});
+            const onUserMessage = vi.fn();
+            client.onUserMessage(onUserMessage);
+            (client as any).lastSeq = 1;
+            return { client, onUserMessage };
+        };
+        const userMessage = { role: 'user', content: { type: 'text', text: 'sent while the generation is frozen' } };
+
+        it('does not take input from a socket push the server would no longer let it read', async () => {
+            const { client, onUserMessage } = bound();
+            mockAxiosGet.mockRejectedValue(Object.assign(new Error('Request failed with status code 403'), { response: { status: 403 } }));
+
+            emitSocketEvent('update', createNewMessageUpdate(2, encryptContent(session, userMessage)));
+            await waitForCheck(() => expect(mockAxiosGet).toHaveBeenCalled());
+
+            expect(onUserMessage).not.toHaveBeenCalled();
+            expect((client as any).lastSeq).toBe(1);
+            await client.close();
+        });
+
+        it('delivers a pushed message once the authorized read returns it', async () => {
+            const { client, onUserMessage } = bound();
+            mockAxiosGet.mockResolvedValue({ data: { hasMore: false, messages: [{ id: 'msg-2', seq: 2, localId: null,
+                content: { t: 'encrypted', c: encryptContent(session, userMessage) }, createdAt: 1000, updatedAt: 1000 }] } });
+
+            emitSocketEvent('update', createNewMessageUpdate(2, encryptContent(session, userMessage)));
+            await waitForCheck(() => expect(onUserMessage).toHaveBeenCalledTimes(1));
+
+            expect((client as any).lastSeq).toBe(2);
+            await client.close();
+        });
+    });
+
     it('routes a message once when polling and the socket deliver the same seq concurrently', async () => {
         const client = new ApiSessionClient('fake-token', session);
         const onUserMessage = vi.fn();

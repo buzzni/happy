@@ -865,6 +865,12 @@ export class ApiSessionClient extends EventEmitter {
 
                 if (data.body.t === 'new-message') {
                     if (this.shutdownReceiveSeq !== null) return;
+                    // A work machine generation that froze can still hold this socket. Its input comes
+                    // only through the read the server authorizes per request (refused once frozen).
+                    if (this.disposeWorkMachineCredential) {
+                        this.receiveSync.invalidate();
+                        return;
+                    }
                     this.receivePollDelayMs = ApiSessionClient.RECEIVE_POLL_INTERVAL_MS;
                     this.receivePollTicksRemaining = 1;
                     const messageSeq = data.body.message?.seq;
