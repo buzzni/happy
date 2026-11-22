@@ -6,8 +6,8 @@ import { join } from 'node:path'
 
 /**
  * Whether this daemon serves the resident bundle: a plain Node with synchronous loader hooks, unless disabled for comparison.
- * macOS bundles the sandbox runtime too: its Seatbelt profile is generated, so no package-relative asset is looked up.
- * Linux stays on the installed graph until the seccomp filter the runtime finds next to its own file travels with the bundle.
+ * The bundle carries the sandbox runtime: macOS generates its Seatbelt profile, and Linux finds the seccomp filter that
+ * bundle-resident-session.mjs copies to dist/vendor/seccomp, next to the bundled module URL.
  */
 export function residentModulesEnabled(runtime: {
   platform: NodeJS.Platform
@@ -15,7 +15,7 @@ export function residentModulesEnabled(runtime: {
   hasRegisterHooks: boolean
   env: NodeJS.ProcessEnv
 }) {
-  return (runtime.platform === 'win32' || runtime.platform === 'darwin') && !runtime.versions.electron && !runtime.versions.bun
+  return ['win32', 'darwin', 'linux'].includes(runtime.platform) && !runtime.versions.electron && !runtime.versions.bun
     && runtime.hasRegisterHooks && runtime.env.HAPPY_DISABLE_RESIDENT_MODULES !== '1'
 }
 

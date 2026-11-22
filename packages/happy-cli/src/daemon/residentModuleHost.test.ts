@@ -1,6 +1,6 @@
 import * as moduleApi from 'node:module'
 import { execFile } from 'node:child_process'
-import { cp, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
@@ -78,6 +78,13 @@ describe('resident Happy module host', () => {
     } finally { await host.close() }
   }, 20_000)
 
+  it.each(['x64', 'arm64'])('ships the %s seccomp filter where the bundled sandbox runtime looks for it', async arch => {
+    // Bundled into dist/*.mjs, the sandbox runtime resolves vendor/seccomp/<arch> next to its own module URL.
+    const vendor = fileURLToPath(new URL(`../../dist/vendor/seccomp/${arch}/`, import.meta.url))
+    expect((await stat(join(vendor, 'unix-block.bpf'))).size).toBeGreaterThan(0)
+    expect((await stat(join(vendor, 'apply-seccomp'))).mode & 0o111).not.toBe(0)
+  })
+
   it('starts the ordinary entry if the module host has already stopped', async () => {
     const { root, launch } = await fixture()
     const host = startResidentModuleHost(root)
@@ -93,11 +100,11 @@ describe('resident Happy module host', () => {
 
 describe('resident module gate', () => {
   const plainNode = { versions: {}, hasRegisterHooks: true, env: {} }
-  it.each(['win32', 'darwin'] as const)('serves the resident bundle on %s Node with loader hooks', platform => {
+  it.each(['win32', 'darwin', 'linux'] as const)('serves the resident bundle on %s Node with loader hooks', platform => {
     expect(residentModulesEnabled({ ...plainNode, platform })).toBe(true)
   })
-  it('keeps Linux on the installed module graph until its seccomp assets travel with the bundle', () => {
-    expect(residentModulesEnabled({ ...plainNode, platform: 'linux' })).toBe(false)
+  it('keeps other platforms on the installed module graph', () => {
+    expect(residentModulesEnabled({ ...plainNode, platform: 'freebsd' })).toBe(false)
   })
   it('stays off under Electron, Bun, without loader hooks, or when disabled for comparison', () => {
     expect(residentModulesEnabled({ ...plainNode, platform: 'win32', versions: { electron: '41.0.0' } })).toBe(false)
