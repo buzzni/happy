@@ -5,8 +5,8 @@ import { scriptAdmissionSchema, scriptEncryptedValueSchema, scriptRegistrationRe
 import { verifyScriptServiceToken, hashScriptManagementRequest, scriptAutomationId, type ScriptServiceOperation } from '@slopus/happy-wire/scriptServiceToken';
 import type { Fastify } from '../types';
 import { inTx } from '@/storage/inTx';
-import { lockLegacyWorkMachineExecution, lockWorkMachineExecution, permitWorkMachineExecution } from '@/app/machine/workMachineExecution';
-import { verifyWorkMachineDaemonBearer } from '@/app/api/utils/enableAuthentication';
+import { lockWorkMachineWorker, permitWorkMachineExecution } from '@/app/machine/workMachineExecution';
+import { requireWorkMachineWorkerAuth } from '@/app/api/utils/enableAuthentication';
 import { projectAccess } from '@/app/automation/automationService';
 import { saveScriptAutomation } from '@/app/automation/scriptRegistrationService';
 import { createScriptArtifactService } from '@/app/automation/scriptArtifactService';
@@ -58,13 +58,7 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
    * already claimed keeps reporting until the freeze.
    * Without a device credential the machine must be outside that authority.
    */
-  async function authenticateWorker(request: FastifyRequest, reply: FastifyReply) {
-    const grant = await verifyWorkMachineDaemonBearer(request);
-    if (!grant) return app.authenticate(request, reply);
-    if (grant.machineId !== (request.params as { machineId?: string }).machineId) return reply.code(403).send({ error: 'MACHINE_DENIED' });
-    request.userId = grant.accountId;
-    request.workMachineDaemonGrant = grant;
-  }
+  const authenticateWorker = requireWorkMachineWorkerAuth(app);
   function workerTransaction<T>(
     request: Pick<FastifyRequest, 'workMachineDaemonGrant'> & { userId: string; params: { machineId: string } },
     operation: (tx: Prisma.TransactionClient) => Promise<T>,
@@ -72,10 +66,8 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
   ): Promise<T> {
     const grant = request.workMachineDaemonGrant;
     return dependencies.transaction(async tx => {
-      const allowed = grant
-        ? grant.expiresAt > Date.now() && await lockWorkMachineExecution(tx, grant, { newWork: newWork || !!startedWork })
-        : await lockLegacyWorkMachineExecution(tx, request.userId, request.params.machineId);
-      if (!allowed) throw new Error('MACHINE_DENIED');
+      const worker = { accountId: request.userId, machineId: request.params.machineId };
+      if (!await lockWorkMachineWorker(tx, worker, grant, { newWork: newWork || !!startedWork })) throw new Error('MACHINE_DENIED');
       const result = await operation(tx);
       // A claim handed to the device is work this generation runs: it records
       // the first execution, which closes the way back.

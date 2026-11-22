@@ -148,6 +148,22 @@ export async function lockWorkMachineExecution(
     return current.length === 1;
 }
 
+/**
+ * Locks the generation for a daemon worker call on a machine. A machine under
+ * work-machine authority is served only through the live credential of its
+ * current device; any other machine only without one, as before.
+ */
+export async function lockWorkMachineWorker(
+    tx: ExecutionDb,
+    worker: { accountId: string; machineId: string },
+    device: (WorkMachineDeviceGrant & { expiresAt: number }) | null | undefined,
+    { newWork = false }: { newWork?: boolean } = {},
+): Promise<boolean> {
+    if (!device) return lockLegacyWorkMachineExecution(tx, worker.accountId, worker.machineId);
+    return device.accountId === worker.accountId && device.machineId === worker.machineId
+        && device.expiresAt > Date.now() && lockWorkMachineExecution(tx, device, { newWork });
+}
+
 export async function redeemWorkMachineRenewal(
     db: Pick<PrismaClient, '$transaction'>,
     device: WorkMachineDeviceGrant & { sessionId?: string },

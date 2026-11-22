@@ -13,9 +13,7 @@ import {
     syncAutomations,
 } from '@/app/automation/automationExecutionService';
 import { inTx, type Tx } from '@/storage/inTx';
-import {
-    lockLegacyWorkMachineExecution, lockWorkMachineExecution, permitWorkMachineExecution, type WorkMachineDeviceGrant,
-} from '@/app/machine/workMachineExecution';
+import { lockWorkMachineWorker, permitWorkMachineExecution, type WorkMachineDeviceGrant } from '@/app/machine/workMachineExecution';
 import type { WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
 import { warn } from '@/utils/log';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
@@ -122,16 +120,14 @@ export function automationSocketHandler(
         { newWork = false, startsWork = false } = {},
     ) {
         return inTx(async tx => {
-            const allowed = device
-                ? !!grant && device.expiresAt > Date.now() && await lockWorkMachineExecution(tx, grant, { newWork: newWork || startsWork })
-                : await lockLegacyWorkMachineExecution(tx, accountId, machineId);
+            const allowed = await lockWorkMachineWorker(tx, { accountId, machineId }, device, { newWork: newWork || startsWork });
             if (!allowed) {
                 return { ok: false as const, error: 'forbidden' };
             }
             const result = await operation(tx);
             // A claim that went through is work this generation runs: it
             // records the first execution, which closes the way back.
-            if (startsWork && grant && result.ok && !await permitWorkMachineExecution(tx, grant, new Date())) {
+            if (startsWork && device && result.ok && !await permitWorkMachineExecution(tx, device, new Date())) {
                 throw new Error('work-machine-permit-lost');
             }
             return result;

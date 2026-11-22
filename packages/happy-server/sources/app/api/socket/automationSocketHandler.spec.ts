@@ -31,7 +31,11 @@ vi.mock('@/app/automation/sessionFollowupUpdate', () => ({
 }));
 vi.mock('@/storage/inTx', () => ({ inTx: (callback: (tx: unknown) => unknown) => callback({}) }));
 vi.mock('@/app/machine/workMachineExecution', () => ({
-    lockLegacyWorkMachineExecution: services.lockLegacyWorkMachineExecution,
+    // These sockets carry no device credential: the worker lock is the legacy one.
+    lockWorkMachineWorker: (tx: unknown, worker: { accountId: string; machineId: string }, device: unknown) => {
+        if (device) throw new Error('device credentials are covered by the pglite spec');
+        return services.lockLegacyWorkMachineExecution(tx, worker.accountId, worker.machineId);
+    },
 }));
 
 import { automationSocketHandler } from './automationSocketHandler';
