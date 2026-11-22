@@ -164,6 +164,53 @@ describe('claudeRemote', () => {
         });
     });
 
+    // aplus-dev-studio specs/agent-app-api T5 — applied over everything the session assembled, so a message's mode cannot loosen it.
+    describe('an app profile', () => {
+        const appProfile = { version: 1 as const, mcpServers: ['shopping'], systemPrompt: '너는 쇼핑 도우미다.' };
+        const run = async (overrides: Record<string, unknown>) => {
+            vi.mocked(query).mockReturnValue({ async *[Symbol.asyncIterator]() { yield { type: 'result', subtype: 'success' }; } } as any);
+            let count = 0;
+            const looseMode: EnhancedMode = {
+                permissionMode: 'bypassPermissions',
+                customSystemPrompt: 'saycode prompt',
+                appendSystemPrompt: 'extra instructions',
+                allowedTools: ['Bash'],
+            };
+            await claudeRemote({ sessionId: null, path: resolve('fixture session'), allowedTools: ['mcp__happy__change_title'], hookSettingsPath: '/tmp/synthetic-settings.json',
+                mcpServers: { happy: { type: 'stdio', command: 'happy' }, shopping: { type: 'http', url: 'https://shop/mcp' } },
+                nextMessage: async () => count++ === 0 ? { message: 'synthetic', mode: looseMode } : null,
+                onReady: vi.fn(), canCallTool: async () => ({ behavior: 'allow' }) as any, isAborted: () => false,
+                onSessionFound: vi.fn(), onThinkingChange: vi.fn(), onMessage: vi.fn(), exitAfterFirstTurn: true, ...overrides } as any);
+            return vi.mocked(query).mock.calls[0][0].options!;
+        };
+
+        it('runs with only the profile servers and prompt, whatever the message mode asks', async () => {
+            const options = await run({ appProfile });
+
+            expect(options.tools).toEqual([]);
+            expect(Object.keys(options.mcpServers ?? {})).toEqual(['shopping']);
+            expect(options.allowedTools).toEqual(['mcp__shopping__*']);
+            expect(options.permissionMode).toBe('default');
+            expect(options.customSystemPrompt).toBe('너는 쇼핑 도우미다.');
+            expect(options.appendSystemPrompt).toBeUndefined();
+            expect(options.settingSources).toEqual([]);
+        });
+
+        it('starts no side query for a title', async () => {
+            const provide = vi.fn();
+            await run({ appProfile, offTurnTitle: { provide, clear: vi.fn() } });
+
+            expect(provide).not.toHaveBeenCalled();
+        });
+
+        it('leaves a session without a profile as it was', async () => {
+            const options = await run({});
+
+            expect(options.tools).toBeUndefined();
+            expect(Object.keys(options.mcpServers ?? {}).sort()).toEqual(['happy', 'shopping']);
+        });
+    });
+
     describe('plugin directories from the command line (specs/cli-plugin-dir-and-env-scrub R5-a)', () => {
         const sessionPath = resolve('fixture session');
         const resumeId = '11111111-2222-4333-8444-555555555555';

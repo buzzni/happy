@@ -288,6 +288,11 @@ export const MachineMetadataSchema = z.object({
    */
   spawnSessionKey: z.object({ version: z.literal(1) }).optional(),
   /**
+   * aplus-dev-studio specs/agent-app-api T5 — `spawn-happy-session` accepts `appProfile` for a run-once Claude session.
+   * Absent on an older daemon, which would drop the field and run the session unrestricted.
+   */
+  appProfile: z.object({ version: z.literal(1) }).optional(),
+  /**
    * Saycode specs/claude-cli-benchmark-followups R2 — `spawn-happy-session` accepts `outputFormat`
    * for these agents. Absent on an older daemon, which would drop the field and run the session
    * without it, so a client must not send one. `agents` is a plain string array so a newer value

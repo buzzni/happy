@@ -55,6 +55,8 @@ export interface QueryOptions {
     mcpServers?: Record<string, unknown>
     /** Local plugin directories to load, e.g. the session's `--plugin-dir` arguments (claude/utils/pluginsFromArgs.ts). */
     plugins?: Options['plugins']
+    /** Plugin ids (`plugin@marketplace`) turned off for this query through the inline settings (`enabledPlugins: false`). */
+    disabledPlugins?: string[]
     permissionMode?: 'default' | 'acceptEdits' | 'bypassPermissions' | 'plan'
     continue?: boolean
     resume?: string

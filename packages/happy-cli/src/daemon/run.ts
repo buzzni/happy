@@ -207,6 +207,7 @@ import { createSessionRetention, retentionProtects } from './sessionRetention';
 import { readStaleRuntimeRestartConfig, sweepStaleRuntimeSessions } from './staleRuntimeSessionRestart';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
 import { outputFormatSeed, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
+import { APP_PROFILE_CAPABILITY, appProfileSeed } from '@/claude/appProfile';
 import {
   removeDeferredContinuationContextFile,
   stageDeferredContinuationContext,
@@ -487,6 +488,7 @@ export const initialMachineMetadata: MachineMetadata = {
   aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
   ...(agentPlanCapabilityForPlatform(process.platform) ? { agentPlan: agentPlanCapabilityForPlatform(process.platform) } : {}),
   ...(configuration.machineControl === 'strict' ? {} : { spawnSessionKey: SPAWN_SESSION_KEY_CAPABILITY }),
+  appProfile: APP_PROFILE_CAPABILITY,
   structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
   writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
   listFilesPage: LIST_FILES_PAGE_CAPABILITY,
@@ -2574,6 +2576,10 @@ export async function startDaemon(): Promise<void> {
         // Structured output: caller-supplied JSON, injected after expansion for the same reason.
         if (options.outputFormat) {
           Object.assign(extraEnv, outputFormatSeed(options.outputFormat));
+        }
+        // App profile (aplus agent-app-api T5): validated at the RPC boundary; the child fails rather than run without it.
+        if (options.appProfile) {
+          Object.assign(extraEnv, appProfileSeed(options.appProfile));
         }
         if (options.exitAfterFirstTurn) {
           extraEnv.HAPPY_AUTOMATION_RUN_ONCE = '1';

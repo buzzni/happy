@@ -150,7 +150,7 @@ function resolveSettings(opts: QueryOptions | undefined, endpointRouting?: Recor
     // SDK 는 settings 파일 경로와 sandbox 옵션의 동시 사용을 거부한다. 우리 규칙을
     // 경로로 넘기면 CLI 가 그 파일만 읽고 여기서 더한 것은 사라지므로, 합쳐야 할
     // 것이 하나라도 있으면 인라인한다.
-    if (!opts?.isolatedAutomationContext && !endpointRouting && emptyPluginServers.length === 0 && (!opts?.settingsPath || (!opts.sandbox && denyRules.length === 0))) return opts?.settingsPath
+    if (!opts?.isolatedAutomationContext && !opts?.disabledPlugins?.length && !endpointRouting && emptyPluginServers.length === 0 && (!opts?.settingsPath || (!opts.sandbox && denyRules.length === 0))) return opts?.settingsPath
     const rawSettings = opts?.settingsPath ? readFileSync(opts.settingsPath, 'utf8') : '{}'
     let parsedSettings: unknown
     try {
@@ -167,6 +167,14 @@ function resolveSettings(opts: QueryOptions | undefined, endpointRouting?: Recor
         if (typeof settingsEnv !== 'object' || Array.isArray(settingsEnv)) throw new Error('Claude hook environment must be a JSON object')
         settings.autoMemoryEnabled = false
         settings.env = { ...settingsEnv, ...isolatedMemoryEnvironment }
+    }
+    if (opts?.disabledPlugins?.length) {
+        // The flag settings outrank user and project ones, so these stay off whatever else enables them.
+        const settings = parsedSettings as { enabledPlugins?: Record<string, unknown> }
+        settings.enabledPlugins = {
+            ...(settings.enabledPlugins ?? {}),
+            ...Object.fromEntries(opts.disabledPlugins.map(id => [id, false])),
+        }
     }
     if (endpointRouting) {
         // The routing is the daemon's: it wins over whatever env the hook settings file carried for the same keys.

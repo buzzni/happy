@@ -56,6 +56,7 @@ import { AI_AUTH_SELECTION_CAPABILITY, parseAiAuthSelection } from '@/daemon/ses
 import { agentPlanCapabilityForPlatform, parseAgentPlanSpawnParam } from '@/daemon/agentPlanGrantEnvelope';
 import { parseResumeAuthRequirement, type ResumeAuthRequirement } from '@/daemon/resumeSetupTokenRebind';
 import { parseOutputFormat, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
+import { APP_PROFILE_CAPABILITY, parseAppProfile } from '@/claude/appProfile';
 import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
 import { backoff } from '@/utils/time';
 import { applyManagedRpcRestrictions, registerManagedRpcHandlers, type ManagedRpcHandlers } from '@/daemon/managedRpcHandlers';
@@ -1508,6 +1509,7 @@ export class ApiMachineClient {
                 aiAuthSelection,
                 agentPlan,
                 outputFormat,
+                appProfile,
                 launchMcpServers,
                 returnSessionKey,
             } = params || {};
@@ -1540,6 +1542,15 @@ export class ApiMachineClient {
             // Refused rather than dropped: a caller that asked for a machine-readable result must
             // not get a session that silently runs without one (specs/claude-cli-benchmark-followups R2).
             const validOutputFormat = parseOutputFormat(outputFormat);
+            // aplus-dev-studio specs/agent-app-api T5: refused, never dropped — a dropped profile runs a public app's
+            // session with every tool and setting of this machine.
+            const validAppProfile = parseAppProfile(appProfile);
+            if (validAppProfile && (agent ?? 'claude') !== 'claude') {
+                throw new Error('An app profile is only supported for Claude');
+            }
+            if (validAppProfile && exitAfterFirstTurn !== true) {
+                throw new Error('An app profile is only for a run-once session');
+            }
             if (validOutputFormat && (agent ?? 'claude') !== 'claude') {
                 throw new Error('Structured output is only supported for Claude');
             }
@@ -1637,6 +1648,7 @@ export class ApiMachineClient {
                 aiAuthSelection: validAiAuthSelection,
                 ...(validAgentPlan ? { agentPlan: validAgentPlan } : {}),
                 ...(validOutputFormat ? { outputFormat: validOutputFormat } : {}),
+                ...(validAppProfile ? { appProfile: validAppProfile } : {}),
                 ...(validLaunchMcpServers ? { launchMcpServers: validLaunchMcpServers } : {}),
             });
 
@@ -4761,6 +4773,10 @@ export class ApiMachineClient {
                 : SPAWN_SESSION_KEY_CAPABILITY;
             const spawnSessionKeyStale = JSON.stringify(this.machine.metadata?.spawnSessionKey)
                 !== JSON.stringify(advertisedSpawnSessionKey);
+            // Managed runtimes start no daemon-spawned Claude session, so nothing there would apply a profile.
+            const advertisedAppProfile = this.managedHandlers ? undefined : APP_PROFILE_CAPABILITY;
+            const appProfileStale = JSON.stringify(this.machine.metadata?.appProfile)
+                !== JSON.stringify(advertisedAppProfile);
             // Managed runtimes do not serve `writeFile`, so nothing there would answer an attempt.
             const advertisedWriteFileAttempt = this.managedHandlers ? undefined : WRITE_FILE_ATTEMPT_CAPABILITY;
             const writeFileAttemptStale = JSON.stringify(this.machine.metadata?.writeFileAttempt)
@@ -4836,7 +4852,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || spawnSessionKeyStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || viewerChannelStale || agentDelegationStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || spawnSessionKeyStale || appProfileStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || viewerChannelStale || agentDelegationStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4873,6 +4889,7 @@ export class ApiMachineClient {
                     aiAuthSelection: advertisedAiAuthSelection,
                     agentPlan: advertisedAgentPlan,
                     spawnSessionKey: advertisedSpawnSessionKey,
+                    appProfile: advertisedAppProfile,
                     structuredOutput: advertisedStructuredOutput,
                     writeFileAttempt: advertisedWriteFileAttempt,
                     listFilesPage: advertisedListFilesPage,

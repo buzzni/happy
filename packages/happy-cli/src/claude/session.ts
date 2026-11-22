@@ -25,6 +25,7 @@ import type { LessonSessionHost } from '@/memory/lessonSessionHost';
 import type { ClaudeTitleBridge } from './claudeOffTurnTitle';
 import type { PolicyApprover } from '@/toolPolicy/policyGate';
 import type { ClaudeOutputFormat } from './structuredOutput';
+import type { ClaudeAppProfile } from './appProfile';
 
 /** Survives SDK generations, but is reset with the actual conversation. */
 export interface ClaudeLessonReviewLifecycle {
@@ -89,6 +90,8 @@ export class Session {
     readonly exitAfterFirstTurn: boolean;
     /** Session-scoped structured output (specs/claude-cli-benchmark-followups R2), fixed for the process. */
     readonly outputFormat?: ClaudeOutputFormat;
+    /** aplus-dev-studio specs/agent-app-api T5 — fixed for the process. */
+    readonly appProfile?: ClaudeAppProfile;
 
     sessionId: string | null;
     /** Always assigned from opts.startingMode in the constructor — the single
@@ -161,6 +164,7 @@ export class Session {
         startingMode?: 'local' | 'remote',
         exitAfterFirstTurn?: boolean,
         outputFormat?: ClaudeOutputFormat,
+        appProfile?: ClaudeAppProfile,
         turnAttendance?: TurnAttendanceState,
         orgRequirements?: ClaudeOrgRequirements,
     }) {
@@ -200,6 +204,7 @@ export class Session {
         this.mode = opts.startingMode ?? 'local';
         this.exitAfterFirstTurn = opts.exitAfterFirstTurn === true;
         this.outputFormat = opts.outputFormat;
+        this.appProfile = opts.appProfile;
 
         // Start keep alive
         this.client.keepAlive(this.thinking, this.mode);

@@ -43,6 +43,7 @@ import {
 import { installManagedMachineTool, managedMachineToolPlatform, managedMachineToolStatus } from './managedMachineTool';
 import { sanitizeChildEnv, type ChildEnvBoundary } from '@/utils/childEnv';
 import type { ClaudeOutputFormat } from '@/claude/structuredOutput';
+import type { ClaudeAppProfile } from '@/claude/appProfile';
 import type { LaunchMcpDropped, LaunchMcpRequest } from '@/aplus/launchMcpServers';
 
 const execAsync = promisify(exec);
@@ -473,6 +474,8 @@ export interface SpawnSessionOptions {
     agentPlan?: AgentPlanSpawnParam;
     /** Session-scoped Claude structured output, validated at the RPC boundary (specs/claude-cli-benchmark-followups R2). */
     outputFormat?: ClaudeOutputFormat;
+    /** aplus-dev-studio specs/agent-app-api T5 — a run-once Claude session's app profile, validated at the RPC boundary. */
+    appProfile?: ClaudeAppProfile;
     /**
      * MCP servers a Desktop extension adds to this launch, checked at the RPC boundary
      * (aplus/launchMcpServers.ts). Only sent to a daemon advertising `daemonState.launchMcpServers`.

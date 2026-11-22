@@ -1844,6 +1844,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     signal: abortController.signal,
                     exitAfterFirstTurn: session.exitAfterFirstTurn,
                     outputFormat: session.outputFormat,
+                    appProfile: session.appProfile,
                 });
 
                 if (remoteResult === 'turn-complete') {
