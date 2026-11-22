@@ -341,11 +341,24 @@ export async function finishWorkMachineMcpCall(
     });
 }
 
+/**
+ * Returns the authority to the original device before the replacement ran
+ * anything. The replacement's row is locked first, as in a replace: claims
+ * lock it too, so no claim can start while the open work is checked.
+ */
 export async function restoreWorkMachineExecution(
-    db: ExecutionDb,
+    db: ExecutionDb & AutomationClaimDb,
     replacement: WorkMachineDeviceGrant,
     originalDeviceId: string,
 ): Promise<boolean> {
+    const unused = await db.$queryRaw<{ machineId: string }[]>`
+        SELECT "machineId" FROM "WorkMachineExecution"
+        WHERE "machineId" = ${replacement.machineId} AND "accountId" = ${replacement.accountId}
+          AND "deviceId" = ${replacement.deviceId} AND "generation" = ${replacement.generation}
+          AND "frozenAt" IS NULL AND "firstExecutionAt" IS NULL
+        FOR UPDATE
+    `;
+    if (unused.length !== 1 || (await listOpenWorkMachineAutomationRuns(db, replacement, new Date(), 1)).length > 0) return false;
     const changed = await db.workMachineExecution.updateMany({
         where: { ...matchGrant(replacement), firstExecutionAt: null, frozenAt: null },
         data: { deviceId: originalDeviceId, generation: { increment: 1 }, drainingAt: null },

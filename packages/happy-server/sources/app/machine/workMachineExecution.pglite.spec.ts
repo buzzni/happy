@@ -248,6 +248,31 @@ describe('work machine execution authority', () => {
         await expect(permitWorkMachineExecution(db, original, new Date())).resolves.toBe(false);
     });
 
+    it('refuses to restore while the replacement holds an unfinished automation claim', async () => {
+        const project = await db.project.create({ data: { accountId, name: 'restore-open-claim' } });
+        const automation = await db.automation.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId,
+            payloadCiphertext: new Uint8Array(1), viewerKeyId: 'viewer', viewerKeyVersion: 1,
+            viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+        } });
+        try {
+            expect(await freezeWorkMachineExecution(db, original)).toBe(true);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+            const claimedAt = new Date();
+            const run = await db.automationRun.create({ data: {
+                automationId: automation.id, generation: 1, scheduledFor: claimedAt, machineAccountId: accountId, machineId,
+                status: 'CLAIMED', claimTokenHash: new Uint8Array(32).fill(7), claimExpiresAt: new Date(Date.now() + 60_000), claimedAt,
+            } });
+            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe(false);
+            expect(await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } }))
+                .toMatchObject({ deviceId: replacement.deviceId, generation: replacement.generation });
+            await db.automationRun.update({ where: { id: run.id }, data: { status: 'EXPIRED', completedAt: new Date() } });
+            expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe(true);
+        } finally {
+            await db.project.delete({ where: { id: project.id } });
+        }
+    });
+
     it('rejects a connected old daemon, its reconnect, and a user socket claiming machine RPCs after handoff', async () => {
         const now = 1_800_000_000_000;
         const issuer = await createWorkMachineExecutionTokenIssuer('work-machine-socket-tests');
