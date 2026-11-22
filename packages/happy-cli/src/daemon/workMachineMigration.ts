@@ -40,6 +40,8 @@ import { proveWorkMachineArchiveRecipient, restoreWorkMachineArchive, sealWorkMa
 
 export const WORK_MACHINE_PART_SIZE = 8 * 1024 ** 2;
 const RECEIPT_MAGIC = Buffer.from('WMR1');
+/** A receipt is a few KiB of JSON; the bound keeps a hostile length from sizing an allocation. */
+const MAX_RECEIPT_BYTES = 64 * 1024;
 const sha256Hex = z.string().regex(/^[a-f0-9]{64}$/);
 const deviceId = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const manifestSchema = z.object({
@@ -410,7 +412,7 @@ async function downloadArchive(client: ReturnType<typeof openWorkMachineTransfer
         await handle.read(trailer, 0, 8, manifest.totalBytes - 8);
         const length = trailer.readUInt32BE(0);
         sealedBytes = manifest.totalBytes - 8 - length;
-        if (!trailer.subarray(4).equals(RECEIPT_MAGIC) || sealedBytes <= 0) throw new Error('The transfer archive has no receipt');
+        if (!trailer.subarray(4).equals(RECEIPT_MAGIC) || sealedBytes <= 0 || length > MAX_RECEIPT_BYTES) throw new Error('The transfer archive has no receipt');
         const receiptBytes = Buffer.alloc(length);
         await handle.read(receiptBytes, 0, length, sealedBytes);
         receipt = JSON.parse(receiptBytes.toString('utf8'));

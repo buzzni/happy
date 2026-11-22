@@ -344,6 +344,31 @@ describe('work machine export and import over the Studio transfer API', () => {
         expect(studio.restored).toBeNull();
     });
 
+    it('refuses a receipt length past its bound before allocating it', async () => {
+        const fixture = await machinesFixture(root, studio);
+        await exportWorkMachine(fixture.exportInput);
+        await fixture.vacateSource();
+        // Within the object, so only the bound stops it: a source may claim up to the whole 32 GiB.
+        const length = Buffer.alloc(4);
+        length.writeUInt32BE(100 * 1024);
+        const object = Buffer.concat([randomBytes(128 * 1024), length, Buffer.from('WMR1')]);
+        studio.objects.clear();
+        studio.objects.set('part-0', object);
+        const manifest = JSON.parse(Buffer.from(studio.manifest!.manifestB64, 'base64url').toString('utf8'));
+        Object.assign(manifest, { totalBytes: object.length, partSize: object.length, parts: [{ n: 0, size: object.length, sha256: createHash('sha256').update(object).digest('hex') }] });
+        const bytes = Buffer.from(JSON.stringify(manifest));
+        const keys = await loadOrCreateDeviceKeys(fixture.sourceHome, machineId);
+        const issuedAt = Date.now();
+        const message = Buffer.from(JSON.stringify(['happy-work-machine-export-v1', jobId, createHash('sha256').update(bytes).digest('base64url'), issuedAt]));
+        studio.manifest = {
+            manifestB64: bytes.toString('base64url'),
+            proof: { issuedAt, publicKey: workMachineSigningIdentity(keys.signing.publicKey).publicKey, signature: Buffer.from(nacl.sign.detached(message, keys.signing.secretKey)).toString('base64url') },
+        };
+
+        await expect(importWorkMachine(fixture.importInput)).rejects.toThrow('The transfer archive has no receipt');
+        await expect(lstat(fixture.project)).rejects.toMatchObject({ code: 'ENOENT' });
+    });
+
     it('refuses to overwrite a path that already exists on the target', async () => {
         const fixture = await machinesFixture(root, studio);
         await exportWorkMachine(fixture.exportInput);
