@@ -94,7 +94,7 @@ beforeAll(async () => {
 beforeEach(async () => {
     await db.workMachineExecution.update({
         where: { machineId },
-        data: { deviceId: original.deviceId, generation: original.generation, frozenAt: null, firstExecutionAt: null },
+        data: { deviceId: original.deviceId, generation: original.generation, previousDeviceId: null, frozenAt: null, firstExecutionAt: null },
     });
 });
 
@@ -233,7 +233,10 @@ describe('work machine execution authority', () => {
     it('makes the replacement first execution permit and rollback mutually exclusive', async () => {
         await db.workMachineExecution.update({
             where: { machineId },
-            data: { deviceId: replacement.deviceId, generation: replacement.generation, frozenAt: null, firstExecutionAt: null },
+            data: {
+                deviceId: replacement.deviceId, generation: replacement.generation, previousDeviceId: original.deviceId,
+                frozenAt: null, firstExecutionAt: null,
+            },
         });
         const [allowed, restored] = await Promise.all([
             permitWorkMachineExecution(db, replacement, new Date('2026-11-22T00:00:00Z')),
@@ -246,6 +249,22 @@ describe('work machine execution authority', () => {
         expect(current.generation).toBe(allowed ? replacement.generation : replacement.generation + 1);
         expect(current.firstExecutionAt !== null).toBe(allowed);
         await expect(permitWorkMachineExecution(db, original, new Date())).resolves.toBe(false);
+    });
+
+    it('restores only to the device the replace moved the authority away from', async () => {
+        const row = () => db.workMachineExecution.findUniqueOrThrow({ where: { machineId } });
+        // An enrolled generation was never handed off, so it has nowhere to return to.
+        expect(await restoreWorkMachineExecution(db, original, 'enrolled-elsewhere')).toBe(false);
+        expect(await freezeWorkMachineExecution(db, original)).toBe(true);
+        expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+        expect(await row()).toMatchObject({ previousDeviceId: original.deviceId });
+        expect(await restoreWorkMachineExecution(db, replacement, 'some-other-pc')).toBe(false);
+        expect(await row()).toMatchObject({ deviceId: replacement.deviceId, generation: replacement.generation });
+        expect(await restoreWorkMachineExecution(db, replacement, original.deviceId)).toBe(true);
+        expect(await row()).toMatchObject({ deviceId: original.deviceId, generation: replacement.generation + 1, previousDeviceId: null });
+        // A restore does not chain back to the replacement.
+        expect(await restoreWorkMachineExecution(db, { ...original, generation: replacement.generation + 1 }, replacement.deviceId))
+            .toBe(false);
     });
 
     it('refuses to restore while the replacement holds an unfinished automation claim', async () => {

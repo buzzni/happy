@@ -343,6 +343,8 @@ model WorkMachineExecution {
     machine          Machine   @relation(fields: [machineId, accountId], references: [id, accountId], onDelete: Restrict, onUpdate: Restrict)
     generation       Int
     deviceId         String
+    /// The device a replace moved the authority away from; the only device a restore may return it to.
+    previousDeviceId String?
     drainingAt       DateTime?
     frozenAt         DateTime?
     firstExecutionAt DateTime?

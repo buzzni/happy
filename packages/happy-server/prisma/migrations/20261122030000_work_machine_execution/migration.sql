@@ -3,6 +3,7 @@ CREATE TABLE "WorkMachineExecution" (
     "accountId" TEXT NOT NULL,
     "generation" INTEGER NOT NULL CHECK ("generation" > 0),
     "deviceId" TEXT NOT NULL,
+    "previousDeviceId" TEXT,
     "drainingAt" TIMESTAMP(3),
     "frozenAt" TIMESTAMP(3),
     "firstExecutionAt" TIMESTAMP(3),

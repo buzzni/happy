@@ -273,6 +273,7 @@ export async function replaceWorkMachineExecution(
         where: { ...matchGrant(original), frozenAt: { not: null }, mcpCalls: { none: { completedAt: null } } },
         data: {
             deviceId: replacementDeviceId,
+            previousDeviceId: original.deviceId,
             generation: { increment: 1 },
             drainingAt: null,
             frozenAt: null,
@@ -342,9 +343,11 @@ export async function finishWorkMachineMcpCall(
 }
 
 /**
- * Returns the authority to the original device before the replacement ran
- * anything. The replacement's row is locked first, as in a replace: claims
- * lock it too, so no claim can start while the open work is checked.
+ * Returns the authority to the device the replace moved it away from, before
+ * the replacement ran anything. The replacement's row is locked first, as in a
+ * replace: claims lock it too, so no claim can start while the open work is
+ * checked. The restored generation has no previous device, so a restore does
+ * not chain back.
  */
 export async function restoreWorkMachineExecution(
     db: ExecutionDb & AutomationClaimDb,
@@ -355,13 +358,13 @@ export async function restoreWorkMachineExecution(
         SELECT "machineId" FROM "WorkMachineExecution"
         WHERE "machineId" = ${replacement.machineId} AND "accountId" = ${replacement.accountId}
           AND "deviceId" = ${replacement.deviceId} AND "generation" = ${replacement.generation}
-          AND "frozenAt" IS NULL AND "firstExecutionAt" IS NULL
+          AND "frozenAt" IS NULL AND "firstExecutionAt" IS NULL AND "previousDeviceId" = ${originalDeviceId}
         FOR UPDATE
     `;
     if (unused.length !== 1 || (await listOpenWorkMachineAutomationRuns(db, replacement, new Date(), 1)).length > 0) return false;
     const changed = await db.workMachineExecution.updateMany({
         where: { ...matchGrant(replacement), firstExecutionAt: null, frozenAt: null },
-        data: { deviceId: originalDeviceId, generation: { increment: 1 }, drainingAt: null },
+        data: { deviceId: originalDeviceId, previousDeviceId: null, generation: { increment: 1 }, drainingAt: null },
     });
     return changed.count === 1;
 }
