@@ -492,7 +492,8 @@ export async function runCodex(opts: {
             env: process.env,
             checkpointEvents: sandboxConfig?.checkpointProtection
                 ? createCheckpointEventPublisher({
-                    token: requireAccountToken(accountToken),
+                    // A protected conversation posts with its own session credential; the server refuses the account token there.
+                    token: api.workMachineMcpProof()?.token ?? requireAccountToken(accountToken),
                     sessionId: response.id,
                     encryption: {
                         encryptionKey: response.encryptionKey,

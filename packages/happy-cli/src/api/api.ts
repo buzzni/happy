@@ -107,9 +107,13 @@ export class ApiClient {
     // not register for the customer's notifications: its bearer is scoped to
     // this machine, and pushing from it would put runtime activity into the
     // account's notification stream as if the person had done it.
+    // A protected conversation pushes with its own (renewed) session credential: the server refuses
+    // the account bearer there. The daemon's wmx_ machine credential is not a push principal.
     this.pushClient = principal.kind === 'account' && !this.usesWorkMachineExecutionGrant()
       ? new PushNotificationClient(principal.credential.token, configuration.serverUrl)
-      : null
+      : principal.kind === 'work-machine-session'
+        ? new PushNotificationClient(() => principal.token, configuration.serverUrl)
+        : null
   }
 
   usesWorkMachineExecutionGrant(): boolean {
@@ -935,16 +939,17 @@ export class ApiClient {
 
   /**
    * Post a session event to the durable event log on the server.
-   * Used by daemon recovery to emit session-end for dead sessions.
+   * Used by daemon recovery to emit session-end for dead sessions. `token` is a protected
+   * conversation's own session credential, which the server requires there.
    */
-  async postSessionEvent(sessionId: string, eventType: string, content: string): Promise<void> {
+  async postSessionEvent(sessionId: string, eventType: string, content: string, token?: string): Promise<void> {
     try {
       await axios.post(
         `${configuration.serverUrl}/v3/sessions/${sessionId}/events`,
         { eventType, content },
         {
           headers: {
-            'Authorization': `Bearer ${this.bearer()}`,
+            'Authorization': `Bearer ${token ?? this.bearer()}`,
             'Content-Type': 'application/json'
           },
           timeout: 10000
