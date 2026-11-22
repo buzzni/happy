@@ -148,6 +148,36 @@ export async function lockWorkMachineExecution(
     return current.length === 1;
 }
 
+/**
+ * Locks the generation for a daemon worker call on a machine. A machine under
+ * work-machine authority is served only through the live credential of its
+ * current device; any other machine only without one, as before.
+ */
+export async function lockWorkMachineWorker(
+    tx: ExecutionDb,
+    worker: { accountId: string; machineId: string },
+    device: (WorkMachineDeviceGrant & { expiresAt: number }) | null | undefined,
+    { newWork = false }: { newWork?: boolean } = {},
+): Promise<boolean> {
+    if (!device) return lockLegacyWorkMachineExecution(tx, worker.accountId, worker.machineId);
+    return device.accountId === worker.accountId && device.machineId === worker.machineId
+        && device.expiresAt > Date.now() && lockWorkMachineExecution(tx, device, { newWork });
+}
+
+/** Thrown by a work machine write guard when the credential's generation is no longer live. */
+export class WorkMachineWriteRefused extends Error {}
+
+/**
+ * For a write that runs its own transaction: locks the credential's live
+ * generation inside it, as an in-turn write (allowed while draining), and
+ * throws `WorkMachineWriteRefused` otherwise so nothing is written.
+ */
+export function workMachineWriteGuard(grant: WorkMachineDeviceGrant & { expiresAt: number }) {
+    return async (tx: Pick<ExecutionDb, '$queryRaw'>) => {
+        if (grant.expiresAt <= Date.now() || !await lockWorkMachineExecution(tx, grant)) throw new WorkMachineWriteRefused();
+    };
+}
+
 export async function redeemWorkMachineRenewal(
     db: Pick<PrismaClient, '$transaction'>,
     device: WorkMachineDeviceGrant & { sessionId?: string },
@@ -250,36 +280,60 @@ export async function listOpenWorkMachineAutomationRuns(
     ].sort((a, b) => a.claimedAt.getTime() - b.claimedAt.getTime()).slice(0, limit);
 }
 
+/** Why a handoff did not move the authority, as the operator routes report it. */
+export type WorkMachineHandoffRefusal =
+    | 'generation-mismatch' | 'not-frozen' | 'frozen' | 'open-mcp-calls' | 'open-automation-runs'
+    | 'first-execution-recorded' | 'previous-device-mismatch' | 'key-mismatch';
+
+/** Locks the authority row of exactly this device and generation for a handoff. */
+async function lockHandoffAuthority(db: Pick<ExecutionDb, '$queryRaw'>, grant: WorkMachineDeviceGrant) {
+    const [row] = await db.$queryRaw<{ frozenAt: Date | null; firstExecutionAt: Date | null; previousDeviceId: string | null }[]>`
+        SELECT "frozenAt", "firstExecutionAt", "previousDeviceId" FROM "WorkMachineExecution"
+        WHERE "machineId" = ${grant.machineId} AND "accountId" = ${grant.accountId}
+          AND "deviceId" = ${grant.deviceId} AND "generation" = ${grant.generation}
+        FOR UPDATE
+    `;
+    return row ?? null;
+}
+
+async function hasOpenAutomationRun(db: AutomationClaimDb, grant: WorkMachineDeviceGrant) {
+    return (await listOpenWorkMachineAutomationRuns(db, grant, new Date(), 1)).length > 0;
+}
+
 /**
  * The caller commits key and device changes in the same authority transaction.
- * The frozen authority row is locked first: claims and heartbeats lock it too
- * and stop at the freeze, so no claim of this generation can start or extend
- * its lease while the open work is checked.
+ * The frozen authority row is locked first: claims, heartbeats and connector
+ * admissions lock it too and stop at the freeze, so no claim of this
+ * generation can start or extend its lease while the open work is checked.
  */
 export async function replaceWorkMachineExecution(
     db: ExecutionDb & AutomationClaimDb,
     original: WorkMachineDeviceGrant,
     replacementDeviceId: string,
-): Promise<boolean> {
-    const frozen = await db.$queryRaw<{ machineId: string }[]>`
-        SELECT "machineId" FROM "WorkMachineExecution"
-        WHERE "machineId" = ${original.machineId} AND "accountId" = ${original.accountId}
-          AND "deviceId" = ${original.deviceId} AND "generation" = ${original.generation}
-          AND "frozenAt" IS NOT NULL
-        FOR UPDATE
-    `;
-    if (frozen.length !== 1 || (await listOpenWorkMachineAutomationRuns(db, original, new Date(), 1)).length > 0) return false;
+): Promise<true | WorkMachineHandoffRefusal> {
+    const row = await lockHandoffAuthority(db, original);
+    if (!row) return 'generation-mismatch';
+    if (!row.frozenAt) return 'not-frozen';
+    const { accountId, machineId } = original;
+    if (await db.workMachineExecution.count({ where: { accountId, machineId, mcpCalls: { some: { completedAt: null } } } })) {
+        return 'open-mcp-calls';
+    }
+    if (await hasOpenAutomationRun(db, original)) return 'open-automation-runs';
+    // The predicates repeat the checks for a caller outside a transaction,
+    // where the row lock ends with the statement; a row that changed is
+    // checked again and refused for its new reason.
     const changed = await db.workMachineExecution.updateMany({
         where: { ...matchGrant(original), frozenAt: { not: null }, mcpCalls: { none: { completedAt: null } } },
         data: {
             deviceId: replacementDeviceId,
+            previousDeviceId: original.deviceId,
             generation: { increment: 1 },
             drainingAt: null,
             frozenAt: null,
             firstExecutionAt: null,
         },
     });
-    return changed.count === 1;
+    return changed.count === 1 || replaceWorkMachineExecution(db, original, replacementDeviceId);
 }
 
 /** Preserve the first permit timestamp on retries without releasing the generation predicate. */
@@ -308,7 +362,12 @@ export async function permitWorkMachineExecution(
     return changed.length === 1;
 }
 
-/** Commit before contacting the connector. An unknown outcome deliberately leaves the call open. */
+/**
+ * Commit before contacting the connector. An unknown outcome deliberately
+ * leaves the call open. Retrying an admission whose answer was lost succeeds
+ * while the call is still open under the same scope; a request id taken by
+ * another scope, or a call already finished, is refused.
+ */
 export async function admitWorkMachineMcpCall(
     db: Pick<PrismaClient, '$transaction'>,
     device: WorkMachineDeviceGrant,
@@ -321,8 +380,9 @@ export async function admitWorkMachineMcpCall(
                 data: { ...matchGrant(device), requestId },
                 skipDuplicates: true,
             });
-            if (inserted.count !== 1) throw new DuplicateWorkMachineMcpCall();
-            return true;
+            if (inserted.count === 1) return true;
+            if (await tx.workMachineMcpCall.count({ where: { ...matchGrant(device), requestId, completedAt: null } }) === 1) return true;
+            throw new DuplicateWorkMachineMcpCall();
         });
     } catch (error) {
         if (error instanceof DuplicateWorkMachineMcpCall) return false;
@@ -341,16 +401,30 @@ export async function finishWorkMachineMcpCall(
     });
 }
 
+/**
+ * Returns the authority to the device the replace moved it away from, before
+ * the replacement ran anything. The replacement's row is locked first, as in a
+ * replace: claims and first execution permits lock it too, so none can start
+ * while it is checked. The restored generation has no previous device, so a
+ * restore does not chain back.
+ */
 export async function restoreWorkMachineExecution(
-    db: ExecutionDb,
+    db: ExecutionDb & AutomationClaimDb,
     replacement: WorkMachineDeviceGrant,
     originalDeviceId: string,
-): Promise<boolean> {
+): Promise<true | WorkMachineHandoffRefusal> {
+    const row = await lockHandoffAuthority(db, replacement);
+    if (!row) return 'generation-mismatch';
+    if (row.firstExecutionAt) return 'first-execution-recorded';
+    if (row.frozenAt) return 'frozen';
+    if (row.previousDeviceId !== originalDeviceId) return 'previous-device-mismatch';
+    if (await hasOpenAutomationRun(db, replacement)) return 'open-automation-runs';
+    // As in a replace, the predicates repeat the checks for a caller outside a transaction.
     const changed = await db.workMachineExecution.updateMany({
-        where: { ...matchGrant(replacement), firstExecutionAt: null, frozenAt: null },
-        data: { deviceId: originalDeviceId, generation: { increment: 1 }, drainingAt: null },
+        where: { ...matchGrant(replacement), firstExecutionAt: null, frozenAt: null, previousDeviceId: originalDeviceId },
+        data: { deviceId: originalDeviceId, previousDeviceId: null, generation: { increment: 1 }, drainingAt: null },
     });
-    return changed.count === 1;
+    return changed.count === 1 || restoreWorkMachineExecution(db, replacement, originalDeviceId);
 }
 
 const transitionSelect = { deviceId: true, generation: true, drainingAt: true, frozenAt: true } as const;
@@ -374,27 +448,41 @@ async function readTransitionState(
     };
 }
 
+/** Why a transition did not reach its state, as the operator routes report it. */
+export type WorkMachineTransitionRefusal = 'generation-mismatch' | 'not-draining' | 'frozen';
+
+/** The state the transition reached, or why this device and generation could not reach it. */
+async function transitionResult(
+    db: ExecutionDb,
+    grant: WorkMachineDeviceGrant,
+    reached: Prisma.WorkMachineExecutionWhereInput,
+    refusal: WorkMachineTransitionRefusal,
+): Promise<WorkMachineTransitionState | WorkMachineTransitionRefusal> {
+    return await readTransitionState(db, { ...matchGrant(grant), ...reached })
+        ?? (await readTransitionState(db, matchGrant(grant)) ? refusal : 'generation-mismatch');
+}
+
 /**
  * Stops new work in the current generation: turn permits, write RPCs and
  * state-changing preview requests are refused while in-turn writes continue.
- * Repeating it, also after the freeze, reports the drained state again. Null
- * when the row is no longer at this device and generation.
+ * Repeating it, also after the freeze, reports the drained state again.
+ * Refused when the row is no longer at this device and generation.
  */
 export async function drainWorkMachineExecution(db: ExecutionDb, grant: WorkMachineDeviceGrant) {
     await db.workMachineExecution.updateMany({
         where: { ...matchGrant(grant), drainingAt: null, frozenAt: null },
         data: { drainingAt: new Date() },
     });
-    return readTransitionState(db, { ...matchGrant(grant), drainingAt: { not: null } });
+    return transitionResult(db, grant, { drainingAt: { not: null } }, 'frozen');
 }
 
-/** Freezes a drained generation, which stops every write. Null unless it was drained first. */
+/** Freezes a drained generation, which stops every write. Refused unless it was drained first. */
 export async function freezeDrainedWorkMachineExecution(db: ExecutionDb, grant: WorkMachineDeviceGrant) {
     await db.workMachineExecution.updateMany({
         where: { ...matchGrant(grant), drainingAt: { not: null }, frozenAt: null },
         data: { frozenAt: new Date() },
     });
-    return readTransitionState(db, { ...matchGrant(grant), drainingAt: { not: null }, frozenAt: { not: null } });
+    return transitionResult(db, grant, { drainingAt: { not: null }, frozenAt: { not: null } }, 'not-draining');
 }
 
 /** Cancels a handoff before it happens: the same device and generation run again. */
@@ -403,7 +491,7 @@ export async function resumeWorkMachineExecution(db: ExecutionDb, grant: WorkMac
         where: { ...matchGrant(grant), OR: [{ drainingAt: { not: null } }, { frozenAt: { not: null } }] },
         data: { drainingAt: null, frozenAt: null },
     });
-    return readTransitionState(db, { ...matchGrant(grant), drainingAt: null, frozenAt: null });
+    return transitionResult(db, grant, { drainingAt: null, frozenAt: null }, 'generation-mismatch');
 }
 
 export type WorkMachineHandoff = 'replace' | 'restore';
@@ -411,13 +499,14 @@ export type WorkMachineHandoff = 'replace' | 'restore';
 /**
  * Moves the authority to the next device in the next generation and installs
  * the machine data key that device created, in the caller's transaction.
- * Replace needs a frozen generation without an open connector call; restore
- * needs a replacement that has not received its first execution permit. The
- * authority row is locked before the machine row, the order the daemon's
- * machine writes use. As in a key rotation, the server envelopes and the
+ * Replace needs a frozen generation without open connector calls or automation
+ * claims; restore needs a replacement that has run nothing and the device it
+ * was replaced from. A refusal says why. The authority row is locked before
+ * the machine row, the order the daemon's machine writes use. As in a key rotation, the server envelopes and the
  * attestation of the old key are cleared and both row versions move, so a
  * write prepared against the old key cannot land. A retry after a lost
- * response finds the device, generation and key in place and writes nothing.
+ * response finds the device, generation and key in place and writes nothing;
+ * the same retry with another key is a `key-mismatch`.
  */
 export async function handoffWorkMachineExecution(
     tx: Prisma.TransactionClient,
@@ -430,13 +519,16 @@ export async function handoffWorkMachineExecution(
     const moved = kind === 'replace'
         ? await replaceWorkMachineExecution(tx, current, nextDeviceId)
         : await restoreWorkMachineExecution(tx, current, nextDeviceId);
-    if (!moved) {
+    if (moved !== true) {
         const applied = await tx.workMachineExecution.findFirst({
             where: { accountId, machineId, deviceId: nextDeviceId, generation: current.generation + 1 },
             select: { machine: { select: { dataEncryptionKey: true } } },
         });
-        const key = applied?.machine.dataEncryptionKey;
-        return key && machineDataKeyEnvelopesEqual(key, dataEncryptionKey) ? { changed: false as const } : null;
+        if (!applied) return { refused: moved };
+        const key = applied.machine.dataEncryptionKey;
+        return key && machineDataKeyEnvelopesEqual(key, dataEncryptionKey)
+            ? { changed: false as const }
+            : { refused: 'key-mismatch' as const };
     }
     const machine = await tx.machine.update({
         where: { id: machineId, accountId },

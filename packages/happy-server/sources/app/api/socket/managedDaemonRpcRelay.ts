@@ -68,6 +68,19 @@ export type DaemonRpcRelayDeps = {
     now?: () => number;
 };
 
+/**
+ * What an RPC to a work machine does to its execution. Reads and stopping a
+ * turn run nothing new: drain allows them and they record no first execution.
+ * A permission answer belongs to a turn already running, so drain allows it,
+ * but an approval lets a tool run, so it records the first execution. Every
+ * other method is new work, refused while draining.
+ */
+const workMachineRpcTiers = new Map<string, 'read' | 'turn-stop' | 'turn-answer'>([
+    ['readFile', 'read'], ['readFileChunk', 'read'], ['listDirectory', 'read'], ['listFilesPage', 'read'],
+    ['abort', 'turn-stop'],
+    ['permission', 'turn-answer'],
+]);
+
 function defaultLocalSocket(io: Server, socketId: string): Socket | undefined {
     return io.sockets.sockets.get(socketId);
 }
@@ -106,11 +119,13 @@ export async function executeDaemonRpcLocally(input: {
     if (allowed && execution) {
         const method = splitRpcMethod(input.request.method);
         const scopeId = method?.sessionId;
-        const readOnly = method !== null && ['readFile', 'readFileChunk', 'listDirectory', 'listFilesPage'].includes(method.name);
+        const tier = (method && workMachineRpcTiers.get(method.name)) ?? 'new-work';
         const expectedScopeId = execution.purpose === 'daemon' ? execution.machineId : execution.sessionId;
         try {
             allowed = scopeId === expectedScopeId && now() < execution.expiresAt
-                && await (readOnly ? lockWorkMachineExecution(db, execution) : permitWorkMachineExecution(db, execution, new Date(now())));
+                && await (tier === 'new-work' ? permitWorkMachineExecution(db, execution, new Date(now()))
+                    : tier === 'turn-answer' ? permitWorkMachineExecution(db, execution, new Date(now()), true)
+                    : lockWorkMachineExecution(db, execution));
         } catch {
             allowed = false;
         }

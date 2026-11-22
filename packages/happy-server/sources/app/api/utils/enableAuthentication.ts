@@ -293,3 +293,21 @@ export function requireWorkMachineSessionScopeAuth(
         request.workMachineSessionGrant = claim;
     };
 }
+
+/**
+ * A daemon worker route under `/v1/machines/:machineId`. A work machine daemon
+ * credential must name that machine and stands in for the account; any other
+ * bearer goes through `authenticate` as before. Whether the machine may be
+ * served with that bearer is decided per call by `lockWorkMachineWorker`.
+ */
+export function requireWorkMachineWorkerAuth(app: Fastify) {
+    return async (request: FastifyRequest, reply: FastifyReply) => {
+        const grant = await verifyWorkMachineDaemonBearer(request);
+        if (!grant) return app.authenticate(request, reply);
+        if (grant.machineId !== (request.params as { machineId?: string }).machineId) {
+            return reply.code(403).send({ error: 'MACHINE_DENIED' });
+        }
+        request.userId = grant.accountId;
+        request.workMachineDaemonGrant = grant;
+    };
+}
