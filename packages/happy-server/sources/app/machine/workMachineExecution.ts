@@ -362,7 +362,12 @@ export async function permitWorkMachineExecution(
     return changed.length === 1;
 }
 
-/** Commit before contacting the connector. An unknown outcome deliberately leaves the call open. */
+/**
+ * Commit before contacting the connector. An unknown outcome deliberately
+ * leaves the call open. Retrying an admission whose answer was lost succeeds
+ * while the call is still open under the same scope; a request id taken by
+ * another scope, or a call already finished, is refused.
+ */
 export async function admitWorkMachineMcpCall(
     db: Pick<PrismaClient, '$transaction'>,
     device: WorkMachineDeviceGrant,
@@ -375,8 +380,9 @@ export async function admitWorkMachineMcpCall(
                 data: { ...matchGrant(device), requestId },
                 skipDuplicates: true,
             });
-            if (inserted.count !== 1) throw new DuplicateWorkMachineMcpCall();
-            return true;
+            if (inserted.count === 1) return true;
+            if (await tx.workMachineMcpCall.count({ where: { ...matchGrant(device), requestId, completedAt: null } }) === 1) return true;
+            throw new DuplicateWorkMachineMcpCall();
         });
     } catch (error) {
         if (error instanceof DuplicateWorkMachineMcpCall) return false;

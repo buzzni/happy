@@ -214,7 +214,10 @@ describe('work machine execution authority', () => {
         const requestId = crypto.randomUUID();
         const secondId = crypto.randomUUID();
         await expect(authority.admitWorkMachineMcpCall(db, original, requestId)).resolves.toBe(true);
-        await expect(authority.admitWorkMachineMcpCall(db, original, requestId)).resolves.toBe(false);
+        // A retry after a lost answer is the same admission; another scope cannot take the request id.
+        await expect(authority.admitWorkMachineMcpCall(db, original, requestId)).resolves.toBe(true);
+        await expect(authority.admitWorkMachineMcpCall(db, { ...original, deviceId: 'other-pc' }, requestId)).resolves.toBe(false);
+        expect(await db.workMachineMcpCall.count({ where: { requestId } })).toBe(1);
         expect((await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt).not.toBeNull();
         expect(await freezeWorkMachineExecution(db, original)).toBe(true);
         await expect(authority.admitWorkMachineMcpCall(db, original, secondId)).resolves.toBe(false);
@@ -223,6 +226,10 @@ describe('work machine execution authority', () => {
         await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe('open-mcp-calls');
         await authority.finishWorkMachineMcpCall(db, original, requestId);
         await authority.finishWorkMachineMcpCall(db, original, requestId);
+        await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: null } });
+        // A finished call is not admitted again.
+        await expect(authority.admitWorkMachineMcpCall(db, original, requestId)).resolves.toBe(false);
+        await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
         await expect(replaceWorkMachineExecution(db, original, replacement.deviceId)).resolves.toBe(true);
         await expect(authority.admitWorkMachineMcpCall(db, original, secondId)).resolves.toBe(false);
         await expect(authority.admitWorkMachineMcpCall(db, replacement, secondId)).resolves.toBe(true);
