@@ -2,17 +2,20 @@ import { db } from '@/storage/db';
 import { Prisma } from '@prisma/client';
 import type { CheckpointEventEnvelope } from './checkpointEventEnvelope';
 import type { SessionEventType } from './sessionEventTypes';
+import type { SessionEventWriteGuard } from './persistSessionEvent';
 
 export async function persistCheckpointSessionEvent(params: {
     sessionId: string;
     eventType: SessionEventType;
     content: string;
     checkpoint: CheckpointEventEnvelope;
+    guard?: SessionEventWriteGuard;
 }) {
-    const { sessionId, eventType, content, checkpoint } = params;
+    const { sessionId, eventType, content, checkpoint, guard } = params;
     const idempotencyKey = `${eventType}:${checkpoint.operationId}:${checkpoint.state}`;
     try {
         const event = await db.$transaction(async (tx) => {
+            await guard?.(tx);
             const session = await tx.session.update({
                 where: { id: sessionId },
                 select: { eventSeq: true },

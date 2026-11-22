@@ -40,6 +40,8 @@ async function makeApp() {
     app.setValidatorCompiler(validatorCompiler);
     app.setSerializerCompiler(serializerCompiler);
     app.decorate('authenticate', async (request: { userId: string }) => { request.userId = 'account-1'; });
+    // push-event takes the session-scope decorator, so a work machine session credential can reach it.
+    app.decorate('authenticateSessionScope', async (request: { userId: string }) => { request.userId = 'account-1'; });
     pushRoutes(app as unknown as Fastify);
     return app;
 }
@@ -117,7 +119,8 @@ describe('pushRoutes turn-ready event', () => {
         const response = await sendDone(await makeApp());
 
         expect(response.statusCode).toBe(200);
-        expect(mocks.persistTurnReadySessionEvent).toHaveBeenCalledWith('session-1');
+        // An ordinary session writes without a work machine guard.
+        expect(mocks.persistTurnReadySessionEvent).toHaveBeenCalledWith('session-1', undefined);
     });
 
     it('does not record a turn-ready event for a SILENT automation session', async () => {

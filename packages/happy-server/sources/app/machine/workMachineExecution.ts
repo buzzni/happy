@@ -164,6 +164,20 @@ export async function lockWorkMachineWorker(
         && device.expiresAt > Date.now() && lockWorkMachineExecution(tx, device, { newWork });
 }
 
+/** Thrown by a work machine write guard when the credential's generation is no longer live. */
+export class WorkMachineWriteRefused extends Error {}
+
+/**
+ * For a write that runs its own transaction: locks the credential's live
+ * generation inside it, as an in-turn write (allowed while draining), and
+ * throws `WorkMachineWriteRefused` otherwise so nothing is written.
+ */
+export function workMachineWriteGuard(grant: WorkMachineDeviceGrant & { expiresAt: number }) {
+    return async (tx: Pick<ExecutionDb, '$queryRaw'>) => {
+        if (grant.expiresAt <= Date.now() || !await lockWorkMachineExecution(tx, grant)) throw new WorkMachineWriteRefused();
+    };
+}
+
 export async function redeemWorkMachineRenewal(
     db: Pick<PrismaClient, '$transaction'>,
     device: WorkMachineDeviceGrant & { sessionId?: string },

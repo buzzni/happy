@@ -22,6 +22,8 @@ import { v3SessionRoutes } from '@/app/api/routes/v3SessionRoutes';
 import { automationSocketHandler } from '@/app/api/socket/automationSocketHandler';
 import { workMachineExecutionRoutes } from '@/app/api/routes/workMachineExecutionRoutes';
 import { automationExecutionRoutes } from '@/app/api/routes/automationExecutionRoutes';
+import { v3SessionEventRoutes } from '@/app/api/routes/v3SessionEventRoutes';
+import { pushRoutes } from '@/app/api/routes/pushRoutes';
 import { enableAuthentication, enableSessionScopeAuthentication } from '@/app/api/utils/enableAuthentication';
 import { canonicalDigest } from '@/app/managed/canonicalDigest';
 import { createControlAssertionVerifier } from '@/app/managed/managedControlAssertion';
@@ -1486,6 +1488,63 @@ describe('work machine execution authority', () => {
             await db.machine.deleteMany({ where: { id: 'question-legacy-machine' } });
             await db.project.delete({ where: { id: project.id } });
             vi.unstubAllEnvs();
+            if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
+            else process.env.HANDY_MASTER_SECRET = priorSecret;
+        }
+    });
+
+    it('accepts session events and push events of a protected conversation only with its current session credential', async () => {
+        const priorSecret = process.env.HANDY_MASTER_SECRET;
+        process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+        const app = fastify();
+        app.setValidatorCompiler(validatorCompiler);
+        app.setSerializerCompiler(serializerCompiler);
+        const ephemeral = vi.spyOn(eventRouter, 'emitEphemeral').mockImplementation(() => {});
+        try {
+            await auth.init();
+            enableAuthentication(app as unknown as Fastify);
+            enableSessionScopeAuthentication(app as unknown as Fastify, () => null);
+            v3SessionEventRoutes(app as unknown as Fastify);
+            pushRoutes(app as unknown as Fastify);
+            const session = async (device: typeof original) => {
+                const now = Date.now();
+                return auth.workMachineExecutionIssuer!.mint({
+                    ...device, sessionId: 'protected-session', purpose: 'session', expiresAt: now + 60_000,
+                }, now);
+            };
+            const event = (token: string) => app.inject({
+                method: 'POST', url: '/v3/sessions/protected-session/events', headers: { authorization: `Bearer ${token}` },
+                payload: { eventType: 'session-end', content: 'encrypted' },
+            });
+            const push = (token: string) => app.inject({
+                method: 'POST', url: '/v1/sessions/protected-session/push-event', headers: { authorization: `Bearer ${token}` },
+                payload: { kind: 'permission', title: 'title', body: 'body' },
+            });
+            const events = () => db.sessionEvent.count({ where: { sessionId: 'protected-session' } });
+            const current = await session(original);
+            const accountToken = await auth.createToken(accountId);
+
+            expect((await event(accountToken)).statusCode).toBe(403);
+            expect((await push(accountToken)).statusCode).toBe(403);
+            const before = await events();
+            expect((await event(current)).statusCode).toBe(200);
+            expect(await events()).toBe(before + 1);
+            expect((await push(current)).statusCode).toBe(200);
+
+            // In-turn writes continue while draining and stop at the freeze.
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+            expect((await event(current)).statusCode).toBe(200);
+            await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+            expect((await event(current)).statusCode).toBe(403);
+            expect((await push(current)).statusCode).toBe(403);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+            expect((await event(current)).statusCode).toBe(403);
+            expect((await event(await session(replacement))).statusCode).toBe(200);
+            expect(await events()).toBe(before + 3);
+        } finally {
+            ephemeral.mockRestore();
+            await app.close();
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
             if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
             else process.env.HANDY_MASTER_SECRET = priorSecret;
         }
