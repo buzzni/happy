@@ -388,4 +388,25 @@ describe('work machine export and import over the Studio transfer API', () => {
         expect(after.encryption.machineKey).not.toBe(before.encryption.machineKey);
         await expect(createWorkMachineRestoreProof({ home: fixture.sourceHome, machineId: 'another-machine', generation: 4 })).rejects.toThrow();
     });
+
+    it.each(['import', 'restore-proof'] as const)('keeps the access.key fields it does not own when %s replaces the key', async (operation) => {
+        const fixture = await machinesFixture(root, studio);
+        const home = operation === 'import' ? fixture.targetHome : fixture.sourceHome;
+        const before = {
+            token: `${operation}-account-token`, futureField: { kept: true },
+            encryption: { publicKey: Buffer.from(nacl.box.keyPair().publicKey).toString('base64'), machineKey: randomBytes(32).toString('base64'), neverEscrowed: true },
+        };
+        await writeFile(join(home, 'access.key'), JSON.stringify(before), { mode: 0o600 });
+        if (operation === 'import') {
+            await exportWorkMachine(fixture.exportInput);
+            await fixture.vacateSource();
+            await importWorkMachine(fixture.importInput);
+        } else {
+            await createWorkMachineRestoreProof({ home, machineId, generation: 4 });
+        }
+
+        const after = JSON.parse(await readFile(join(home, 'access.key'), 'utf8'));
+        expect(after).toEqual({ ...before, encryption: { ...before.encryption, machineKey: expect.any(String) } });
+        expect(after.encryption.machineKey).not.toBe(before.encryption.machineKey);
+    });
 });

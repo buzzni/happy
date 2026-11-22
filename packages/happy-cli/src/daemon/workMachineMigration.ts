@@ -116,15 +116,23 @@ function signScope(keys: DeviceKeys, scope: (issuedAt: number) => unknown[]): Wo
     };
 }
 
+const accessKeySchema = z.object({ encryption: z.object({ machineKey: z.string() }).passthrough() }).passthrough();
+
 /**
  * Replaces this home's machine data key and returns the new envelope (base64, as machine
  * registration sends it: 105 bytes) with the proof-scope digest, base64url sha256 over those bytes.
+ * Only `encryption.machineKey` changes: the token, `neverEscrowed` (the new key goes to the
+ * account key alone, never to the server) and any field a newer CLI added stay as they were.
  * The previous access.key is kept once beside it.
  */
 async function rotateMachineDataKey(home: string, backupSuffix: string): Promise<{ dataEncryptionKey: string; digest: string }> {
     const accessKey = join(home, 'access.key');
-    const credentials = parseCredentials(await readJson(accessKey));
-    if (credentials?.encryption.type !== 'dataKey') throw new Error('This home needs a dataKey account login (access.key) to rotate the machine data key');
+    const raw = await readJson(accessKey);
+    const credentials = parseCredentials(raw);
+    const stored = accessKeySchema.safeParse(raw);
+    if (credentials?.encryption.type !== 'dataKey' || !stored.success) {
+        throw new Error('This home needs a dataKey account login (access.key) to rotate the machine data key');
+    }
     await copyFile(accessKey, `${accessKey}.before-${backupSuffix}`, constants.COPYFILE_EXCL).catch((error: NodeJS.ErrnoException) => {
         if (error.code !== 'EEXIST') throw error;
     });
@@ -132,8 +140,7 @@ async function rotateMachineDataKey(home: string, backupSuffix: string): Promise
     try {
         const envelope = wrapDataEncryptionKey(machineKey, credentials.encryption.publicKey);
         await replacePrivateFile(accessKey, JSON.stringify({
-            encryption: { publicKey: encodeBase64(credentials.encryption.publicKey), machineKey: encodeBase64(machineKey) },
-            token: credentials.token,
+            ...stored.data, encryption: { ...stored.data.encryption, machineKey: encodeBase64(machineKey) },
         }, null, 2));
         return { dataEncryptionKey: encodeBase64(envelope), digest: createHash('sha256').update(envelope).digest('base64url') };
     } finally {
