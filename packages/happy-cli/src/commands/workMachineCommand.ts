@@ -16,8 +16,9 @@ const USAGE = [
     'Usage: happy work-machine prepare <machineId>',
     '       happy work-machine bind <machineId> <accountId> <generation>',
     '       happy work-machine target-approval <machineId> <jobId> <expiresAt> --account <accountId> --generation <n> --source-device <deviceId> [--max-bytes <n>]',
-    '       happy work-machine export --studio <url> --job <jobId> --token <wmt_…> [--check]',
-    '       happy work-machine import --studio <url> --job <jobId> --token <wmt_…>',
+    '       happy work-machine export --studio <url> --job <jobId> [--token <wmt_…>] [--check]',
+    '       happy work-machine import --studio <url> --job <jobId> [--token <wmt_…>]',
+    '       (the transfer token may come from HAPPY_WORK_MACHINE_TRANSFER_TOKEN instead, keeping it out of argv)',
     '       happy work-machine restore-proof <machineId> <current generation>',
 ].join('\n');
 /** The envelope's single-archive ceiling. */
@@ -83,8 +84,9 @@ export async function handleWorkMachineCommand(args: string[]): Promise<void> {
     }
     if (operation === 'export' || operation === 'import') {
         const { positional, options, flags } = parseArguments(rest, ['studio', 'job', 'token'], operation === 'export' ? ['check'] : []);
-        if (positional.length || !options.studio || !options.job || !options.token) throw new Error(USAGE);
-        const endpoint = { home: happyHomeDir, studioUrl: options.studio, jobId: options.job, token: options.token, ...providerHomes() };
+        const token = options.token ?? process.env.HAPPY_WORK_MACHINE_TRANSFER_TOKEN;
+        if (positional.length || !options.studio || !options.job || !token) throw new Error(USAGE);
+        const endpoint = { home: happyHomeDir, studioUrl: options.studio, jobId: options.job, token, ...providerHomes() };
         // A dry run while the source still drains: nothing is stopped, sealed or uploaded.
         if (flags.has('check')) {
             console.log(JSON.stringify(await checkWorkMachineExport(endpoint)));
