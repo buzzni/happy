@@ -611,6 +611,39 @@ describe('PII request-scoped visibility', () => {
         expect(supported.statusCode).toBe(200);
         expect(supported.json()).toMatchObject({ currentData: 'private-key-envelope' });
     });
+    it('refuses access-key writes with the account token for a work machine or its conversation', async () => {
+        await seed('handoff-session', T0);
+        await seed('regular-session', T0);
+        await client.machine.createMany({ data: [
+            { id: 'stable-machine', accountId: ACCOUNT, metadata: '' },
+            { id: 'regular-machine', accountId: ACCOUNT, metadata: '' },
+        ] });
+        await client.workMachineExecution.create({
+            data: { machineId: 'stable-machine', accountId: ACCOUNT, deviceId: 'device', generation: 1 },
+        });
+        await client.session.update({ where: { id: 'handoff-session' }, data: { workMachineId: 'stable-machine' } });
+        await client.accessKey.createMany({ data: [
+            { accountId: ACCOUNT, sessionId: 'handoff-session', machineId: 'regular-machine', data: 'existing' },
+            { accountId: ACCOUNT, sessionId: 'regular-session', machineId: 'stable-machine', data: 'existing' },
+        ] });
+        const headers = { authorization: `Bearer ${token}` };
+        const write = (method: 'POST' | 'PUT', sessionId: string, machineId: string) => app.inject({
+            method, url: `/v1/access-keys/${sessionId}/${machineId}`, headers,
+            payload: method === 'POST' ? { data: 'replacement' } : { data: 'replacement', expectedVersion: 1 },
+        });
+        for (const [sessionId, machineId] of [['handoff-session', 'regular-machine'], ['regular-session', 'stable-machine']]) {
+            await client.accessKey.delete({
+                where: { accountId_machineId_sessionId: { accountId: ACCOUNT, sessionId, machineId } },
+            });
+            expect((await write('POST', sessionId, machineId)).statusCode).toBe(404);
+            await client.accessKey.create({ data: { accountId: ACCOUNT, sessionId, machineId, data: 'existing' } });
+            expect((await write('PUT', sessionId, machineId)).statusCode).toBe(404);
+        }
+        expect(await client.accessKey.count({ where: { data: 'existing' } })).toBe(2);
+        expect((await write('POST', 'regular-session', 'regular-machine')).statusCode).toBe(200);
+        expect((await write('PUT', 'regular-session', 'regular-machine')).json()).toEqual({ success: true, version: 2 });
+    });
+
     it('enforces protection immutability beneath metadata writers', async () => {
         await seed('normal', Date.now());
         // The schema diff provides the column; the migration supplies the trigger.
