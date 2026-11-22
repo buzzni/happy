@@ -13,7 +13,8 @@ import {
     syncAutomations,
 } from '@/app/automation/automationExecutionService';
 import { inTx, type Tx } from '@/storage/inTx';
-import { lockLegacyWorkMachineExecution } from '@/app/machine/workMachineExecution';
+import { lockLegacyWorkMachineExecution, lockWorkMachineExecution, type WorkMachineDeviceGrant } from '@/app/machine/workMachineExecution';
+import type { WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
 import { warn } from '@/utils/log';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
 import { emitAutomationUpdate, emitProjectAutomationUpdate } from '@/app/automation/automationUpdate';
@@ -97,13 +98,37 @@ async function answer(
     }
 }
 
-export function automationSocketHandler(accountId: string, machineId: string, socket: Socket): void {
-    function workerTransaction<T extends Parameters<Callback>[0]>(operation: (tx: Tx) => Promise<T>) {
+/**
+ * `device` is the daemon credential the machine socket authenticated with, if
+ * any. A machine under work-machine authority runs automation only through
+ * it: every call locks the live generation in its own transaction. Claims are
+ * new work and stop at drain, leaving the slot untouched; the rest (sync, key,
+ * start, heartbeat, delivery and the result report of a run already claimed)
+ * continues until the freeze. Without a device credential the machine must
+ * still be outside work-machine authority, as before.
+ */
+export function automationSocketHandler(
+    accountId: string,
+    machineId: string,
+    socket: Socket,
+    device: Extract<WorkMachineExecutionClaims, { purpose: 'daemon' }> | null = null,
+): void {
+    const grant: WorkMachineDeviceGrant | null = device && device.accountId === accountId && device.machineId === machineId ? device : null;
+    function workerTransaction<T extends Parameters<Callback>[0]>(operation: (tx: Tx) => Promise<T>, { newWork = false } = {}) {
         return inTx(async tx => {
-            if (!await lockLegacyWorkMachineExecution(tx, accountId, machineId)) {
+            const allowed = device
+                ? !!grant && device.expiresAt > Date.now() && await lockWorkMachineExecution(tx, grant, { newWork })
+                : await lockLegacyWorkMachineExecution(tx, accountId, machineId);
+            if (!allowed) {
                 return { ok: false as const, error: 'forbidden' };
             }
             return operation(tx);
+        });
+    }
+    /** A device attaches a run only to a conversation of its own work machine. */
+    async function ownSession(tx: Tx, sessionId: string | null) {
+        return !grant || sessionId === null || !!await tx.session.findFirst({
+            where: { id: sessionId, accountId, workMachineId: machineId }, select: { id: true },
         });
     }
 
@@ -170,7 +195,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         scheduledFor: new Date(integer(data?.scheduledFor, 0, Number.MAX_SAFE_INTEGER)),
         // specs/scheduled-missed-run-policy R11 — only an explicit true widens the window; anything else is a plain claim.
         ...(data?.catchUp === true ? { catchUp: true } : {}),
-    })), (value) => {
+    }), { newWork: true }), (value) => {
         const { projectId } = value as { projectId: string };
         return emitProjectAutomationUpdate(projectId, {
             projectId,
@@ -193,7 +218,8 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         };
         // A storage failure is not a refusal: the daemon keeps its schedule and reports the gap again (R5),
         // where a malformed request (invalid-input above) or a refusal lets it move on without a record.
-        return workerTransaction((tx) => recordMissedAutomationRuns(tx, accountId, machineId, input))
+        // Recording a slot as missed decides its fate, so it waits with the claims.
+        return workerTransaction((tx) => recordMissedAutomationRuns(tx, accountId, machineId, input), { newWork: true })
             .catch((error) => {
                 warn({ err: error }, 'automation socket: missed-run record failed to store');
                 return { ok: false as const, error: 'record-failed' };
@@ -227,7 +253,9 @@ export function automationSocketHandler(accountId: string, machineId: string, so
 
     on('automation-conversation-deliver', async (data, callback) => answer(callback, () => {
         const input = automationConversationDeliverRequestSchema.parse(data);
-        return workerTransaction((tx) => deliverAutomationConversationMessage(tx, accountId, machineId, input));
+        return workerTransaction(async (tx) => await ownSession(tx, input.sessionId)
+            ? deliverAutomationConversationMessage(tx, accountId, machineId, input)
+            : { ok: false as const, error: 'target-mismatch' });
     }, async (value) => {
         const { message } = value as { message: { id: string; sessionId: string; seq: number; localId: string | null; content: { c: string }; createdAt: Date; updatedAt: Date } };
         await emitSessionFollowupMessageUpdate({ userId: accountId, ...message, contentCiphertext: message.content.c });
@@ -248,13 +276,16 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             : typeof data?.degradedCode === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(data.degradedCode)
                 ? data.degradedCode
                 : (() => { throw new Error('invalid-input'); })();
-        return workerTransaction((tx) => reportAutomationRun(tx, accountId, machineId, {
+        const sessionId = data?.sessionId === null ? null : requiredString(data?.sessionId);
+        return workerTransaction(async (tx) => !await ownSession(tx, sessionId)
+            ? { ok: false as const, error: 'target-mismatch' }
+            : reportAutomationRun(tx, accountId, machineId, {
             runId: requiredString(data?.runId),
             claimToken: requiredString(data?.claimToken),
             reportId: requiredString(data?.reportId),
             status,
             outcome,
-            sessionId: data?.sessionId === null ? null : requiredString(data?.sessionId),
+            sessionId,
             detailCiphertext: data?.detailCiphertext === null ? null : bytes(data?.detailCiphertext, 128 * 1024),
             failureCode,
             degradedCode,
@@ -301,7 +332,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             followupId: input.followupId,
             generation: input.generation,
             step: input.step,
-        }));
+        }), { newWork: true });
     }));
 
     on('session-followup-evaluate', async (data, callback) => answer(callback, () => {

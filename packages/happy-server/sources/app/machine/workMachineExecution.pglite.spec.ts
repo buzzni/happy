@@ -32,7 +32,7 @@ import {
     machineSocketIdentityExists,
     workMachineSocketMayAct,
 } from '@/app/api/socket/machineSocketAuth';
-import { createWorkMachineExecutionTokenIssuer } from '@/app/auth/workMachineExecutionToken';
+import { createWorkMachineExecutionTokenIssuer, type WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
 import * as machineSockets from '@/app/events/findMachineSockets';
 import { eventRouter } from '@/app/events/eventRouter';
 import * as authority from './workMachineExecution';
@@ -1044,5 +1044,79 @@ describe('work machine execution authority', () => {
             if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
             else process.env.HANDY_MASTER_SECRET = priorSecret;
         }
+    });
+
+    it('lets the current device run scheduled automation: claims stop at drain, claimed runs finish until the freeze', async () => {
+        vi.stubEnv('SAYCODE_AUTOMATION_ENABLED', 'true');
+        const project = await db.project.create({ data: { accountId, name: 'device-automation', automationViewerKeyVersion: 1 } });
+        await db.machine.update({ where: { id: machineId }, data: { automationKeyVersion: 1 } });
+        const automations = await Promise.all(['first', 'second', 'third'].map(name => db.automation.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, payloadVersion: 1,
+            payloadCiphertext: new Uint8Array(1), viewerKeyId: `viewer-${name}`, viewerKeyVersion: 1,
+            viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+            enabledAt: new Date(Date.now() - 60_000),
+        } })));
+        await db.session.create({ data: { id: 'unattached-report-target', tag: 'unattached-report-target', accountId, metadata: 'encrypted' } });
+        const expiresAt = Date.now() + 60_000;
+        const worker = (device: WorkMachineExecutionClaims | null) => {
+            const handlers = new Map<string, (data: unknown, callback: (result: unknown) => void) => Promise<void>>();
+            automationSocketHandler(accountId, machineId, { on: (event: string, handler: never) => handlers.set(event, handler) } as never,
+                device as never);
+            return (event: string, data: object) => new Promise<{ ok: boolean; value?: any; error?: string }>(resolve =>
+                void handlers.get(event)!(data, resolve as never));
+        };
+        const current = worker({ ...original, purpose: 'daemon', expiresAt });
+        const claim = (send: ReturnType<typeof worker>, automationId: string) =>
+            send('automation-claim', { automationId, generation: 1, scheduledFor: Date.now() });
+        const report = (send: ReturnType<typeof worker>, run: { runId: string; claimToken: string }, sessionId: string | null, reportId: string) =>
+            send('automation-run-report', { ...run, reportId, status: 'COMPLETED', outcome: 'WOKE', sessionId, detailCiphertext: null });
+        try {
+            expect(await claim(worker(null), automations[0].id)).toEqual({ ok: false, error: 'forbidden' });
+            const first = await claim(current, automations[0].id);
+            const second = await claim(current, automations[1].id);
+            expect(first.ok && second.ok).toBe(true);
+            const runs = [first, second].map(({ value }) => ({ runId: value.runId as string, claimToken: value.claimToken as string }));
+            for (const run of runs) expect(await current('automation-run-start', run)).toMatchObject({ ok: true });
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+            expect(await claim(current, automations[2].id)).toEqual({ ok: false, error: 'forbidden' });
+            expect(await current('automation-missed-record', {
+                automationId: automations[2].id, generation: 1, firstMissedAt: Date.now() - 60_000, missedCount: 1, failureCode: 'MISSED_OFFLINE',
+            })).toEqual({ ok: false, error: 'forbidden' });
+            expect(await db.automationRun.count({ where: { automationId: automations[2].id } })).toBe(0);
+            expect(await current('automation-run-heartbeat', runs[0])).toMatchObject({ ok: true });
+            // A claimed run reports only a conversation of this work machine.
+            expect(await report(current, runs[0], 'unattached-report-target', 'report-unattached')).toEqual({ ok: false, error: 'target-mismatch' });
+            expect(await report(current, runs[0], 'protected-session', 'report-first')).toMatchObject({ ok: true });
+            expect(await db.automationRun.findUniqueOrThrow({ where: { id: runs[0].runId } }))
+                .toMatchObject({ status: 'COMPLETED', sessionId: 'protected-session' });
+
+            await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+            expect(await current('automation-run-heartbeat', runs[1])).toEqual({ ok: false, error: 'forbidden' });
+            expect(await report(current, runs[1], null, 'report-frozen')).toEqual({ ok: false, error: 'forbidden' });
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+            expect(await report(current, runs[1], null, 'report-old-generation')).toEqual({ ok: false, error: 'forbidden' });
+            expect((await db.automationRun.findUniqueOrThrow({ where: { id: runs[1].runId } })).status).toBe('RUNNING');
+            expect(await claim(worker({ ...replacement, purpose: 'daemon', expiresAt }), automations[2].id)).toMatchObject({ ok: true });
+        } finally {
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+            await db.project.delete({ where: { id: project.id } });
+            vi.unstubAllEnvs();
+        }
+    });
+
+    it('admits the automation socket events of the current device daemon socket only', async () => {
+        const claims = { ...original, purpose: 'daemon' as const, expiresAt: Date.now() + 60_000 };
+        const act = (event: string, input: Partial<Parameters<typeof workMachineSocketMayAct>[1]> = {}) => workMachineSocketMayAct(db, {
+            accountId, socketMachineId: machineId, claims, event, payload: { automationId: 'any' }, now: Date.now(), ...input,
+        });
+        for (const event of ['automation-claim', 'automation-run-report', 'automation-sync', 'session-followup-claim']) {
+            expect(await act(event)).toBe(true);
+        }
+        expect(await act('automation-claim', { socketMachineId: 'ordinary-machine' })).toBe(false);
+        expect(await act('automation-claim', { claims: { ...claims, purpose: 'session', sessionId: 'protected-session' } as never, socketMachineId: undefined, socketSessionId: 'protected-session' })).toBe(false);
+        expect(await act('automation-claim', { claims: null })).toBe(false);
+        await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+        expect(await act('automation-run-report')).toBe(false);
     });
 });
