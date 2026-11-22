@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { once } from 'node:events'
 import { readdir, readFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
@@ -6,17 +7,26 @@ import { join } from 'node:path'
 
 /**
  * Whether this daemon serves the resident bundle: a plain Node with synchronous loader hooks, unless disabled for comparison.
- * macOS bundles the sandbox runtime too: its Seatbelt profile is generated, so no package-relative asset is looked up.
- * Linux stays on the installed graph until the seccomp filter the runtime finds next to its own file travels with the bundle.
+ * The bundle carries the sandbox runtime: macOS generates its Seatbelt profile, and Linux finds the seccomp filter that
+ * bundle-resident-session.mjs copies to dist/vendor/seccomp, next to the bundled module URL.
  */
 export function residentModulesEnabled(runtime: {
   platform: NodeJS.Platform
   versions: { electron?: string; bun?: string; [name: string]: string | undefined }
   hasRegisterHooks: boolean
   env: NodeJS.ProcessEnv
+  /** Linux only: the bundle carries this machine's seccomp filter (bundledSeccompFilterPresent). */
+  linuxSeccompFilter: boolean
 }) {
-  return (runtime.platform === 'win32' || runtime.platform === 'darwin') && !runtime.versions.electron && !runtime.versions.bun
+  return ['win32', 'darwin', 'linux'].includes(runtime.platform) && !runtime.versions.electron && !runtime.versions.bun
     && runtime.hasRegisterHooks && runtime.env.HAPPY_DISABLE_RESIDENT_MODULES !== '1'
+    && (runtime.platform !== 'linux' || runtime.linuxSeccompFilter)
+}
+
+/** The filter the bundled sandbox runtime looks up for this architecture, using its own x64/arm64 vendor names. */
+export function bundledSeccompFilterPresent(root: string, arch: string = process.arch) {
+  const vendorArch = arch === 'x64' ? 'x64' : arch === 'arm64' ? 'arm64' : null
+  return vendorArch !== null && existsSync(join(root, 'dist', 'vendor', 'seccomp', vendorArch, 'unix-block.bpf'))
 }
 
 /** Loads verified installation code once. Session data and project files never reach this listener. */

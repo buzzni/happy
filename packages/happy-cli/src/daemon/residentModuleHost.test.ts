@@ -1,13 +1,13 @@
 import * as moduleApi from 'node:module'
 import { execFile } from 'node:child_process'
-import { cp, mkdir, mkdtemp, realpath, rm, writeFile } from 'node:fs/promises'
+import { cp, mkdir, mkdtemp, realpath, rm, stat, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { RESIDENT_MODULE_HOST_ENV } from '@/utils/childEnv'
-import { residentModulesEnabled, startResidentModuleHost } from './residentModuleHost'
+import { bundledSeccompFilterPresent, residentModulesEnabled, startResidentModuleHost } from './residentModuleHost'
 
 const execute = promisify(execFile)
 const tempRoots: string[] = []
@@ -78,6 +78,13 @@ describe('resident Happy module host', () => {
     } finally { await host.close() }
   }, 20_000)
 
+  it.each(['x64', 'arm64'])('ships the %s seccomp filter where the bundled sandbox runtime looks for it', async arch => {
+    // Bundled into dist/*.mjs, the sandbox runtime resolves vendor/seccomp/<arch> next to its own module URL.
+    const vendor = fileURLToPath(new URL(`../../dist/vendor/seccomp/${arch}/`, import.meta.url))
+    expect((await stat(join(vendor, 'unix-block.bpf'))).size).toBeGreaterThan(0)
+    expect((await stat(join(vendor, 'apply-seccomp'))).mode & 0o111).not.toBe(0)
+  })
+
   it('starts the ordinary entry if the module host has already stopped', async () => {
     const { root, launch } = await fixture()
     const host = startResidentModuleHost(root)
@@ -92,12 +99,26 @@ describe('resident Happy module host', () => {
 })
 
 describe('resident module gate', () => {
-  const plainNode = { versions: {}, hasRegisterHooks: true, env: {} }
-  it.each(['win32', 'darwin'] as const)('serves the resident bundle on %s Node with loader hooks', platform => {
+  const plainNode = { versions: {}, hasRegisterHooks: true, env: {}, linuxSeccompFilter: true }
+  it.each(['win32', 'darwin', 'linux'] as const)('serves the resident bundle on %s Node with loader hooks', platform => {
     expect(residentModulesEnabled({ ...plainNode, platform })).toBe(true)
   })
-  it('keeps Linux on the installed module graph until its seccomp assets travel with the bundle', () => {
-    expect(residentModulesEnabled({ ...plainNode, platform: 'linux' })).toBe(false)
+  it('keeps Linux on the installed module graph when the bundle has no seccomp filter for this machine', () => {
+    // Without the filter the bundled sandbox runtime would only warn and leave unix sockets unrestricted.
+    expect(residentModulesEnabled({ ...plainNode, platform: 'linux', linuxSeccompFilter: false })).toBe(false)
+    expect(residentModulesEnabled({ ...plainNode, platform: 'darwin', linuxSeccompFilter: false })).toBe(true)
+  })
+  it('finds the bundled seccomp filter only for the architectures the sandbox runtime supports', async () => {
+    const root = fileURLToPath(new URL('../../', import.meta.url))
+    expect(bundledSeccompFilterPresent(root, 'x64')).toBe(true)
+    expect(bundledSeccompFilterPresent(root, 'arm64')).toBe(true)
+    expect(bundledSeccompFilterPresent(root, 'ia32')).toBe(false)
+    const empty = await realpath(await mkdtemp(join(tmpdir(), 'happy-resident-seccomp-')))
+    tempRoots.push(empty)
+    expect(bundledSeccompFilterPresent(empty, 'x64')).toBe(false)
+  })
+  it('keeps other platforms on the installed module graph', () => {
+    expect(residentModulesEnabled({ ...plainNode, platform: 'freebsd' })).toBe(false)
   })
   it('stays off under Electron, Bun, without loader hooks, or when disabled for comparison', () => {
     expect(residentModulesEnabled({ ...plainNode, platform: 'win32', versions: { electron: '41.0.0' } })).toBe(false)
