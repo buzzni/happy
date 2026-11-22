@@ -82,6 +82,7 @@ jobs:
         src/daemon/sessionRetention.test.ts
         src/daemon/sessionRetentionControl.test.ts
         src/daemon/sessionIdleReaper.test.ts
+        src/daemon/residentModuleHost.test.ts
 
     - name: Verify Claude account switches preserve queued input
       if: matrix.node-version == 24

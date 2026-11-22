@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto'
+import { existsSync } from 'node:fs'
 import { once } from 'node:events'
 import { readdir, readFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
@@ -14,9 +15,18 @@ export function residentModulesEnabled(runtime: {
   versions: { electron?: string; bun?: string; [name: string]: string | undefined }
   hasRegisterHooks: boolean
   env: NodeJS.ProcessEnv
+  /** Linux only: the bundle carries this machine's seccomp filter (bundledSeccompFilterPresent). */
+  linuxSeccompFilter: boolean
 }) {
   return ['win32', 'darwin', 'linux'].includes(runtime.platform) && !runtime.versions.electron && !runtime.versions.bun
     && runtime.hasRegisterHooks && runtime.env.HAPPY_DISABLE_RESIDENT_MODULES !== '1'
+    && (runtime.platform !== 'linux' || runtime.linuxSeccompFilter)
+}
+
+/** The filter the bundled sandbox runtime looks up for this architecture, using its own x64/arm64 vendor names. */
+export function bundledSeccompFilterPresent(root: string, arch: string = process.arch) {
+  const vendorArch = arch === 'x64' ? 'x64' : arch === 'arm64' ? 'arm64' : null
+  return vendorArch !== null && existsSync(join(root, 'dist', 'vendor', 'seccomp', vendorArch, 'unix-block.bpf'))
 }
 
 /** Loads verified installation code once. Session data and project files never reach this listener. */

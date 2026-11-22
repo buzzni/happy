@@ -7,7 +7,7 @@ import { promisify } from 'node:util'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { afterEach, describe, expect, it } from 'vitest'
 import { RESIDENT_MODULE_HOST_ENV } from '@/utils/childEnv'
-import { residentModulesEnabled, startResidentModuleHost } from './residentModuleHost'
+import { bundledSeccompFilterPresent, residentModulesEnabled, startResidentModuleHost } from './residentModuleHost'
 
 const execute = promisify(execFile)
 const tempRoots: string[] = []
@@ -99,9 +99,23 @@ describe('resident Happy module host', () => {
 })
 
 describe('resident module gate', () => {
-  const plainNode = { versions: {}, hasRegisterHooks: true, env: {} }
+  const plainNode = { versions: {}, hasRegisterHooks: true, env: {}, linuxSeccompFilter: true }
   it.each(['win32', 'darwin', 'linux'] as const)('serves the resident bundle on %s Node with loader hooks', platform => {
     expect(residentModulesEnabled({ ...plainNode, platform })).toBe(true)
+  })
+  it('keeps Linux on the installed module graph when the bundle has no seccomp filter for this machine', () => {
+    // Without the filter the bundled sandbox runtime would only warn and leave unix sockets unrestricted.
+    expect(residentModulesEnabled({ ...plainNode, platform: 'linux', linuxSeccompFilter: false })).toBe(false)
+    expect(residentModulesEnabled({ ...plainNode, platform: 'darwin', linuxSeccompFilter: false })).toBe(true)
+  })
+  it('finds the bundled seccomp filter only for the architectures the sandbox runtime supports', async () => {
+    const root = fileURLToPath(new URL('../../', import.meta.url))
+    expect(bundledSeccompFilterPresent(root, 'x64')).toBe(true)
+    expect(bundledSeccompFilterPresent(root, 'arm64')).toBe(true)
+    expect(bundledSeccompFilterPresent(root, 'ia32')).toBe(false)
+    const empty = await realpath(await mkdtemp(join(tmpdir(), 'happy-resident-seccomp-')))
+    tempRoots.push(empty)
+    expect(bundledSeccompFilterPresent(empty, 'x64')).toBe(false)
   })
   it('keeps other platforms on the installed module graph', () => {
     expect(residentModulesEnabled({ ...plainNode, platform: 'freebsd' })).toBe(false)
