@@ -2118,6 +2118,26 @@ describe('ApiMachineClient socket reconnection', () => {
         }
     });
 
+    // aplus-dev-studio specs/agent-app-api T5 — the server starts an app session only on a daemon that applies the
+    // profile; an older one would drop the field and run the session with every tool of the machine.
+    it('advertises the app profile', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') return { result: 'success', version: 1, metadata: data.metadata };
+            if (event === 'machine-update-state') return { result: 'success', version: 1, daemonState: data.daemonState };
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        expect(machine.metadata?.appProfile).toBeUndefined();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.appProfile).toEqual({ version: 1 }));
+
+        client.shutdown();
+    });
+
     // aplus-dev-studio specs/remote-file-list-pages — the web picks listFilesPage only on a
     // daemon that says it serves it; an older daemon answers only after the reconnect grace.
     it('advertises listFilesPage on a machine registered before the advertisement existed', async () => {

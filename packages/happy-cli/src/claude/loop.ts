@@ -24,6 +24,7 @@ export type { PermissionMode } from "@/api/types"
 import type { PermissionMode } from "@/api/types"
 import type { ClaudeTitleBridge } from './claudeOffTurnTitle'
 import type { ClaudeOutputFormat } from './structuredOutput'
+import type { ClaudeAppProfile } from './appProfile'
 import type { ClaudeOrgRequirements, OrgModelRequest } from './claudeOrgRequirements'
 import { assertRemoteOnlyForOrgEndpoint } from './utils/orgEndpointLocalMode'
 
@@ -112,6 +113,8 @@ interface LoopOptions {
     exitAfterFirstTurn?: boolean
     /** Session-scoped structured output from the spawn seed (specs/claude-cli-benchmark-followups R2). */
     outputFormat?: ClaudeOutputFormat
+    /** aplus-dev-studio specs/agent-app-api T5 — the app profile from the spawn seed, fixed for the process. */
+    appProfile?: ClaudeAppProfile
     getSaycodeSystemPromptEnabled: () => boolean | undefined
     getSaycodePromptBlocks: () => SaycodePromptBlockOverrides | undefined
     /** codexcli-approval-session-binding R10a — the run's turn attendance. */
@@ -156,6 +159,7 @@ export async function loop(opts: LoopOptions): Promise<number> {
         startingMode: opts.startingMode,
         exitAfterFirstTurn: opts.exitAfterFirstTurn,
         outputFormat: opts.outputFormat,
+        appProfile: opts.appProfile,
         turnAttendance: opts.turnAttendance,
         orgRequirements: opts.orgRequirements,
         lessons: opts.lessons,

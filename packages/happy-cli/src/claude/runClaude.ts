@@ -106,6 +106,7 @@ import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { consumeAutomationRunOnce } from '@/utils/automationRunOnce';
 import { createManagedFollowUpHandler } from '@/managed/managedFollowUp';
 import { consumeOutputFormatSeed } from './structuredOutput';
+import { consumeAppProfileSeed } from './appProfile';
 import { claudeLaunchMcpServers, consumeLaunchMcpServersSeed, launchMcpServersBeside, readClaudeMcpServerNames } from '@/aplus/launchMcpServers';
 import { consumePendingInitialAppendSystemPrompt, consumePendingInitialEffort, consumePendingInitialModel, consumePendingInitialSaycodePromptBlocks, consumePendingInitialSaycodeSystemPromptEnabled, defaultClaudeModelForRuntime, normalizeClaudeModelForRuntime, resolveClaudeModelForRuntime, resolveInitialPromptPermissionMode } from '@/utils/initialPrompt';
 import {
@@ -1103,6 +1104,9 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // validated it; a seed that does not parse is dropped, and the session runs without a format.
     const outputFormat = consumeOutputFormatSeed(process.env) ?? undefined;
     if (outputFormat) logger.debug('[START] Structured output requested for this session');
+    // aplus-dev-studio specs/agent-app-api T5 — throws on a malformed seed: running unrestricted is what it prevents.
+    const appProfile = consumeAppProfileSeed(process.env) ?? undefined;
+    if (appProfile) logger.debug(`[START] App profile: MCP servers ${appProfile.mcpServers.join(', ')}`);
     const initialSaycodeSystemPromptEnabled = consumePendingInitialSaycodeSystemPromptEnabled(
         process.env,
     );
@@ -2351,6 +2355,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         jsRuntime: options.jsRuntime,
         exitAfterFirstTurn,
         outputFormat,
+        appProfile,
         ...(claudeOrgRequirements ? { orgRequirements: claudeOrgRequirements } : {}),
         getSaycodeSystemPromptEnabled: () => currentSaycodeSystemPromptEnabled,
         getSaycodePromptBlocks: () => currentSaycodePromptBlocks,

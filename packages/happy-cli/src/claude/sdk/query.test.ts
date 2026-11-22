@@ -53,6 +53,19 @@ describe('query adapter', () => {
         expect(JSON.parse(readFileSync(settingsPath, 'utf8')).autoMemoryEnabled).toBe(true);
     });
 
+    // aplus-dev-studio specs/agent-app-api T5 — built-in plugins load whatever the setting sources say.
+    it('turns the named plugins off in the inline settings, keeping the hook settings and leaving the file alone', () => {
+        const settingsPath = join(configDirectory, 'hooks.json');
+        const hooks = { SessionStart: [{ hooks: [{ type: 'command', command: 'happy-session-hook' }] }] };
+        writeFileSync(settingsPath, JSON.stringify({ hooks, enabledPlugins: { 'kept@market': true } }));
+        query({ prompt: 'this occurrence', options: { settingsPath, disabledPlugins: ['cc-plugin-agents-md@builtin'] } });
+
+        expect(JSON.parse(lastOptions().settings as string)).toMatchObject({
+            hooks, enabledPlugins: { 'kept@market': true, 'cc-plugin-agents-md@builtin': false },
+        });
+        expect(JSON.parse(readFileSync(settingsPath, 'utf8')).enabledPlugins).toEqual({ 'kept@market': true });
+    });
+
     it('pins the assigned organization token on every query, including resume and title calls', () => {
         vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-bundle');
         for (const token of ['fixture-first-generation', 'fixture-next-generation']) {
