@@ -54,9 +54,9 @@ CREATE INDEX "Session_workMachineId_accountId_idx" ON "Session" ("workMachineId"
 CREATE INDEX "SessionOwnershipBinding_machineId_machineAccountId_idx"
     ON "SessionOwnershipBinding" ("machineId", "machineAccountId");
 -- Added NOT VALID so the ALTER does not scan "Session" under its lock; the
--- separate VALIDATE checks existing rows without blocking writes.
+-- next migration validates existing rows in its own transaction, which takes
+-- only a SHARE UPDATE EXCLUSIVE lock and does not block writes.
 ALTER TABLE "Session"
     ADD CONSTRAINT "Session_workMachineId_accountId_fkey"
     FOREIGN KEY ("workMachineId", "accountId") REFERENCES "WorkMachineExecution"("machineId", "accountId")
     ON DELETE RESTRICT ON UPDATE RESTRICT NOT VALID;
-ALTER TABLE "Session" VALIDATE CONSTRAINT "Session_workMachineId_accountId_fkey";
