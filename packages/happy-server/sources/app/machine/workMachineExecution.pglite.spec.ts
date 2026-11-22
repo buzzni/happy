@@ -19,6 +19,7 @@ import { sessionRoutes } from '@/app/api/routes/sessionRoutes';
 import { sessionOwnershipRoutes } from '@/app/api/routes/sessionOwnershipRoutes';
 import { scriptAutomationRoutes } from '@/app/api/routes/scriptAutomationRoutes';
 import { v3SessionRoutes } from '@/app/api/routes/v3SessionRoutes';
+import { automationSocketHandler } from '@/app/api/socket/automationSocketHandler';
 import { workMachineExecutionRoutes } from '@/app/api/routes/workMachineExecutionRoutes';
 import { enableAuthentication, enableSessionScopeAuthentication } from '@/app/api/utils/enableAuthentication';
 import { canonicalDigest } from '@/app/managed/canonicalDigest';
@@ -448,6 +449,60 @@ describe('work machine execution authority', () => {
             else process.env.HANDY_MASTER_SECRET = priorSecret;
         }
     }, 15_000);
+
+    it('leaves scheduled and script automation work pending on a draining or frozen work machine', async () => {
+        const priorSecret = process.env.HANDY_MASTER_SECRET;
+        process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+        vi.stubEnv('SAYCODE_AUTOMATION_ENABLED', 'true');
+        const app = fastify();
+        app.setValidatorCompiler(validatorCompiler);
+        app.setSerializerCompiler(serializerCompiler);
+        const project = await db.project.create({ data: { accountId, name: 'automation-handoff' } });
+        const automation = await db.automation.create({ data: {
+            projectId: project.id, ownerAccountId: accountId, machineAccountId: accountId, machineId, payloadVersion: 3,
+            payloadCiphertext: new Uint8Array(1), viewerKeyId: 'viewer', viewerKeyVersion: 1,
+            viewerKeyEnvelope: new Uint8Array(1), machineKeyVersion: 1, machineKeyEnvelope: new Uint8Array(1),
+        } });
+        await db.scriptArtifact.create({ data: { id: 'handoff-artifact', projectId: project.id, digest: 'digest', encrypted: {} } });
+        await db.scriptAutomationRevision.create({ data: {
+            automationId: automation.id, revision: 1, artifactId: 'handoff-artifact', digest: 'digest',
+            payloadCiphertext: 'encrypted', admission: {}, ready: true,
+        } });
+        const run = await db.scriptInvocation.create({ data: {
+            id: 'handoff-run', automationId: automation.id, revision: 1, generation: 1, trigger: 'manual',
+            requestedBy: accountId, idempotencyKey: 'handoff', bodyHash: 'hash', snapshot: { machineId, machineAccountId: accountId },
+            inputCiphertext: 'encrypted', createdAt: Date.now(),
+        } });
+        const handlers = new Map<string, (data: unknown, callback: (result: unknown) => void) => Promise<void>>();
+        automationSocketHandler(accountId, machineId, { on: (event: string, handler: never) => handlers.set(event, handler) } as never);
+        const socketClaim = () => new Promise(resolve => void handlers.get('automation-claim')!(
+            { automationId: automation.id, generation: 1, scheduledFor: Date.now() }, resolve,
+        ));
+        try {
+            await auth.init();
+            enableAuthentication(app as unknown as Fastify);
+            scriptAutomationRoutes(app as unknown as Fastify, { enabled: () => true, transaction: work => db.$transaction(work) });
+            const bearer = await auth.createToken(accountId);
+            const httpClaim = () => app.inject({
+                method: 'POST', url: `/v1/machines/${machineId}/script-automations/${automation.id}/claim`, payload: {},
+                headers: { authorization: `Bearer ${bearer}` },
+            });
+            for (const data of [{ drainingAt: new Date() }, { frozenAt: new Date() }]) {
+                await db.workMachineExecution.update({ where: { machineId }, data });
+                expect((await httpClaim()).statusCode).toBe(403);
+                expect(await socketClaim()).toEqual({ ok: false, error: 'forbidden' });
+            }
+            expect(await db.scriptInvocation.findUniqueOrThrow({ where: { id: run.id } })).toMatchObject({ status: 'QUEUED', claimHash: null });
+            expect(await db.automationRun.count({ where: { automationId: automation.id } })).toBe(0);
+        } finally {
+            await app.close();
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+            await db.project.delete({ where: { id: project.id } });
+            vi.unstubAllEnvs();
+            if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
+            else process.env.HANDY_MASTER_SECRET = priorSecret;
+        }
+    });
 
     it('drains, freezes, hands off and restores a work machine through idempotent control routes', async () => {
         const priorSecret = process.env.HANDY_MASTER_SECRET;
