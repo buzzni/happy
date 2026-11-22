@@ -69,9 +69,17 @@ describe('PINNED_OWNERSHIP_TRUST', () => {
         expect(pinnedOwnershipTrustProblems(PINNED_OWNERSHIP_TRUST)).toEqual([]);
     });
 
+    it('trusts the production A+ signing key for the default Happy origin', () => {
+        // keyId from the prod web-ui signing key (2026-11-22), equal to happy-server HAPPY_SESSION_OWNERSHIP_PUBLIC_KEYS.
+        expect(ownershipTrustEnv({}, ownershipHappyOrigin('https://saycode.ai/'))).toEqual({ HAPPY_SESSION_OWNERSHIP_ENABLED: '1',
+            HAPPY_SESSION_OWNERSHIP_ISSUER: 'https://saycode.ai', HAPPY_SESSION_OWNERSHIP_AUDIENCE: 'https://saycode.ai',
+            HAPPY_SESSION_OWNERSHIP_PUBLIC_KEYS: JSON.stringify({ aef6ff940e6def127cda4b4b73c0dbb4aa0a9bcf891133d81867a3fdb062ff54: 'wXzuUR8PtlKeCc9eEfImeUxDCwqten_0gYY4WoutYNU' }) });
+        expect(ownershipTrustEnv({ HAPPY_SESSION_OWNERSHIP_ENABLED: '0' }, 'https://saycode.ai')).toEqual({ HAPPY_SESSION_OWNERSHIP_ENABLED: '0' });
+    });
+
     it('ships the same bytes as Desktop config/session-ownership-trust.v1.json', () => {
         // Change both repos together: Desktop tests/sessionOwnershipTrustPins.test.ts pins the same digest.
         const bytes = readFileSync(join(__dirname, 'sessionOwnershipTrust.v1.json'), 'utf8').replace(/\r\n/g, '\n'); // A Windows checkout may use CRLF.
-        expect(createHash('sha256').update(bytes).digest('hex')).toBe('e930e56b0dfbb72b6544c09a73a67b0670896ca0e9622f0d23bccb3c40061492');
+        expect(createHash('sha256').update(bytes).digest('hex')).toBe('ff97a0a8bdb6f858539c276e2888d500091d7f20cf5f9bf02cd66d4e46e705bf');
     });
 });
