@@ -2,6 +2,7 @@
 import { z } from 'zod';
 import { randomUUID } from 'node:crypto';
 import { realpathSync } from 'node:fs';
+import { isDeepStrictEqual } from 'node:util';
 import { rotationIsFresh, verifyOwnership, rotationDecodeBinary, sessionCreateBodyHash, OwnershipCallerBindingSchema } from '@slopus/happy-wire';
 import { ApiClient } from '@/api/api';
 import { decodeBase64, decrypt, encodeBase64 } from '@/api/encryption';
@@ -119,6 +120,40 @@ export function createOwnedStartGuard() {
         },
     };
 }
+const accountIdSchema = z.string().min(1).max(128);
+const registeredMachineSchema = z.object({ machine: z.object({ id: accountIdSchema, accountId: accountIdSchema }) });
+const accountProfileSchema = z.object({ id: accountIdSchema });
+
+/** Verify the runtime home's machine against the same account bearer used for owned creation. */
+export async function readOwnedSpawnPrincipal(
+    happyOrigin: string, registration: OwnedSpawnRuntimeDependencies['registration'], fetcher: typeof fetch = fetch,
+): Promise<{ machineId: string; happyAccountId: string; epoch: string }> {
+    const state = await registration();
+    const credentials = structuredClone(state.credentials);
+    const read = async (path: string): Promise<unknown> => {
+        let response: Response;
+        try {
+            response = await fetcher(happyOrigin + path, {
+                headers: { Authorization: `Bearer ${credentials.token}`, 'Cache-Control': 'no-cache' },
+                redirect: 'error', signal: AbortSignal.timeout(15_000),
+            });
+        } catch { throw new Error('owned-spawn-transport-unavailable'); }
+        if ([401, 403, 404].includes(response.status)) throw new Error('identity-changed');
+        if (!response.ok) throw new Error('owned-spawn-transport-unavailable');
+        return response.json().catch(() => { throw new Error('owned-spawn-transport-unavailable'); });
+    };
+    const [rawMachine, rawProfile] = await Promise.all([
+        read('/v1/machines/' + encodeURIComponent(state.machineId)), read('/v1/account/profile'),
+    ]);
+    const registered = registeredMachineSchema.safeParse(rawMachine), profile = accountProfileSchema.safeParse(rawProfile);
+    if (!registered.success || !profile.success) throw new Error('owned-spawn-transport-unavailable');
+    const machine = registered.data.machine, accountId = profile.data.id;
+    const latest = await registration();
+    if (machine.id !== state.machineId || machine.accountId !== accountId || latest.epoch !== state.epoch
+        || latest.machineId !== state.machineId || !isDeepStrictEqual(latest.credentials, credentials)) throw new Error('identity-changed');
+    return { machineId: state.machineId, happyAccountId: accountId, epoch: state.epoch };
+}
+
 export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): OwnedSpawnRuntime {
     const journal = createOwnedSpawnJournal(deps.home), fetcher = deps.fetch ?? fetch;
     let local: { machineId: string; happyAccountId: string; epoch: string } | null = null;
@@ -159,12 +194,9 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
         return response.json();
     }
     async function scope() {
-        const state = await deps.registration();
-        const account = z.object({ id: z.string().min(1) }).parse(await json('/v1/account/profile'));
-        const latest = await deps.registration();
-        if (latest.epoch !== state.epoch || latest.machineId !== state.machineId) throw new Error('identity-changed');
-        local = { machineId: state.machineId, happyAccountId: account.id, epoch: state.epoch };
-        return { machineId: state.machineId, machineAccountId: account.id, sessionAccountId: account.id };
+        const verified = await readOwnedSpawnPrincipal(deps.happyOrigin, deps.registration, fetcher);
+        local = verified;
+        return { machineId: verified.machineId, machineAccountId: verified.happyAccountId, sessionAccountId: verified.happyAccountId };
     }
     async function verify(raw: unknown) {
         try {
@@ -377,8 +409,9 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
             const configured = deps.env.HAPPY_SESSION_OWNERSHIP_ENABLED === '1' && !!deps.env.HAPPY_SESSION_OWNERSHIP_PUBLIC_KEYS
                 && !!deps.env.HAPPY_SESSION_OWNERSHIP_ISSUER && deps.env.HAPPY_SESSION_OWNERSHIP_AUDIENCE === deps.happyOrigin;
             const supported = spawnOk && configured;
-            // Contacting an owned child is advertised apart from creating one; switch off answers exactly as before.
-            return hostCallers() ? { ownedSpawnPrepareV1: supported, ownedChildOwnerContactV1: supported } : { ownedSpawnPrepareV1: supported };
+            // Capability discovery says which registration check is implemented. Authorization is checked on each operation.
+            return { ownedSpawnPrepareV1: supported, ...(supported ? { ownedSpawnRegistrationV1: true as const } : {}),
+                ...(hostCallers() ? { ownedChildOwnerContactV1: supported } : {}) };
         },
         async launchLineage(sessionId) {
             if (!hostCallers()) return null;
