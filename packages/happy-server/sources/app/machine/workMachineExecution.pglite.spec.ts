@@ -1557,6 +1557,20 @@ describe('work machine execution authority', () => {
         }
     });
 
+    it('refuses a session event that names two different conversations', async () => {
+        const claims = { ...original, sessionId: 'protected-session', purpose: 'session' as const, expiresAt: Date.now() + 60_000 };
+        const act = (payload: object, input: Partial<Parameters<typeof workMachineSocketMayAct>[1]> = {}) => workMachineSocketMayAct(db, {
+            accountId, socketMachineId: undefined, socketSessionId: 'protected-session', claims, event: 'usage-report',
+            payload, now: Date.now(), ...input,
+        });
+        expect(await act({ sessionId: 'protected-session' })).toBe(true);
+        expect(await act({ sid: 'protected-session', sessionId: 'protected-session' })).toBe(true);
+        // The usage handler writes `sessionId`; the check must not read `sid` instead.
+        expect(await act({ sid: 'protected-session', sessionId: 'other-conversation' })).toBe(false);
+        expect(await act({ sid: 'ordinary-conversation', sessionId: 'protected-session' }, { claims: null, socketSessionId: undefined }))
+            .toBe(false);
+    });
+
     it('admits the automation socket events of the current device daemon socket only', async () => {
         const claims = { ...original, purpose: 'daemon' as const, expiresAt: Date.now() + 60_000 };
         const act = (event: string, input: Partial<Parameters<typeof workMachineSocketMayAct>[1]> = {}) => workMachineSocketMayAct(db, {
