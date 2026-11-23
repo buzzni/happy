@@ -3,7 +3,7 @@ import type { FastifyReply, FastifyRequest } from "fastify";
 import { log, debug } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
 import { db } from "@/storage/db";
-import { authorizeWorkMachineSession } from "@/app/machine/workMachineExecution";
+import { authorizeWorkMachineExecution, authorizeWorkMachineSession } from "@/app/machine/workMachineExecution";
 import type { Principal, SessionScopedTokenIssuer } from "@/app/auth/sessionScopedToken";
 import { authorizeManagedSessionRequest } from "@/app/managed/managedSessionAccess";
 import { resolveBrowserSyncRestPrincipal } from "./browserSyncRestAuth";
@@ -306,6 +306,25 @@ export function requireWorkMachineWorkerAuth(app: Fastify) {
         if (!grant) return app.authenticate(request, reply);
         if (grant.machineId !== (request.params as { machineId?: string }).machineId) {
             return reply.code(403).send({ error: 'MACHINE_DENIED' });
+        }
+        request.userId = grant.accountId;
+        request.workMachineDaemonGrant = grant;
+    };
+}
+
+/**
+ * A read Studio makes on a daemon's behalf with the daemon's own bearer
+ * (session owner, automation run context). A work machine daemon credential
+ * must name the machine the request is about and be its current device and
+ * generation; drain still allows these reads, a frozen machine does not.
+ * Any other bearer goes through `authenticate` as before.
+ */
+export function requireWorkMachineDaemonReadAuth(app: Fastify, requestedMachine: (request: FastifyRequest) => string | undefined) {
+    return async (request: FastifyRequest, reply: FastifyReply) => {
+        const grant = await verifyWorkMachineDaemonBearer(request);
+        if (!grant) return app.authenticate(request, reply);
+        if (grant.machineId !== requestedMachine(request) || !await authorizeWorkMachineExecution(db, grant)) {
+            return reply.code(403).send({ error: 'Work machine device authorization required' });
         }
         request.userId = grant.accountId;
         request.workMachineDaemonGrant = grant;
