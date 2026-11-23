@@ -1233,6 +1233,137 @@ describe('work machine execution authority', () => {
         }
     });
 
+    it('enrolls a PC whose existing unbound conversations Studio attributes to it and names what it refuses', async () => {
+        const priorSecret = process.env.HANDY_MASTER_SECRET;
+        process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+        const app = fastify();
+        app.setValidatorCompiler(validatorCompiler);
+        app.setSerializerCompiler(serializerCompiler);
+        const control = generateKeyPairSync('ed25519');
+        const kid = 'attribution-key';
+        const audience = 'attribution-happy';
+        const verifier = createControlAssertionVerifier({
+            audience,
+            verifierKeys: JSON.stringify({ [kid]: control.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url') }),
+        });
+        const owner = 'attribution-owner';
+        const pc = 'attribution-pc';
+        const otherAccount = 'attribution-stranger';
+        try {
+            await auth.init();
+            enableAuthentication(app as unknown as Fastify);
+            workMachineExecutionRoutes(app as unknown as Fastify, () => verifier);
+            await db.account.createMany({ data: [{ id: owner, publicKey: owner }, { id: otherAccount, publicKey: otherAccount }] });
+            await db.machine.create({ data: { id: pc, accountId: owner, metadata: 'encrypted', dataEncryptionKey: new Uint8Array(105) } });
+            const conversation = (id: string, accountId = owner) => db.session.create({
+                data: { id, tag: id, accountId, metadata: 'encrypted', dataEncryptionKey: new Uint8Array(105), active: false },
+            });
+            await conversation('unbound-a');
+            await conversation('unbound-b');
+            const bearer = await auth.createToken(owner);
+            const accountTokenDigest = createHash('sha256').update(bearer).digest('hex');
+            const signingKey = generateKeyPairSync('ed25519');
+            const publicDer = signingKey.publicKey.export({ format: 'der', type: 'spki' });
+            const deviceId = createHash('sha256').update(publicDer).digest('base64url');
+            const enroll = (sessionIds: string[], studioAttributedSessionIds: string[], signedAttribution = studioAttributedSessionIds) => {
+                const now = Date.now();
+                const proof = {
+                    publicKey: publicDer.toString('base64url'), issuedAt: now,
+                    signature: sign(null, Buffer.from(JSON.stringify([
+                        'happy-work-machine-enrollment-v2', pc, deviceId, now, [...sessionIds].sort(),
+                    ])), signingKey.privateKey).toString('base64url'),
+                };
+                const payload = { deviceId, ownerUserId: 'studio-user', sessionIds, studioAttributedSessionIds, proof };
+                const bytes = Buffer.from(JSON.stringify({
+                    kid, aud: audience, purpose: 'happy-managed-control', op: 'work-machine-enroll',
+                    bodyDigest: canonicalDigest({
+                        accountTokenDigest, machineId: pc, ...payload, studioAttributedSessionIds: signedAttribution,
+                    }),
+                    iat: now, exp: now + 5000,
+                }));
+                return app.inject({
+                    method: 'POST', url: `/v1/work-machines/${pc}/execution-enrollment`, payload,
+                    headers: {
+                        authorization: `Bearer ${bearer}`,
+                        'x-happy-control-assertion': `${bytes.toString('base64url')}.${sign(null, bytes, control.privateKey).toString('base64url')}`,
+                    },
+                });
+            };
+            const refusal = async (response: Promise<{ statusCode: number; json(): unknown }>) => {
+                const reply = await response;
+                return { status: reply.statusCode, body: reply.json() };
+            };
+
+            // Only Studio's assertion vouches for a conversation without an ownership binding.
+            expect(await refusal(enroll(['unbound-a', 'unbound-b'], ['unbound-a']))).toEqual({
+                status: 409, body: { error: 'Work machine enrollment not ready', reason: 'unattributed-sessions', sessionIds: ['unbound-b'] },
+            });
+            // The attribution is part of the signed body: a caller cannot widen it.
+            expect((await enroll(['unbound-a', 'unbound-b'], ['unbound-a', 'unbound-b'], ['unbound-a'])).statusCode).toBe(403);
+
+            await db.session.update({ where: { id: 'unbound-b' }, data: { active: true } });
+            expect(await refusal(enroll(['unbound-a', 'unbound-b'], ['unbound-a', 'unbound-b']))).toMatchObject({
+                status: 409, body: { reason: 'active-session', sessionIds: ['unbound-b'] },
+            });
+            await db.session.update({ where: { id: 'unbound-b' }, data: { active: false } });
+
+            await conversation('stranger-session', otherAccount);
+            expect(await refusal(enroll(['unbound-a', 'stranger-session'], ['unbound-a', 'stranger-session']))).toMatchObject({
+                status: 409, body: { reason: 'unknown-sessions', sessionIds: ['stranger-session'] },
+            });
+
+            // A conversation bound to another machine keeps the binding checks even when attributed.
+            await conversation('bound-elsewhere');
+            await db.sessionOwnershipBinding.create({ data: {
+                sessionId: 'bound-elsewhere', sessionRowId: 'bound-elsewhere', bindingId: 'attribution-elsewhere',
+                subjectIssuer: 'studio', ownerUserId: 'studio-user', sessionAccountId: owner,
+                machineId: 'ordinary-machine', machineAccountId: owner, intentId: 'attribution-intent',
+                operationId: 'attribution-op', nonce: 'attribution-nonce', createDigest: 'creation',
+                proofDigest: 'proof', issuedAt: new Date(), confirmedAt: new Date(),
+            } });
+            expect(await refusal(enroll(['unbound-a', 'bound-elsewhere'], ['unbound-a', 'bound-elsewhere']))).toMatchObject({
+                status: 409, body: { reason: 'session-bound-elsewhere', sessionIds: ['bound-elsewhere'] },
+            });
+
+            await conversation('bound-other-owner');
+            await db.sessionOwnershipBinding.create({ data: {
+                sessionId: 'bound-other-owner', sessionRowId: 'bound-other-owner', bindingId: 'attribution-other-owner',
+                subjectIssuer: 'studio', ownerUserId: 'another-studio-user', sessionAccountId: owner,
+                machineId: pc, machineAccountId: owner, intentId: 'attribution-intent-2',
+                operationId: 'attribution-op-2', nonce: 'attribution-nonce-2', createDigest: 'creation',
+                proofDigest: 'proof', issuedAt: new Date(), confirmedAt: new Date(),
+            } });
+            expect(await refusal(enroll(['unbound-a', 'bound-other-owner'], ['unbound-a', 'bound-other-owner']))).toMatchObject({
+                status: 409, body: { reason: 'owner-mismatch', sessionIds: ['bound-other-owner'] },
+            });
+            await db.sessionOwnershipBinding.delete({ where: { sessionId: 'bound-other-owner' } });
+
+            await db.machine.create({ data: { id: 'attribution-held-pc', accountId: owner, metadata: 'encrypted' } });
+            await db.workMachineExecution.create({ data: { machineId: 'attribution-held-pc', accountId: owner, deviceId: 'held', generation: 1 } });
+            await db.session.update({ where: { id: 'unbound-b' }, data: { workMachineId: 'attribution-held-pc' } });
+            expect(await refusal(enroll(['unbound-a', 'unbound-b'], ['unbound-a', 'unbound-b']))).toMatchObject({
+                status: 409, body: { reason: 'session-attached', sessionIds: ['unbound-b'] },
+            });
+            await db.session.update({ where: { id: 'unbound-b' }, data: { workMachineId: null } });
+            expect(await db.workMachineExecution.findUnique({ where: { machineId: pc } })).toBeNull();
+
+            const enrolled = await enroll(['unbound-a', 'unbound-b'], ['unbound-a', 'unbound-b']);
+            expect(enrolled.statusCode).toBe(200);
+            expect(enrolled.json()).toMatchObject({ machineId: pc, accountId: owner, deviceId, generation: 1 });
+            expect(await db.session.findMany({ where: { id: { in: ['unbound-a', 'unbound-b'] } }, select: { workMachineId: true } }))
+                .toEqual([{ workMachineId: pc }, { workMachineId: pc }]);
+            // A lost acknowledgement is answered again with the same grant.
+            expect((await enroll(['unbound-a', 'unbound-b'], ['unbound-a', 'unbound-b'])).statusCode).toBe(200);
+            await db.workMachineExecution.update({ where: { machineId: pc }, data: { frozenAt: new Date() } });
+            expect(await refusal(enroll(['unbound-a', 'unbound-b'], ['unbound-a', 'unbound-b'])))
+                .toMatchObject({ status: 409, body: { reason: 'generation-conflict' } });
+        } finally {
+            await app.close();
+            if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
+            else process.env.HANDY_MASTER_SECRET = priorSecret;
+        }
+    });
+
     it('creates a new conversation attached to the work machine only with the current device daemon credential', async () => {
         const priorSecret = process.env.HANDY_MASTER_SECRET;
         process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';

@@ -17,11 +17,40 @@ export interface WorkMachineDeviceGrant {
 class WorkMachineEnrollmentConflict extends Error {}
 class DuplicateWorkMachineMcpCall extends Error {}
 
+export type WorkMachineEnrollmentRefusalReason =
+    | 'machine-not-ready' | 'invalid-inventory' | 'session-execution-bound' | 'uninventoried-sessions'
+    | 'session-bound-elsewhere' | 'unconfirmed-binding' | 'owner-mismatch' | 'account-mismatch'
+    | 'unattributed-sessions' | 'unknown-sessions' | 'generation-conflict' | 'inventory-mismatch'
+    | 'active-session' | 'session-attached' | 'session-key-missing' | 'session-protected' | 'concurrent-change';
+
+export interface WorkMachineEnrollmentRefusal {
+    reason: WorkMachineEnrollmentRefusalReason;
+    sessionIds?: string[];
+}
+
+/** How many refused conversations a refusal names. */
+const maxRefusedSessionIds = 100;
+
+function refuse(reason: WorkMachineEnrollmentRefusalReason, sessionIds?: string[]): WorkMachineEnrollmentRefusal {
+    return sessionIds ? { reason, sessionIds: [...sessionIds].sort().slice(0, maxRefusedSessionIds) } : { reason };
+}
+
+/**
+ * Makes the CLI-signed session inventory the work machine's conversations.
+ * A conversation with an ownership binding must be confirmed for this machine
+ * and owner. One without a binding (ownership tracking off when it was
+ * created) is accepted only if Studio attributes it to this machine and owner
+ * in its signed request (`studioAttributedSessionIds`) and it belongs to the
+ * machine account.
+ */
 export async function enrollWorkMachineExecution(
     db: Pick<PrismaClient, '$transaction'>,
-    input: Omit<WorkMachineDeviceGrant, 'generation'> & { ownerUserId: string; sessionIds: string[] },
-): Promise<WorkMachineDeviceGrant | null> {
+    input: Omit<WorkMachineDeviceGrant, 'generation'> & {
+        ownerUserId: string; sessionIds: string[]; studioAttributedSessionIds?: string[];
+    },
+): Promise<WorkMachineDeviceGrant | WorkMachineEnrollmentRefusal> {
     const { accountId, machineId, deviceId, ownerUserId, sessionIds } = input;
+    const attributed = new Set(input.studioAttributedSessionIds ?? []);
     try {
         return await db.$transaction(async tx => {
             const [machine] = await tx.$queryRaw<{ id: string }[]>`
@@ -29,40 +58,67 @@ export async function enrollWorkMachineExecution(
                 WHERE "id" = ${machineId} AND "accountId" = ${accountId} AND "dataEncryptionKey" IS NOT NULL
                 FOR UPDATE
             `;
-            if (!machine) return null;
-            if (await tx.sessionExecutionBinding.findFirst({
+            if (!machine) return refuse('machine-not-ready');
+            const inventory = new Set(sessionIds);
+            if (inventory.size !== sessionIds.length) return refuse('invalid-inventory');
+            const launched = await tx.sessionExecutionBinding.findMany({
                 where: { machineId, machineOwnerAccountId: accountId, sessionRowId: { not: null } },
-                select: { sessionId: true },
-            })) return null;
+                take: maxRefusedSessionIds, select: { sessionId: true },
+            });
+            if (launched.length) return refuse('session-execution-bound', launched.map(row => row.sessionId));
+            const uninventoried = await tx.sessionOwnershipBinding.findMany({
+                where: { machineId, machineAccountId: accountId, sessionRowId: { not: null }, sessionId: { notIn: sessionIds } },
+                take: maxRefusedSessionIds, select: { sessionId: true },
+            });
+            if (uninventoried.length) return refuse('uninventoried-sessions', uninventoried.map(row => row.sessionId));
+            const bindings = await tx.sessionOwnershipBinding.findMany({
+                where: { sessionId: { in: sessionIds } },
+                select: {
+                    sessionId: true, machineId: true, machineAccountId: true, ownerUserId: true,
+                    sessionAccountId: true, confirmedAt: true,
+                },
+            });
+            const bound = new Set(bindings.map(binding => binding.sessionId));
+            const failing = (reason: WorkMachineEnrollmentRefusalReason, ids: string[]) =>
+                ids.length ? refuse(reason, ids) : null;
+            const bindingRefusal = failing('session-bound-elsewhere', bindings
+                .filter(binding => binding.machineId !== machineId || binding.machineAccountId !== accountId)
+                .map(binding => binding.sessionId))
+                ?? failing('unconfirmed-binding', bindings.filter(binding => !binding.confirmedAt).map(binding => binding.sessionId))
+                ?? failing('owner-mismatch', bindings.filter(binding => binding.ownerUserId !== ownerUserId).map(binding => binding.sessionId))
+                ?? failing('account-mismatch', bindings.filter(binding => binding.sessionAccountId !== accountId).map(binding => binding.sessionId))
+                ?? failing('unattributed-sessions', sessionIds.filter(id => !bound.has(id) && !attributed.has(id)));
+            if (bindingRefusal) return bindingRefusal;
+
+            const sessions = await tx.session.findMany({
+                where: { id: { in: sessionIds }, accountId },
+                select: {
+                    id: true, active: true, dataEncryptionKey: true, workMachineId: true, piiProtection: true,
+                    executionBinding: { select: { sessionId: true } },
+                },
+            });
+            const found = new Set(sessions.map(session => session.id));
+            const unknown = sessionIds.filter(id => !found.has(id));
+            if (unknown.length) return refuse('unknown-sessions', unknown);
+
+            const grant = { accountId, machineId, deviceId, generation: 1 };
             const active = await tx.workMachineExecution.findUnique({
                 where: { machineId },
                 select: { generation: true, deviceId: true, frozenAt: true },
             });
-            const bindings = await tx.sessionOwnershipBinding.findMany({
-                where: { machineId, machineAccountId: accountId, sessionRowId: { not: null } },
-                take: sessionIds.length + 1,
-                select: {
-                    ownerUserId: true, sessionAccountId: true, confirmedAt: true,
-                    session: { select: {
-                        id: true, accountId: true, active: true, dataEncryptionKey: true, workMachineId: true, piiProtection: true,
-                        executionBinding: { select: { sessionId: true } },
-                    } },
-                },
-            });
-            const inventory = new Set(sessionIds);
-            if (inventory.size !== sessionIds.length || inventory.size !== bindings.length
-                || bindings.some(binding => binding.ownerUserId !== ownerUserId || binding.sessionAccountId !== accountId
-                    || !binding.confirmedAt || !binding.session || binding.session.accountId !== accountId
-                    || !inventory.has(binding.session.id))) return null;
-            const sessions = bindings.map(binding => binding.session!);
-            const grant = { accountId, machineId, deviceId, generation: 1 };
             if (active) {
-                return active.generation === grant.generation && active.deviceId === deviceId && !active.frozenAt
-                    && sessions.every(session => session.workMachineId === machineId) ? grant : null;
+                if (active.generation !== grant.generation || active.deviceId !== deviceId || active.frozenAt) {
+                    return refuse('generation-conflict');
+                }
+                return failing('inventory-mismatch', sessions
+                    .filter(session => session.workMachineId !== machineId).map(session => session.id)) ?? grant;
             }
-            if (sessions.some(session =>
-                session.active || !session.dataEncryptionKey || session.workMachineId || session.piiProtection || session.executionBinding,
-            )) return null;
+            const sessionRefusal = failing('active-session', sessions.filter(session => session.active).map(session => session.id))
+                ?? failing('session-attached', sessions.filter(session => session.workMachineId).map(session => session.id))
+                ?? failing('session-key-missing', sessions.filter(session => !session.dataEncryptionKey).map(session => session.id))
+                ?? failing('session-protected', sessions.filter(session => session.piiProtection).map(session => session.id))
+                ?? failing('session-execution-bound', sessions.filter(session => session.executionBinding).map(session => session.id));
+            if (sessionRefusal) return sessionRefusal;
             // Serializable legacy worker transactions may have started before
             // the row lock was acquired. Change its row version so they retry
             // instead of observing the old absence of the authority.
@@ -78,7 +134,7 @@ export async function enrollWorkMachineExecution(
             return grant;
         });
     } catch (error) {
-        if (error instanceof WorkMachineEnrollmentConflict) return null;
+        if (error instanceof WorkMachineEnrollmentConflict) return refuse('concurrent-change');
         throw error;
     }
 }
