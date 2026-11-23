@@ -64,6 +64,7 @@ import {
   type SpawnSessionResult,
 } from '@/modules/common/registerCommonHandlers';
 import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
+import { FIXED_READ_RPCS_CAPABILITY } from './fixedReadRpcsCapability';
 import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher';
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
@@ -494,6 +495,7 @@ export const initialMachineMetadata: MachineMetadata = {
   structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
   writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
   listFilesPage: LIST_FILES_PAGE_CAPABILITY,
+  fixedReadRpcs: FIXED_READ_RPCS_CAPABILITY,
   permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
   machineRun: {
     protocolVersion: 1,

@@ -67,6 +67,11 @@ import { machineServerLane } from './rpc/serverLane';
 import { machineDelegationLane } from './rpc/delegationLane';
 import { AGENT_DELEGATION_CAPABILITY, delegationLaneAdmission, registerAgentDelegationRpc, type AgentDelegationHost } from '@/daemon/agentDelegationMethods';
 import { createMachineMetadataHandlers, probeLocalHttp, runFileWithoutShell } from '@/daemon/machineMetadataMethods';
+import { createWorkspaceCurrentPrHandler, createWorkspaceGitStatusHandler, WORKSPACE_CURRENT_PR_METHOD, WORKSPACE_GIT_STATUS_METHOD } from '@/daemon/workspaceGitStatus';
+import { createMachineAiUsageHandler, MACHINE_AI_USAGE_METHOD } from '@/daemon/machineAiUsage';
+import { AGENT_LOGIN_STATUS_METHOD, CODEX_CLI_STATUS_METHOD, createAgentLoginStatusHandler, createCodexCliStatusHandler } from '@/daemon/agentCliProbes';
+import { FIXED_READ_RPCS_CAPABILITY } from '@/daemon/fixedReadRpcsCapability';
+import { isStrictlyGuardedPath } from '@/modules/common/happyHomeGuard';
 import { createRpcRequestListener } from './rpc/rpcRequestListener';
 import { detectCLIAvailability, CLIAvailability } from '@/utils/detectCLI';
 import { detectResumeSupport, type ResumeSupport } from '@/resume/localHappyAgentAuth';
@@ -1186,6 +1191,29 @@ export class ApiMachineClient {
         for (const [method, handler] of Object.entries(metadataHandlers)) {
             this.rpcHandlerManager.registerHandler(method, handler);
         }
+        // Fixed reads in place of Studio's automatic `bash` status reads, so a work machine can count
+        // them as reads (aplus-dev-studio specs/work-machine-migration). Customer lane:
+        // git status names files.
+        const approvedRoots = this.approvedRoots;
+        const workspaceGitDeps = {
+            allowedRoot,
+            approvedRoots: () => approvedRoots?.() ?? [],
+            isGuardedPath: isStrictlyGuardedPath,
+            runFile: runFileWithoutShell,
+            now: Date.now,
+        };
+        this.rpcHandlerManager.registerHandler(WORKSPACE_GIT_STATUS_METHOD, createWorkspaceGitStatusHandler(workspaceGitDeps));
+        this.rpcHandlerManager.registerHandler(WORKSPACE_CURRENT_PR_METHOD, createWorkspaceCurrentPrHandler(workspaceGitDeps));
+        this.rpcHandlerManager.registerHandler(MACHINE_AI_USAGE_METHOD, createMachineAiUsageHandler({
+            runFile: runFileWithoutShell,
+            nodePath: process.execPath,
+            platform: process.platform,
+        }));
+        this.rpcHandlerManager.registerHandler(AGENT_LOGIN_STATUS_METHOD, createAgentLoginStatusHandler({
+            runFile: runFileWithoutShell,
+            nodePath: process.execPath,
+        }));
+        this.rpcHandlerManager.registerHandler(CODEX_CLI_STATUS_METHOD, createCodexCliStatusHandler({ runFile: runFileWithoutShell }));
         this.rpcHandlerManager.registerHandler(
             'claude-session-transfer',
             createClaudeSessionTransferHandler({ allowedRoot, approvedRoots: this.approvedRoots }),
@@ -4785,6 +4813,10 @@ export class ApiMachineClient {
             const advertisedListFilesPage = this.managedHandlers ? undefined : LIST_FILES_PAGE_CAPABILITY;
             const listFilesPageStale = JSON.stringify(this.machine.metadata?.listFilesPage)
                 !== JSON.stringify(advertisedListFilesPage);
+            // Neither a managed runtime nor the Windows trial admits these two methods.
+            const advertisedFixedReadRpcs = this.managedHandlers || this.windowsStandaloneTrial ? undefined : FIXED_READ_RPCS_CAPABILITY;
+            const fixedReadRpcsStale = JSON.stringify(this.machine.metadata?.fixedReadRpcs)
+                !== JSON.stringify(advertisedFixedReadRpcs);
             // Availability hint only: every live session owns its permission handler and must
             // publish its own runtimeCapabilities.permissionGrants, including on a managed runtime.
             // Detached older sessions do not gain that session marker when this daemon upgrades.
@@ -4852,7 +4884,7 @@ export class ApiMachineClient {
             // Bounded: an acknowledgement that never comes must not block every later change.
             const awaitingServer = this.capabilityUpdateInFlight !== null
                 && Date.now() - this.capabilityUpdateInFlight.startedAt < CAPABILITY_UPDATE_WAIT_MS;
-            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || spawnSessionKeyStale || appProfileStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || viewerChannelStale || agentDelegationStale || writeFileAttemptStale || listFilesPageStale || permissionGrantsStale)) {
+            if (!awaitingServer && (cliAvailabilityChanged || resumeSupportChanged || cliVersionChanged || automationSupportChanged || autonomousQualityGateSupportChanged || automationServerKeyChanged || daemonSessionStateChanged || channelSupportStale || aiAuthSelectionStale || agentPlanStale || spawnSessionKeyStale || appProfileStale || structuredOutputStale || channelHostStale || rpcBindingStale || sealedSpawnEnvStale || worktreeOpsStale || projectPurgeStale || workspaceSyncStale || companyKeyReseedStale || terminalBindingStale || viewerChannelStale || agentDelegationStale || writeFileAttemptStale || listFilesPageStale || fixedReadRpcsStale || permissionGrantsStale)) {
                 this.lastKnownCLIAvailability = newAvailability;
                 this.lastKnownResumeSupport = newResumeSupport;
                 this.lastKnownCliVersion = newCliVersion;
@@ -4893,6 +4925,7 @@ export class ApiMachineClient {
                     structuredOutput: advertisedStructuredOutput,
                     writeFileAttempt: advertisedWriteFileAttempt,
                     listFilesPage: advertisedListFilesPage,
+                    fixedReadRpcs: advertisedFixedReadRpcs,
                     permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
                     channelHost: advertisedChannelHost,
                     rpcBinding: advertisedRpcBinding,
