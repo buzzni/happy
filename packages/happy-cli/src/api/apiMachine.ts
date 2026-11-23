@@ -69,6 +69,7 @@ import { AGENT_DELEGATION_CAPABILITY, delegationLaneAdmission, registerAgentDele
 import { createMachineMetadataHandlers, probeLocalHttp, runFileWithoutShell } from '@/daemon/machineMetadataMethods';
 import { createWorkspaceGitStatusHandler, WORKSPACE_GIT_STATUS_METHOD } from '@/daemon/workspaceGitStatus';
 import { createMachineAiUsageHandler, MACHINE_AI_USAGE_METHOD } from '@/daemon/machineAiUsage';
+import { AGENT_LOGIN_STATUS_METHOD, CODEX_CLI_STATUS_METHOD, createAgentLoginStatusHandler, createCodexCliStatusHandler } from '@/daemon/agentCliProbes';
 import { FIXED_READ_RPCS_CAPABILITY } from '@/daemon/fixedReadRpcsCapability';
 import { isStrictlyGuardedPath } from '@/modules/common/happyHomeGuard';
 import { createRpcRequestListener } from './rpc/rpcRequestListener';
@@ -1190,7 +1191,7 @@ export class ApiMachineClient {
         for (const [method, handler] of Object.entries(metadataHandlers)) {
             this.rpcHandlerManager.registerHandler(method, handler);
         }
-        // Fixed reads in place of Studio's `bash` status reads, so a work machine can count
+        // Fixed reads in place of Studio's automatic `bash` status reads, so a work machine can count
         // them as reads (aplus-dev-studio specs/work-machine-migration). Customer lane:
         // git status names files.
         const approvedRoots = this.approvedRoots;
@@ -1206,6 +1207,11 @@ export class ApiMachineClient {
             nodePath: process.execPath,
             platform: process.platform,
         }));
+        this.rpcHandlerManager.registerHandler(AGENT_LOGIN_STATUS_METHOD, createAgentLoginStatusHandler({
+            runFile: runFileWithoutShell,
+            nodePath: process.execPath,
+        }));
+        this.rpcHandlerManager.registerHandler(CODEX_CLI_STATUS_METHOD, createCodexCliStatusHandler({ runFile: runFileWithoutShell }));
         this.rpcHandlerManager.registerHandler(
             'claude-session-transfer',
             createClaudeSessionTransferHandler({ allowedRoot, approvedRoots: this.approvedRoots }),
