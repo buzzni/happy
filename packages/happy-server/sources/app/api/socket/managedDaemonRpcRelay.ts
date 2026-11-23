@@ -70,18 +70,24 @@ export type DaemonRpcRelayDeps = {
 
 /**
  * What an RPC to a work machine does to its execution. Reads and stopping a
- * turn run nothing new: drain allows them and they record no first execution.
- * A permission answer belongs to a turn already running, so drain allows it,
- * but an approval lets a tool run, so it records the first execution. Every
- * other method is new work, refused while draining.
+ * turn or a conversation run nothing new: drain allows them and they record no
+ * first execution. Bringing a conversation back up is refused while draining,
+ * like new work, but runs no turn either: its process asks for its own permit
+ * before a turn starts. A permission answer belongs to a turn already running,
+ * so drain allows it, but an approval lets a tool run, so it records the first
+ * execution. Every other method is new work, refused while draining.
  */
-const workMachineRpcTiers = new Map<string, 'read' | 'turn-stop' | 'turn-answer'>([
+const workMachineRpcTiers = new Map<string, 'read' | 'turn-stop' | 'turn-answer' | 'start'>([
     ['readFile', 'read'], ['readFileChunk', 'read'], ['listDirectory', 'read'], ['listFilesPage', 'read'],
+    ['listWorkspaceDirectory', 'read'], ['readWorkspaceFile', 'read'], ['readWorkspaceFileChunk', 'read'],
+    ['listWorkspaceDownloadDirectory', 'read'], ['closeWorkspaceDownloadDirectory', 'read'],
     // Status the web client polls; a poll after a switch must not close the way back.
     ['daemon-session-state', 'read'], ['mcp-status', 'read'], ['getDirectoryTree', 'read'], ['ripgrep', 'read'],
     ['get-port', 'read'], ['claude-list-rewind-points', 'read'], ['codex-list-rewind-points', 'read'],
     ['checkpoint:list', 'read'], ['checkpoint:status', 'read'], ['checkpoint:diff', 'read'],
-    ['abort', 'turn-stop'],
+    // The idle reaper and the user's stop end a conversation's process.
+    ['abort', 'turn-stop'], ['stop-session', 'turn-stop'], ['killSession', 'turn-stop'],
+    ['resume-happy-session', 'start'],
     ['permission', 'turn-answer'],
 ]);
 
@@ -129,7 +135,7 @@ export async function executeDaemonRpcLocally(input: {
             allowed = scopeId === expectedScopeId && now() < execution.expiresAt
                 && await (tier === 'new-work' ? permitWorkMachineExecution(db, execution, new Date(now()))
                     : tier === 'turn-answer' ? permitWorkMachineExecution(db, execution, new Date(now()), true)
-                    : lockWorkMachineExecution(db, execution));
+                    : lockWorkMachineExecution(db, execution, { newWork: tier === 'start' }));
         } catch {
             allowed = false;
         }

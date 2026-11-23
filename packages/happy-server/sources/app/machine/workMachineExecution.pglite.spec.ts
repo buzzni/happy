@@ -183,6 +183,51 @@ describe('work machine execution authority', () => {
         }
     });
 
+    // dev E2E 2nd round, defect 5: what reaches a freshly started daemon and its conversations before
+    // anyone sends a message must not close the way back, yet still stops at drain and freeze.
+    it('lets housekeeping RPCs reach a freshly started daemon and its conversations without recording first execution', async () => {
+        const now = Date.now();
+        const emitted: string[] = [];
+        const emit = { timeout: () => ({ emitWithAck: async (_event: string, request: { method: string }) => { emitted.push(request.method); return {}; } }) };
+        const daemon = { data: { workMachineExecution: { ...original, purpose: 'daemon', expiresAt: now + 60_000 } }, ...emit };
+        const conversation = { data: { workMachineExecution: { ...original, sessionId: 'protected-session', purpose: 'session', expiresAt: now + 60_000 } }, ...emit };
+        const invoke = async (scope: string, method: string) => (await executeDaemonRpcLocally({
+            io: { sockets: { sockets: new Map<string, unknown>([['daemon', daemon], ['conversation', conversation]]) } } as never,
+            request: { requestId: crypto.randomUUID(), targetSocketId: scope === machineId ? 'daemon' : 'conversation',
+                method: `${scope}:${method}`, params: {}, timeoutMs: 1000 },
+            onResult: () => {}, deps: { allowed: (async () => true) as never, now: () => now },
+        })).refused;
+        const firstExecution = async () => (await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt;
+        const workspaceReads = ['listWorkspaceDirectory', 'readWorkspaceFile', 'readWorkspaceFileChunk',
+            'listWorkspaceDownloadDirectory', 'closeWorkspaceDownloadDirectory'];
+
+        // Opening a conversation again, an idle stop and workspace reads run no turn.
+        for (const method of ['resume-happy-session', 'stop-session', ...workspaceReads]) {
+            expect(await invoke(machineId, method), method).toBe(false);
+        }
+        expect(await invoke('protected-session', 'killSession')).toBe(false);
+        expect(await firstExecution()).toBeNull();
+        // A shell command may change anything; the server cannot tell a status poll from any other one.
+        expect(await invoke(machineId, 'bash')).toBe(false);
+        expect(await firstExecution()).not.toBeNull();
+
+        await db.workMachineExecution.update({ where: { machineId }, data: { firstExecutionAt: null, drainingAt: new Date() } });
+        try {
+            // Draining stops new work, including bringing a conversation back up; stopping and reading go on.
+            expect(await invoke(machineId, 'resume-happy-session')).toBe(true);
+            for (const method of ['stop-session', ...workspaceReads]) expect(await invoke(machineId, method), method).toBe(false);
+            expect(await invoke('protected-session', 'killSession')).toBe(false);
+            expect(await firstExecution()).toBeNull();
+            await freezeWorkMachineExecution(db, original);
+            for (const method of ['resume-happy-session', 'stop-session', 'listWorkspaceDirectory']) {
+                expect(await invoke(machineId, method), method).toBe(true);
+            }
+            expect(await invoke('protected-session', 'killSession')).toBe(true);
+        } finally {
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+        }
+    });
+
     it('lets a draining conversation answer and abort its turn but refuses new turn work', async () => {
         const now = Date.now();
         const emitted: string[] = [];
