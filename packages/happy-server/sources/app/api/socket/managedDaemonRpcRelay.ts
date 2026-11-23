@@ -85,8 +85,9 @@ const workMachineRpcTiers = new Map<string, 'read' | 'turn-stop' | 'turn-answer'
     // the web client reads through `bash` stays new work: the server cannot see which command it carries.
     ['workspace-path-stat', 'read'], ['workspace-git-info', 'read'], ['preview-liveness', 'read'],
     ['listening-ports', 'read'], ['container-runtime-status', 'read'], ['gh-auth-status', 'read'], ['machine-info', 'read'],
-    // Studio's git status and AI usage, read by a fixed git invocation and a fixed script instead of `bash`.
-    ['workspace-git-status', 'read'], ['machine-ai-usage', 'read'],
+    // What Studio reads on page open and by timer, with fixed git calls and fixed scripts instead of `bash`:
+    // git status, AI usage, agent CLI login and Codex models.
+    ['workspace-git-status', 'read'], ['machine-ai-usage', 'read'], ['agent-login-status', 'read'], ['codex-cli-status', 'read'],
     // Status the web client polls; a poll after a switch must not close the way back.
     ['daemon-session-state', 'read'], ['mcp-status', 'read'], ['getDirectoryTree', 'read'], ['ripgrep', 'read'],
     ['get-port', 'read'], ['claude-list-rewind-points', 'read'], ['codex-list-rewind-points', 'read'],

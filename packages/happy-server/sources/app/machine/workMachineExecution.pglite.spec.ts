@@ -203,8 +203,9 @@ describe('work machine execution authority', () => {
             // The fixed-shape status answers of the daemon's metadata methods (happy-cli machineMetadataMethods.ts).
             'workspace-path-stat', 'workspace-git-info', 'preview-liveness', 'listening-ports',
             'container-runtime-status', 'gh-auth-status', 'machine-info',
-            // Fixed reads Studio uses instead of `bash` for git status and AI usage (happy-cli workspaceGitStatus.ts, machineAiUsage.ts).
-            'workspace-git-status', 'machine-ai-usage'];
+            // Fixed reads Studio uses instead of `bash` for git status, AI usage and agent CLI status
+            // (happy-cli workspaceGitStatus.ts, machineAiUsage.ts, agentCliProbes.ts).
+            'workspace-git-status', 'machine-ai-usage', 'agent-login-status', 'codex-cli-status'];
 
         // Opening a conversation again, an idle stop and workspace reads run no turn.
         for (const method of ['resume-happy-session', 'stop-session', ...workspaceReads]) {
