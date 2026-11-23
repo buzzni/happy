@@ -188,7 +188,12 @@ async function collectTree(root: string, scanAll: boolean, entries: string[]): P
 
 async function readSessionRecords(happyHome: string): Promise<Record<string, unknown>> {
     const file = await open(join(happyHome, 'sessions.json'), constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-        .catch(() => { throw new Error('The session recovery records are unreadable'); });
+        .catch((error: NodeJS.ErrnoException) => {
+            // A home that never ran a conversation has no file yet; prepare reads that as no sessions too.
+            if (error.code === 'ENOENT') return null;
+            throw new Error('The session recovery records are unreadable');
+        });
+    if (!file) return {};
     try {
         const info = await file.stat();
         if (!info.isFile() || info.nlink !== 1 || (info.mode & 0o077) !== 0) throw new Error('The session recovery records are not a private file');

@@ -220,6 +220,15 @@ describe('work machine transfer archive selection', () => {
         await expect(select(fixture)).rejects.toThrow(join(fixture.project, 'chained'));
     });
 
+    it('treats a home that never recorded a session as having none, like prepare does', async () => {
+        const fixture = await machineFixture(root);
+        await rm(join(fixture.home, 'sessions.json'));
+        const selection = await select(fixture, { sessionIds: [], requireStopRecords: false });
+        expect(selection.sessions).toEqual([]);
+        expect(selection.roots).toEqual([fixture.project]);
+        await expect(select(fixture)).rejects.toThrow('claude-session');
+    });
+
     it('refuses paths outside the plan', async () => {
         const fixture = await machineFixture(root);
         await expect(select(fixture, { projectPaths: ['relative/project'] })).rejects.toThrow();
