@@ -2,7 +2,7 @@ import { piiSessionVisibility } from "@/app/session/piiSessionVisibility";
 import { Fastify } from "../types";
 import { z } from "zod";
 import { db } from "@/storage/db";
-import { requireAccountPrincipal } from "../utils/enableAuthentication";
+import { requireAccountPrincipal, requireWorkMachineDaemonReadAuth } from "../utils/enableAuthentication";
 import { ExecutionOwnerRequestSchema, ExecutionOwnerResponseSchema } from "@slopus/happy-wire";
 
 /**
@@ -36,8 +36,10 @@ export function machineSessionOwnerRoutes(app: Fastify) {
         schema: { response: { 200: z.object({ orgEndpointSubagentVersion: z.literal(1), executionProofVersion: z.literal(1), relayTimeoutMs: z.literal(630000) }).strict() } },
     }, async () => ({ orgEndpointSubagentVersion: 1 as const, executionProofVersion: 1 as const, relayTimeoutMs: 630000 as const }));
 
+    // A protected machine's daemon asks with its device credential; it vouches only for
+    // conversations attached to that work machine, not for every session of the account.
     app.post('/v1/machine-sessions/:sessionId/owner', {
-        preHandler: app.authenticate,
+        preHandler: requireWorkMachineDaemonReadAuth(app, request => (request.body as { machineId?: string }).machineId),
         schema: {
             params: z.object({ sessionId: z.string().min(1) }),
             body: z.object({ machineId: z.string().min(1) }),
@@ -51,7 +53,10 @@ export function machineSessionOwnerRoutes(app: Fastify) {
         // Scoped to the authenticated account both ways, so a caller can only ever learn about
         // its own sessions and its own machines.
         const [session, machine] = await Promise.all([
-            db.session.findFirst({ where: { ...piiSessionVisibility(request), id: request.params.sessionId, accountId: request.userId } }),
+            db.session.findFirst({ where: {
+                ...piiSessionVisibility(request), id: request.params.sessionId, accountId: request.userId,
+                ...(request.workMachineDaemonGrant ? { workMachineId: request.body.machineId } : {}),
+            } }),
             db.machine.findFirst({ where: { id: request.body.machineId, accountId: request.userId } }),
         ]);
 
