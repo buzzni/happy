@@ -52,12 +52,18 @@ export async function prepareWorkMachineNewSession(input: {
     const key = requestId && encryption.type === 'dataKey'
         ? new Uint8Array(createHmac('sha256', encryption.machineKey).update(`happy-work-machine-spawn-key-v1\0${requestId}`).digest())
         : null;
-    // The server refuses while the generation drains, is frozen or moved to another device.
+    // The server refuses while the generation drains, is frozen or moved to another device. A drain is
+    // named (a migration pauses new work); it is not a reachability problem.
+    let draining = false;
     const session = await api.getOrCreateSession({
         tag: key ? `wm-spawn-${createHash('sha256').update(requestId!).digest('base64url')}` : randomUUID(),
         metadata: input.metadata, state: null,
         ...(key && encryption.type === 'dataKey' ? { dataKey: { key, wrapped: wrapDataEncryptionKey(key, encryption.publicKey) } } : {}),
-    }).catch(() => null);
+    }).catch((error: unknown) => {
+        draining = (error as { cause?: { response?: { data?: { reason?: unknown } } } })?.cause?.response?.data?.reason === 'work-machine-draining';
+        return null;
+    });
+    if (draining) return { kind: 'refused', errorMessage: 'This work machine is being migrated; new work is paused until the migration finishes' };
     if (!session) return { kind: 'refused', errorMessage: 'Work machine conversation could not be created; retry when the server is reachable' };
     if (!await input.persist(session)) return { kind: 'refused', errorMessage: 'Work machine conversation could not be recorded locally' };
     return {

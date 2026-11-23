@@ -95,6 +95,32 @@ describe('prepareWorkMachineNewSession', () => {
 
         expect(result.kind).toBe('refused');
     });
+
+    it('names the migration drain when the server pauses new work on the machine', async () => {
+        post.mockRejectedValueOnce({ response: { status: 409, data: { error: 'Work machine is draining', reason: 'work-machine-draining' } } });
+
+        const result = await prepareWorkMachineNewSession({
+            protectedMachine: true, options: {}, credentials: deviceCredentials, metadata, persist: async () => true,
+        });
+
+        expect(result).toEqual({
+            kind: 'refused',
+            errorMessage: 'This work machine is being migrated; new work is paused until the migration finishes',
+        });
+    });
+
+    it('keeps the reachability hint for a refusal that is not a drain', async () => {
+        post.mockRejectedValueOnce({ response: { status: 403, data: { error: 'Work machine device authorization required' } } });
+
+        const result = await prepareWorkMachineNewSession({
+            protectedMachine: true, options: {}, credentials: deviceCredentials, metadata, persist: async () => true,
+        });
+
+        expect(result).toEqual({
+            kind: 'refused',
+            errorMessage: 'Work machine conversation could not be created; retry when the server is reachable',
+        });
+    });
 });
 
 describe('startsNewWorkMachineConversation', () => {
