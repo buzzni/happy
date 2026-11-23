@@ -81,6 +81,10 @@ const workMachineRpcTiers = new Map<string, 'read' | 'turn-stop' | 'turn-answer'
     ['readFile', 'read'], ['readFileChunk', 'read'], ['listDirectory', 'read'], ['listFilesPage', 'read'],
     ['listWorkspaceDirectory', 'read'], ['readWorkspaceFile', 'read'], ['readWorkspaceFileChunk', 'read'],
     ['listWorkspaceDownloadDirectory', 'read'], ['closeWorkspaceDownloadDirectory', 'read'],
+    // The daemon's metadata methods: fixed-shape status answers, no command the caller chooses. A git status
+    // the web client reads through `bash` stays new work: the server cannot see which command it carries.
+    ['workspace-path-stat', 'read'], ['workspace-git-info', 'read'], ['preview-liveness', 'read'],
+    ['listening-ports', 'read'], ['container-runtime-status', 'read'], ['gh-auth-status', 'read'], ['machine-info', 'read'],
     // Status the web client polls; a poll after a switch must not close the way back.
     ['daemon-session-state', 'read'], ['mcp-status', 'read'], ['getDirectoryTree', 'read'], ['ripgrep', 'read'],
     ['get-port', 'read'], ['claude-list-rewind-points', 'read'], ['codex-list-rewind-points', 'read'],

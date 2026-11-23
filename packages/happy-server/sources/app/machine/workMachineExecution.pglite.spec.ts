@@ -199,7 +199,10 @@ describe('work machine execution authority', () => {
         })).refused;
         const firstExecution = async () => (await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt;
         const workspaceReads = ['listWorkspaceDirectory', 'readWorkspaceFile', 'readWorkspaceFileChunk',
-            'listWorkspaceDownloadDirectory', 'closeWorkspaceDownloadDirectory'];
+            'listWorkspaceDownloadDirectory', 'closeWorkspaceDownloadDirectory',
+            // The fixed-shape status answers of the daemon's metadata methods (happy-cli machineMetadataMethods.ts).
+            'workspace-path-stat', 'workspace-git-info', 'preview-liveness', 'listening-ports',
+            'container-runtime-status', 'gh-auth-status', 'machine-info'];
 
         // Opening a conversation again, an idle stop and workspace reads run no turn.
         for (const method of ['resume-happy-session', 'stop-session', ...workspaceReads]) {
