@@ -88,6 +88,31 @@ const SIGNED_TOKEN = /\beyJ[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}/g;
 
 const within = (root: string, path: string) => path === root || path.startsWith(root.endsWith('/') ? root : `${root}/`);
 
+/**
+ * Whether a link at `path` (inside `root`) to `target` lands inside `root` however the tree's other
+ * links resolve. Reading the target as text is not enough: `a/b/up -> ../..` then `chained ->
+ * a/b/up/..` both read as inside, yet `chained` is the root's parent. So a target may step up
+ * (`..`) only from a directory strictly inside the root that it reached without passing a link.
+ */
+function linkStaysInside(root: string, path: string, target: string, links: ReadonlySet<string>): boolean {
+    let current = isAbsolute(target) ? '/' : dirname(path);
+    let throughLink = false;
+    for (let ancestor = current; ancestor !== dirname(ancestor); ancestor = dirname(ancestor)) {
+        if (links.has(ancestor)) throughLink = true;
+    }
+    for (const part of target.split('/')) {
+        if (part === '' || part === '.') continue;
+        if (part === '..') {
+            if (throughLink || current === root || !within(root, current)) return false;
+            current = dirname(current);
+            continue;
+        }
+        current = join(current, part);
+        if (links.has(current)) throughLink = true;
+    }
+    return within(root, current);
+}
+
 function containsCredential(text: string, patterns: readonly RegExp[] = CREDENTIAL_PATTERNS): boolean {
     if (patterns.some(pattern => pattern.test(text))) return true;
     for (const match of text.matchAll(SIGNED_TOKEN)) {
@@ -133,13 +158,12 @@ function assertPlannedPath(path: string): void {
 
 /** Walks one root. Symlinks are kept only when they resolve inside the root. */
 async function collectTree(root: string, scanAll: boolean, entries: string[]): Promise<void> {
+    const links = new Map<string, string>();
     const visit = async (path: string): Promise<void> => {
         const info = await lstat(path);
         const name = basename(path);
         if (info.isSymbolicLink()) {
-            if (!within(root, resolve(dirname(path), await readlink(path)))) {
-                throw new Error(`Symbolic link leaves the transfer tree: ${path}`);
-            }
+            links.set(path, await readlink(path));
             entries.push(path);
             return;
         }
@@ -156,6 +180,10 @@ async function collectTree(root: string, scanAll: boolean, entries: string[]): P
         entries.push(path);
     };
     await visit(root);
+    const linkPaths = new Set(links.keys());
+    for (const [path, target] of links) {
+        if (!linkStaysInside(root, path, target, linkPaths)) throw new Error(`Symbolic link leaves the transfer tree: ${path}`);
+    }
 }
 
 async function readSessionRecords(happyHome: string): Promise<Record<string, unknown>> {
@@ -312,6 +340,7 @@ export async function extractWorkMachineArchive(input: {
     let records = 0;
     let invalid = false;
     const links: string[] = [];
+    const linkTargets: Array<{ root: string; path: string; target: string }> = [];
     await listTar({
         file: input.archivePath, strict: true,
         onReadEntry: entry => {
@@ -321,13 +350,19 @@ export async function extractWorkMachineArchive(input: {
             }
             const path = entry.path.startsWith('fs/') ? `/${entry.path.slice(3).replace(/\/$/, '')}` : '';
             const root = isAbsolute(path) && resolve(path) === path ? input.roots.find(candidate => within(candidate, path)) : undefined;
-            const linkInside = entry.type !== 'SymbolicLink' || (!!root && !!entry.linkpath && within(root, resolve(dirname(path), entry.linkpath)));
+            const linkNamed = entry.type !== 'SymbolicLink' || !!entry.linkpath;
             // Nothing may be written through a link: its target is a real path on this machine.
             const throughLink = links.some(link => path !== link && within(link, path));
-            if (entry.type === 'SymbolicLink') links.push(path);
-            if (!root || !['File', 'OldFile', 'Directory', 'SymbolicLink'].includes(entry.type) || !linkInside || throughLink) invalid = true;
+            if (entry.type === 'SymbolicLink') {
+                links.push(path);
+                if (root && entry.linkpath) linkTargets.push({ root, path, target: entry.linkpath });
+            }
+            if (!root || !['File', 'OldFile', 'Directory', 'SymbolicLink'].includes(entry.type) || !linkNamed || throughLink) invalid = true;
         },
     });
+    // Checked once every link is known: a link may step through one that comes later in the archive.
+    const linkPaths = new Set(links);
+    if (linkTargets.some(({ root, path, target }) => !linkStaysInside(root, path, target, linkPaths))) invalid = true;
     if (invalid || records !== 1) throw new Error('Work machine archive contains entries outside the transfer manifest');
     await mkdir(input.staging, { mode: 0o700 });
     // Links keep their absolute targets: the tree returns to the same absolute paths. Every entry

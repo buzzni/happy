@@ -239,12 +239,15 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
                 deviceId: z.string().regex(/^[a-zA-Z0-9_-]{43}$/),
                 ownerUserId: identifier,
                 sessionIds: z.array(identifier).max(5000),
+                // Studio's records place these inventory sessions on this machine
+                // for this owner. Covered by the control assertion, not the device proof.
+                studioAttributedSessionIds: z.array(identifier).max(5000).optional(),
                 proof: deviceSignatureSchema,
             }).strict(),
         },
     }, async (request, reply) => {
         const { machineId } = request.params;
-        const { deviceId, proof, ownerUserId, sessionIds } = request.body;
+        const { deviceId, proof, ownerUserId, sessionIds, studioAttributedSessionIds } = request.body;
         const now = Date.now();
         const enrollmentScope = ['happy-work-machine-enrollment-v2', machineId, deviceId, proof.issuedAt, [...sessionIds].sort()] as const;
         if (!verifiedOperation(request.headers, machineId, 'work-machine-enroll', request.body, now)
@@ -252,9 +255,9 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
             return reply.code(403).send({ error: 'Work machine enrollment not authorized' });
         }
         const enrolled = await enrollWorkMachineExecution(db, {
-            machineId, accountId: request.userId, deviceId, ownerUserId, sessionIds,
+            machineId, accountId: request.userId, deviceId, ownerUserId, sessionIds, studioAttributedSessionIds,
         });
-        if (!enrolled) return reply.code(409).send({ error: 'Work machine enrollment not ready' });
+        if ('reason' in enrolled) return reply.code(409).send({ error: 'Work machine enrollment not ready', ...enrolled });
         return reply.header('Cache-Control', 'no-store').send(enrolled);
     });
 

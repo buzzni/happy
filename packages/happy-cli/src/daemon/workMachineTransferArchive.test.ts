@@ -208,6 +208,18 @@ describe('work machine transfer archive selection', () => {
         await expect(select(fixture)).rejects.toThrow(join(fixture.project, 'escape-link'));
     });
 
+    it('refuses a link that steps up through another link, which leaves the tree although its text stays inside', async () => {
+        const fixture = await machineFixture(root);
+        await mkdir(join(fixture.project, 'node_modules', '.bin'), { recursive: true });
+        await symlink('../tool/cli.js', join(fixture.project, 'node_modules', '.bin', 'tool'));
+        expect((await select(fixture)).entries).toContain(join(fixture.project, 'node_modules', '.bin', 'tool'));
+        await mkdir(join(fixture.project, 'a', 'b'), { recursive: true });
+        await symlink('../..', join(fixture.project, 'a', 'b', 'up'));
+        // Lexically <project>/a/b, but a/b/up is the project itself, so this is its parent.
+        await symlink('a/b/up/..', join(fixture.project, 'chained'));
+        await expect(select(fixture)).rejects.toThrow(join(fixture.project, 'chained'));
+    });
+
     it('refuses paths outside the plan', async () => {
         const fixture = await machineFixture(root);
         await expect(select(fixture, { projectPaths: ['relative/project'] })).rejects.toThrow();
@@ -260,6 +272,13 @@ describe('work machine transfer archive selection', () => {
         await expect(crafted('relative-escape', async dir => {
             await symlink('../../../../../../../../../../../../etc', join(dir, 'escape'));
             return { [inTree(dir, 'escape')]: inTree(dir, 'escape') };
+        })).rejects.toThrow('outside the transfer manifest');
+        // Each link reads as inside the root; the second steps up through the first, out of it.
+        await expect(crafted('chained-link', async dir => {
+            await mkdir(join(dir, 'a', 'b'), { recursive: true });
+            await symlink('../..', join(dir, 'a', 'b', 'up'));
+            await symlink('a/b/up/..', join(dir, 'chained'));
+            return { [inTree(dir, 'a/b/up')]: inTree(dir, 'a/b/up'), [inTree(dir, 'chained')]: inTree(dir, 'chained') };
         })).rejects.toThrow('outside the transfer manifest');
         // A link that stays inside the root, then a file written through it.
         await expect(crafted('through-link', async dir => {
