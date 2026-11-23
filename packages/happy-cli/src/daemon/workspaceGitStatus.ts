@@ -12,6 +12,11 @@
  * the git invocations are fixed, so the server can classify the method as a
  * read. The answer mirrors the shape of that script's `status` object.
  *
+ * `workspace-current-pr` is the same script's `current-pr` read, which Studio
+ * runs right after the status for a project without a server-side GitHub
+ * connection: the checked-out branch's same-repository pull request on the
+ * GitHub `origin`, from `gh pr list`.
+ *
  * Paths go through the same boundary as the workspace file RPCs. File names
  * leave the machine here, so this is not a server-lane method.
  */
@@ -22,6 +27,7 @@ import { approvedAnchor } from '@/modules/common/pathSecurity';
 import type { MetadataDeps } from './machineMetadataMethods';
 
 export const WORKSPACE_GIT_STATUS_METHOD = 'workspace-git-status';
+export const WORKSPACE_CURRENT_PR_METHOD = 'workspace-current-pr';
 
 export interface WorkspaceGitStatusDeps {
     allowedRoot: string;
@@ -192,6 +198,61 @@ export function createWorkspaceGitStatusHandler(deps: WorkspaceGitStatusDeps): (
                     checkedAt: deps.now(),
                 },
             };
+        } catch (error) {
+            if (error instanceof GitStatusFailure) return failure(error.errorCode, error.message);
+            return failure('GIT_FAILED', error instanceof Error ? error.message : 'git failed');
+        }
+    };
+}
+
+const GITHUB_REMOTE = /^(?:https:\/\/github\.com\/|git@github\.com:|ssh:\/\/git@github\.com\/)([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i;
+const GH_AUTH_FAILURE = /gh auth login|not logged|authentication|HTTP 401|Bad credentials/i;
+const PR_STATES = ['OPEN', 'CLOSED', 'MERGED'];
+
+type GhPr = { number?: unknown; url?: unknown; title?: unknown; state?: unknown; isCrossRepository?: unknown };
+
+export function createWorkspaceCurrentPrHandler(deps: WorkspaceGitStatusDeps): (params: unknown) => Promise<Answer> {
+    return async (params) => {
+        const { workspaceRoot, path, branch } = (params && typeof params === 'object' ? params : {}) as Record<string, unknown>;
+        if (typeof workspaceRoot !== 'string' || typeof path !== 'string' || typeof branch !== 'string' || !branch || branch.length > MAX_BASE_LENGTH) {
+            return failure('INVALID_PARAMS', 'workspaceRoot, path and branch are required');
+        }
+        try {
+            const { cwd, optional } = await openWorkspaceGit(deps, workspaceRoot, path);
+            if (await optional(['symbolic-ref', '--quiet', '--short', 'HEAD']) !== branch) return failure('BRANCH_CHANGED', 'The checked-out branch changed');
+            const remote = await optional(['remote', 'get-url', 'origin']);
+            if (!remote) return failure('REMOTE_MISSING', 'The repository has no origin');
+            const match = GITHUB_REMOTE.exec(remote);
+            if (!match) return failure('UNSUPPORTED_REMOTE', 'origin is not a GitHub repository');
+            const repository = `https://github.com/${match[1]}/${match[2]}`;
+            let result: Awaited<ReturnType<MetadataDeps['runFile']>>;
+            try {
+                result = await deps.runFile('gh', ['pr', 'list', '--repo', repository, '--head', branch, '--state', 'all',
+                    '--limit', '20', '--json', 'number,url,title,state,isCrossRepository'], {
+                    cwd, env: { ...gitEnv(), GH_PROMPT_DISABLED: '1', GH_PAGER: 'cat', NO_COLOR: '1' }, timeoutMs: DEADLINE_MS,
+                });
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return failure('GH_UNAVAILABLE', 'gh is not installed');
+                return failure('GH_FAILED', error instanceof Error ? error.message : 'gh failed');
+            }
+            if (result.code !== 0) {
+                return GH_AUTH_FAILURE.test(`${result.stderr}${result.stdout}`)
+                    ? failure('GH_AUTH_REQUIRED', 'gh is not logged in to GitHub')
+                    : failure('GH_FAILED', 'gh pr list failed');
+            }
+            let list: unknown;
+            try { list = JSON.parse(result.stdout); } catch { list = null; }
+            if (!Array.isArray(list) || list.some((pr: GhPr | null) => !pr || typeof pr.isCrossRepository !== 'boolean')) {
+                return failure('GH_FAILED', 'gh answered an unexpected pull request list');
+            }
+            const pr = (list as GhPr[]).find((candidate) => candidate.isCrossRepository === false);
+            if (!pr) return { success: true, currentPr: null };
+            if (!Number.isInteger(pr.number) || (pr.number as number) <= 0 || typeof pr.title !== 'string'
+                || typeof pr.state !== 'string' || !PR_STATES.includes(pr.state) || typeof pr.url !== 'string'
+                || !pr.url.toLowerCase().startsWith(`${repository}/pull/`.toLowerCase())) {
+                return failure('GH_FAILED', 'gh answered an unexpected pull request');
+            }
+            return { success: true, currentPr: { number: pr.number, url: pr.url, title: pr.title, state: pr.state.toLowerCase() } };
         } catch (error) {
             if (error instanceof GitStatusFailure) return failure(error.errorCode, error.message);
             return failure('GIT_FAILED', error instanceof Error ? error.message : 'git failed');

@@ -9,7 +9,7 @@ import { mkdirSync, mkdtempSync, realpathSync, renameSync, writeFileSync } from 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { runFileWithoutShell } from './machineMetadataMethods';
-import { createWorkspaceGitStatusHandler, type WorkspaceGitStatusDeps } from './workspaceGitStatus';
+import { createWorkspaceCurrentPrHandler, createWorkspaceGitStatusHandler, type WorkspaceGitStatusDeps } from './workspaceGitStatus';
 
 const git = (cwd: string, ...args: string[]) => execFileSync('git', args, {
     cwd, encoding: 'utf8',
@@ -143,5 +143,58 @@ describe('workspace-git-status', () => {
         const stuck = setup({ runFile: async () => ({ code: null, stdout: '', stderr: '' }) });
         expect(await stuck.handler({ workspaceRoot: stuck.workspace, path: stuck.workspace }))
             .toMatchObject({ success: false, errorCode: 'GIT_TIMEOUT' });
+    });
+});
+
+describe('workspace-current-pr', () => {
+    type Gh = (args: string[]) => Awaited<ReturnType<WorkspaceGitStatusDeps['runFile']>>;
+    function prSetup(gh: Gh, remote = 'https://github.com/octo/app.git') {
+        const runFile = vi.fn<WorkspaceGitStatusDeps['runFile']>(async (command, args, options) => (
+            command === 'gh' ? gh(args) : runFileWithoutShell(command, args, options)));
+        const context = setup({ runFile });
+        git(context.workspace, 'init', '-q', '-b', 'feature/x');
+        if (remote) git(context.workspace, 'remote', 'add', 'origin', remote);
+        return { ...context, runFile, handler: createWorkspaceCurrentPrHandler({ allowedRoot: context.root, approvedRoots: () => [], isGuardedPath: () => false, runFile, now: Date.now }) };
+    }
+    const pr = (number: number, isCrossRepository: boolean, state = 'OPEN') => ({
+        number, url: `https://github.com/octo/app/pull/${number}`, title: `PR ${number}`, state, isCrossRepository,
+    });
+
+    it("answers the branch's same-repository pull request from gh, with a fixed query", async () => {
+        const { handler, workspace, runFile } = prSetup(() => ({ code: 0, stdout: JSON.stringify([pr(7, true), pr(8, false, 'MERGED')]), stderr: '' }));
+
+        expect(await handler({ workspaceRoot: workspace, path: workspace, branch: 'feature/x', command: 'id' }))
+            .toEqual({ success: true, currentPr: { number: 8, url: 'https://github.com/octo/app/pull/8', title: 'PR 8', state: 'merged' } });
+        const [, args, options] = runFile.mock.calls.find(([command]) => command === 'gh')!;
+        expect(args).toEqual(['pr', 'list', '--repo', 'https://github.com/octo/app', '--head', 'feature/x', '--state', 'all',
+            '--limit', '20', '--json', 'number,url,title,state,isCrossRepository']);
+        expect(options).toMatchObject({ cwd: workspace, env: { GH_PROMPT_DISABLED: '1', GH_PAGER: 'cat', NO_COLOR: '1' } });
+    });
+
+    it('answers no pull request', async () => {
+        const { handler, workspace } = prSetup(() => ({ code: 0, stdout: '[]', stderr: '' }));
+        expect(await handler({ workspaceRoot: workspace, path: workspace, branch: 'feature/x' })).toEqual({ success: true, currentPr: null });
+    });
+
+    it('refuses a changed branch, a missing or non-GitHub origin', async () => {
+        const gh: Gh = () => ({ code: 0, stdout: '[]', stderr: '' });
+        const changed = prSetup(gh);
+        expect(await changed.handler({ workspaceRoot: changed.workspace, path: changed.workspace, branch: 'main' })).toMatchObject({ success: false, errorCode: 'BRANCH_CHANGED' });
+        const missing = prSetup(gh, '');
+        expect(await missing.handler({ workspaceRoot: missing.workspace, path: missing.workspace, branch: 'feature/x' })).toMatchObject({ success: false, errorCode: 'REMOTE_MISSING' });
+        const gitlab = prSetup(gh, 'https://gitlab.com/octo/app.git');
+        expect(await gitlab.handler({ workspaceRoot: gitlab.workspace, path: gitlab.workspace, branch: 'feature/x' })).toMatchObject({ success: false, errorCode: 'UNSUPPORTED_REMOTE' });
+        expect(await gitlab.handler({ workspaceRoot: gitlab.workspace, path: gitlab.workspace })).toMatchObject({ success: false, errorCode: 'INVALID_PARAMS' });
+    });
+
+    it('reports gh missing, logged out, failing or answering something else', async () => {
+        const missing = prSetup(() => { throw Object.assign(new Error('spawn gh ENOENT'), { code: 'ENOENT' }); });
+        expect(await missing.handler({ workspaceRoot: missing.workspace, path: missing.workspace, branch: 'feature/x' })).toMatchObject({ errorCode: 'GH_UNAVAILABLE' });
+        const loggedOut = prSetup(() => ({ code: 4, stdout: '', stderr: 'To get started with GitHub CLI, please run:  gh auth login' }));
+        expect(await loggedOut.handler({ workspaceRoot: loggedOut.workspace, path: loggedOut.workspace, branch: 'feature/x' })).toMatchObject({ errorCode: 'GH_AUTH_REQUIRED' });
+        const failing = prSetup(() => ({ code: 1, stdout: '', stderr: 'HTTP 502' }));
+        expect(await failing.handler({ workspaceRoot: failing.workspace, path: failing.workspace, branch: 'feature/x' })).toMatchObject({ errorCode: 'GH_FAILED' });
+        const odd = prSetup(() => ({ code: 0, stdout: JSON.stringify([{ ...pr(9, false), url: 'https://github.com/evil/app/pull/9' }]), stderr: '' }));
+        expect(await odd.handler({ workspaceRoot: odd.workspace, path: odd.workspace, branch: 'feature/x' })).toMatchObject({ errorCode: 'GH_FAILED' });
     });
 });
