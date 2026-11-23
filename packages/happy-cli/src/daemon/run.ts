@@ -9,6 +9,7 @@ import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from '
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship } from './ownedSpawnRuntime';
 import { ownershipHappyOrigin, ownershipTrustEnv } from './sessionOwnershipTrust';
+import { readOwnedRegistration } from './ownedSpawnRegistration';
 import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
 import { drainBashRpcs } from '@/modules/common/bashRpcScheduler';
@@ -6063,13 +6064,7 @@ export async function startDaemon(): Promise<void> {
       logger.debug(`[channel-host] not started: ${channelHostEntry.code}`);
     }
 
-    const ownedRegistration = async () => {
-      const [currentCredentials, settings] = await Promise.all([readCredentials(), readSettings()]);
-      if (!currentCredentials || settings.machineId !== machineId || !settings.machineIdConfirmedByServer) throw new Error('identity-changed');
-      // Never replace the running daemon's registration with a descriptor's claims.
-      if (JSON.stringify(currentCredentials) !== JSON.stringify(credentials)) throw new Error('identity-changed');
-      return { machineId, credentials: currentCredentials, epoch: String(process.pid) };
-    };
+    const ownedRegistration = () => readOwnedRegistration({ machineId, credentials, epoch: String(process.pid), readCredentials, readSettings });
     const liveLaunch = (tracked: TrackedSession) => tracked.pid > 0 && isPidAlive(tracked.pid);
     // Default OFF: the route refuses and agent-caller-binding answers only owned-journal sources.
     // A token's account never changes, so only a confirmed answer is remembered; registration is re-read every time.
