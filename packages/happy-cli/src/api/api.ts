@@ -126,12 +126,17 @@ export class ApiClient {
     return { sessionId: principal.credential.sessionId, token: () => principal.token };
   }
 
-  async permitWorkMachineSessionExecution(): Promise<void> {
+  /**
+   * `start`: the process is starting without a turn of its own (a resume or a recovery). The server
+   * still refuses it while the machine drains or is frozen, but records no first execution: that
+   * would close the way back to the previous PC before anything ran. A turn asks again without it.
+   */
+  async permitWorkMachineSessionExecution(options: { start?: true } = {}): Promise<void> {
     const principal = this.principal;
     if (principal.kind !== 'work-machine-session') throw new Error('Work machine session authorization is unavailable');
     try {
-      // An empty JSON object: axios sends a bodiless POST as a form, which the server's parsers refuse (415).
-      await axios.post(`${configuration.serverUrl.replace(/\/+$/, '')}/v1/sessions/${encodeURIComponent(principal.credential.sessionId)}/work-machine-permit`, {}, {
+      // A JSON object even when empty: axios sends a bodiless POST as a form, which the server's parsers refuse (415).
+      await axios.post(`${configuration.serverUrl.replace(/\/+$/, '')}/v1/sessions/${encodeURIComponent(principal.credential.sessionId)}/work-machine-permit`, options.start ? { start: true } : {}, {
         headers: { Authorization: `Bearer ${principal.token}` }, timeout: 10_000, maxRedirects: 0,
       });
     } catch {

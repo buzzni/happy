@@ -460,7 +460,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             || !claudeCheckSession(nativeId, workingDirectory, options.claudeEnvVars?.CLAUDE_CONFIG_DIR))) {
             throw new Error('WORK_MACHINE_CLAUDE_TRANSCRIPT_UNAVAILABLE');
         }
-        await api.permitWorkMachineSessionExecution();
+        // Without a prompt to run now, the first turn asks for its own permit (ApiSessionClient).
+        await api.permitWorkMachineSessionExecution(preparedInitialPrompt.prompt === null ? { start: true } : {});
     }
 
     let response: ApiSession | null;

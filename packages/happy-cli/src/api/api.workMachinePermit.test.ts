@@ -14,12 +14,12 @@ import { configuration } from '@/configuration';
 describe('work machine session execution permit', () => {
     let app: FastifyInstance;
     let originalUrl: string;
-    const received: { sessionId: string; authorization?: string }[] = [];
+    const received: { sessionId: string; authorization?: string; body?: unknown }[] = [];
 
     beforeEach(async () => {
         app = Fastify();
         app.post<{ Params: { sessionId: string } }>('/v1/sessions/:sessionId/work-machine-permit', { bodyLimit: 1_024 }, async (request, reply) => {
-            received.push({ sessionId: request.params.sessionId, authorization: request.headers.authorization });
+            received.push({ sessionId: request.params.sessionId, authorization: request.headers.authorization, body: request.body });
             return reply.code(204).send();
         });
         app.post<{ Params: { sessionId: string } }>('/v1/sessions/:sessionId/push-event', async (request, reply) => {
@@ -43,7 +43,17 @@ describe('work machine session execution permit', () => {
         const api = ApiClient.workMachineSession({ sessionId: 'protected-session', initial, renew: async () => initial });
 
         await expect(api.permitWorkMachineSessionExecution()).resolves.toBeUndefined();
-        expect(received).toEqual([{ sessionId: 'protected-session', authorization: 'Bearer wmx_session_token_for_tests' }]);
+        expect(received).toEqual([{ sessionId: 'protected-session', authorization: 'Bearer wmx_session_token_for_tests', body: {} }]);
+    });
+
+    // dev E2E 2nd round, defect 5: a process that starts without a turn (resume, recovery) must not close the way back.
+    it('asks for a start permit, which records no first execution, when the process starts without a turn', async () => {
+        const initial = { token: 'wmx_session_token_for_tests', expiresAt: Date.now() + 60_000 };
+        const api = ApiClient.workMachineSession({ sessionId: 'protected-session', initial, renew: async () => initial });
+
+        await api.permitWorkMachineSessionExecution({ start: true });
+
+        expect(received).toEqual([{ sessionId: 'protected-session', authorization: 'Bearer wmx_session_token_for_tests', body: { start: true } }]);
     });
 
     // The server takes only the conversation's own session credential for a protected conversation's push.
