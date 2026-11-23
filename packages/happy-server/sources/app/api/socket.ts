@@ -24,7 +24,7 @@ import { setTerminalSessionBackend, type TerminalSessionBackend } from "./socket
 import { previewWsMachineHandler, registerPreviewWsClusterListeners } from "@/modules/preview/previewWebSocketRelay";
 import { registerTerminalSessionClusterListeners } from "@/app/api/socket/terminalSessions";
 import { db } from "@/storage/db";
-import { authenticateWorkMachineSessionSocket, authenticateWorkMachineSocket, inArrivalOrder, legacySessionSocketAllowed, machineSocketIdentityExists, workMachineSocketMayAct } from "./socket/machineSocketAuth";
+import { authenticateWorkMachineSessionSocket, authenticateWorkMachineSocket, legacySessionSocketAllowed, machineSocketIdentityExists, workMachinePacketGuard } from "./socket/machineSocketAuth";
 import type { WorkMachineExecutionClaims } from "@/app/auth/workMachineExecutionToken";
 import { automationSocketHandler } from "./socket/automationSocketHandler";
 import { markMachineOffline, markMachineOnline } from "@/app/presence/machinePresence";
@@ -421,20 +421,12 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
         const workMachineExecution = (socket.data.workMachineExecution ?? null) as WorkMachineExecutionClaims | null;
 
         // This also runs for recovered sockets that skipped the handshake.
-        socket.use(inArrivalOrder(([event, payload], next) => {
-            void workMachineSocketMayAct(db, {
-                accountId: userId, socketMachineId: clientType === 'machine-scoped' ? machineId : undefined,
-                socketSessionId: clientType === 'session-scoped' ? sessionId : undefined,
-                workMachineBrowser: socket.data.workMachineBrowser === true,
-                claims: workMachineExecution, event, payload, now: Date.now(),
-            }).then((allowed) => {
-                if (allowed) next();
-                else next(new Error('Work machine execution is not authorized'));
-            }, (error: unknown) => {
-                log({ module: 'websocket', level: 'warn' }, 'Work machine execution lookup failed');
-                next(error instanceof Error ? error : new Error('Work machine execution lookup failed'));
-            });
-        }));
+        socket.use(workMachinePacketGuard(db, {
+            accountId: userId, socketMachineId: clientType === 'machine-scoped' ? machineId : undefined,
+            socketSessionId: clientType === 'session-scoped' ? sessionId : undefined,
+            workMachineBrowser: socket.data.workMachineBrowser === true,
+            claims: workMachineExecution,
+        }, () => log({ module: 'websocket', level: 'warn' }, 'Work machine execution lookup failed')));
 
         log({ module: 'websocket' }, `Token verified: ${userId}, clientType: ${clientType || 'user-scoped'}, client: ${labels.client}, sessionId: ${sessionId || 'none'}, machineId: ${machineId || 'none'}, socketId: ${socket.id}`);
 

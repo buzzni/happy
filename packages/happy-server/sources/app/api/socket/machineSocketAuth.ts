@@ -151,3 +151,23 @@ export async function workMachineSocketMayAct(db: WorkMachineLookup, input: Mach
         && (!protectedMachine || protectedMachine.frozenAt === null)
         && (!protectedSession || protectedSession.workMachineExecution?.frozenAt === null);
 }
+
+/**
+ * The per-packet work machine check every socket runs, released in arrival order. `context` is the
+ * socket's identity, fixed at connection; a refused packet never reaches its handler.
+ */
+export function workMachinePacketGuard(
+    db: WorkMachineLookup,
+    context: Omit<MachineSocketEvent, 'event' | 'payload' | 'now'>,
+    onLookupFailed: () => void,
+) {
+    return inArrivalOrder(([event, payload]: unknown[], next: (error?: Error) => void) => {
+        void workMachineSocketMayAct(db, { ...context, event: event as string, payload, now: Date.now() }).then((allowed) => {
+            if (allowed) next();
+            else next(new Error('Work machine execution is not authorized'));
+        }, (error: unknown) => {
+            onLookupFailed();
+            next(error instanceof Error ? error : new Error('Work machine execution lookup failed'));
+        });
+    });
+}
