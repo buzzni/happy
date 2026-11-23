@@ -13,6 +13,8 @@ import { captureLaunchMcpServersSeed } from './aplus/launchMcpSeed'
 // anything below can start a subprocess that would inherit them. The runner takes them from memory.
 captureLaunchMcpServersSeed(process.env)
 const args = process.argv.slice(2)
+// Worker launchers hold prepared resources for the runtime, beyond the bootstrap import.
+let commandLifetime: Promise<unknown> | undefined
 if (args[0] === 'daemon' && args[1] === 'start-sync') loadBrowserTaskEnv(process.env)
 try { captureStandaloneLaunchBootstrap(process.env, args) }
 catch { console.error('Invalid standalone launch bootstrap'); process.exit(1) }
@@ -36,5 +38,7 @@ if (args[0] === 'browser-client') {
 } else if (args[0] === 'difficulty-routing-worker') {
   void import('./daemon/difficultyRoutingWorkerProcess')
 } else {
-  void import('./main')
+  commandLifetime = import('./main').then(({ runHappyCli }) => runHappyCli())
 }
+
+export { commandLifetime }

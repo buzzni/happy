@@ -5,7 +5,7 @@ import { BRANCH_SLUG_SPEC } from '@/utils/branchSlugSpec';
  *
  * The in-turn change_title instruction costs extra model round trips on the
  * first request (find the deferred change_title tool, then call it). A
- * provider-specific runner produces the same locked title in parallel instead;
+ * provider-specific runner produces the same locked title after the response;
  * a run that fails stops covering the title, so the next turn falls back to
  * the in-turn instruction.
  */
@@ -73,9 +73,11 @@ export function createOffTurnTitleJob(deps: OffTurnTitleJobDeps) {
         fail('failed to record title', result.error);
     };
 
+    const canStart = () => state === 'idle' && !controller.signal.aborted && !deps.hasTitle();
     return {
+        canStart,
         start(message: string, model: string | undefined): boolean {
-            if (state !== 'idle' || deps.hasTitle()) return false;
+            if (!canStart()) return false;
             state = 'running';
             // Nothing awaits this in production; a rejection would be unhandled.
             settledPromise = execute(message, model).catch((error: unknown) => fail('failed unexpectedly', error));
@@ -99,17 +101,13 @@ export type OffTurnTitleJob = ReturnType<typeof createOffTurnTitleJob>;
 
 /**
  * Decides, per turn, whether the in-turn title instruction can be left out.
- * An eligible untitled turn starts the job (once); after a failed job this
- * returns false again so the turn carries the instruction as before.
+ * An eligible turn reserves the title for after the response. A failed title
+ * restores the in-turn instruction on the next turn.
  */
 export function titleCoveredForTurn(input: {
     hasTitle: boolean;
     job: OffTurnTitleJob;
     eligible: boolean;
-    message: string;
-    model?: string;
 }): boolean {
-    if (input.hasTitle) return true;
-    if (input.eligible) input.job.start(input.message, input.model);
-    return input.job.covers();
+    return input.hasTitle || input.job.covers() || (input.eligible && input.job.canStart());
 }

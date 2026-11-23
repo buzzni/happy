@@ -6,7 +6,7 @@
  */
 
 // These exports allow me to use this package a library in dev-environment cli helper programs
-export { ApiClient } from '@/api/api'
+export { ApiClient } from '@/api/machineApiClient'
 export { ApiSessionClient } from '@/api/apiSession'
 
 export { logger } from '@/ui/logger'

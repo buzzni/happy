@@ -545,9 +545,7 @@ describe('CodexMcpRuntimeRecovery', () => {
             developerInstructions: 'Use Argos through its MCP tools.',
         })).resolves.toEqual({ status: 'failed', affectedServers: ['argos'] });
         expect(client.resumeThread).toHaveBeenCalledTimes(2);
-        expect(sleep).toHaveBeenCalledTimes(2);
-        expect(sleep).toHaveBeenNthCalledWith(1, 10);
-        expect(sleep).toHaveBeenNthCalledWith(2, 20);
+        expect(sleep).toHaveBeenCalledExactlyOnceWith(10);
     });
 
     it('uses the default 250ms and 500ms bounded backoff before reinspection', async () => {

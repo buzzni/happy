@@ -1,4 +1,11 @@
 import { describe, expect, it, vi } from 'vitest';
+import { resolve } from 'node:path';
+
+// The bootstrap budget and authorization cases exercise a project with lessons explicitly enabled.
+vi.mock('./lessonSettingsStore', async importOriginal => ({
+    ...await importOriginal<typeof import('./lessonSettingsStore')>(),
+    isProjectLessonHostEnabled: async () => true,
+}));
 
 import {
     LESSON_SESSION_BOOTSTRAP_BUDGET_MS,
@@ -149,9 +156,9 @@ describe('state root agreement', () => {
          * the machine's, so they must not fork with the home — but the caller,
          * the grant and the permissions stay this session's.
          */
-        expect(lessonStateRoot(env())).toBe('/tmp/happy-lesson-bootstrap');
+        expect(lessonStateRoot(env())).toBe(resolve('/tmp/happy-lesson-bootstrap'));
         expect(lessonStateRoot(env({ HAPPY_LESSON_DAEMON_HOME: '/tmp/daemon-home' })))
-            .toBe('/tmp/daemon-home');
+            .toBe(resolve('/tmp/daemon-home'));
     });
 
     it('is unsupported when the daemon never said what its root is', async () => {

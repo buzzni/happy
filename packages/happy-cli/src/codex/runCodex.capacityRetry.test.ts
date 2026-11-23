@@ -25,7 +25,7 @@ vi.mock('@/ui/logger', () => ({
     logger: { debug: vi.fn(), debugLargeJson: vi.fn(), info: vi.fn(), infoDeveloper: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionStarted: vi.fn(async () => {}) }));
-vi.mock('@/daemon/run', () => ({ initialMachineMetadata: {} }));
+vi.mock('@/daemon/initialMachineMetadata', () => ({ initialMachineMetadata: {} }));
 vi.mock('@/persistence', async (importOriginal) => ({
     ...await importOriginal<typeof import('@/persistence')>(),
     readSettings: vi.fn(async () => ({ machineId: 'machine-test' })),

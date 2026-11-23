@@ -1,4 +1,5 @@
 import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { TITLE_INSTRUCTION } from '@/utils/titlePrompt';
 
@@ -108,7 +109,7 @@ vi.mock('@/api/api', () => ({
   },
 }));
 
-vi.mock('@/daemon/run', () => ({
+vi.mock('@/daemon/initialMachineMetadata', () => ({
   initialMachineMetadata: { host: 'host', platform: 'darwin', happyCliVersion: 'test', homeDir: '/tmp', happyHomeDir: '/tmp/.happy', happyLibDir: '/tmp/happy' },
 }));
 
@@ -363,7 +364,7 @@ describe('runAcp', () => {
     // A .mjs path is not an executable on Windows (os error 193); node runs it everywhere.
     expect(mocks.backendState.constructorArgs.mcpServers.happy).toEqual({
       command: process.execPath,
-      args: ['--no-warnings', '--no-deprecation', '/tmp/happy/bin/happy-mcp.mjs', '--url', 'http://127.0.0.1:9876'],
+      args: ['--no-warnings', '--no-deprecation', join('/tmp/happy', 'bin', 'happy-mcp.mjs'), '--url', 'http://127.0.0.1:9876'],
     });
   });
 

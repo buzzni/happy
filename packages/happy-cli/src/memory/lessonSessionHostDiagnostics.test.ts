@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const mocks = vi.hoisted(() => ({
-    debug: vi.fn(), key: vi.fn(), verifier: vi.fn(), verify: vi.fn(), snapshot: vi.fn(),
+    debug: vi.fn(), settingsEnabled: vi.fn(), key: vi.fn(), verifier: vi.fn(), verify: vi.fn(), snapshot: vi.fn(),
     close: vi.fn(), open: vi.fn(), user: vi.fn(), turn: vi.fn(),
     host: vi.fn(), issuer: vi.fn(), authorize: vi.fn(), review: vi.fn(),
 }));
@@ -20,6 +20,7 @@ vi.mock('./lessonHostSupervisor', () => ({ createLessonHostSupervisor: (options:
 vi.mock('./lessonTurnHost', () => ({ createLessonTurnHost: mocks.turn }));
 vi.mock('./lessonReviewWorker', () => ({ createLessonReviewWorker: mocks.review, lessonCandidateEnvelope: vi.fn() }));
 vi.mock('./lessonSettingsStore', () => ({
+    isProjectLessonHostEnabled: mocks.settingsEnabled,
     createLessonSettingsStore: () => ({}), createLessonReviewOutcomeStore: () => ({}),
     lessonReviewLedgerPath: () => '/unused', lessonReviewOutcomePath: () => '/unused', lessonSettingsPath: () => '/unused',
 }));
@@ -48,6 +49,7 @@ function expectReason(reason: string) {
 
 beforeEach(() => {
     vi.resetAllMocks();
+    mocks.settingsEnabled.mockResolvedValue(true);
     mocks.key.mockResolvedValue('private-key'); mocks.verifier.mockReturnValue({ verify: mocks.verify });
     mocks.verify.mockReturnValue({ ok: true, claims: { projectId: 'private-project' } });
     mocks.snapshot.mockResolvedValue('private-envelope');
@@ -59,6 +61,13 @@ beforeEach(() => {
 });
 
 describe('lesson host safe diagnostics', () => {
+    it('does not request credentials or open the lesson store when both project options are off', async () => {
+        mocks.settingsEnabled.mockResolvedValue(false);
+        expect(await createLessonSessionHost(input())).toBeNull();
+        expect(mocks.key).not.toHaveBeenCalled();
+        expect(mocks.open).not.toHaveBeenCalled();
+        expectReason('settings_disabled');
+    });
     it.each([
         ['missing_account', (i: ReturnType<typeof input>) => { i.accountToken = ''; }],
         ['missing_machine', (i: ReturnType<typeof input>) => { i.machineId = ''; }],

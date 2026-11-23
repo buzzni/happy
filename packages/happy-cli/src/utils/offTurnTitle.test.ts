@@ -142,27 +142,27 @@ describe('parseOffTurnTitle', () => {
 describe('titleCoveredForTurn', () => {
     it('shouldKeepTheExistingTitleWithoutStartingAJob', () => {
         const { job, runner } = setup();
-        expect(titleCoveredForTurn({ hasTitle: true, job, eligible: true, message: 'm' })).toBe(true);
+        expect(titleCoveredForTurn({ hasTitle: true, job, eligible: true })).toBe(true);
         expect(runner).not.toHaveBeenCalled();
     });
 
-    it('shouldStartTheJobAndOmitTheInstructionOnAnEligibleUntitledTurn', () => {
+    it('shouldOmitTheTitleInstructionWithoutStartingTheJobBeforeTheResponse', () => {
         const { job, runner } = setup();
-        expect(titleCoveredForTurn({ hasTitle: false, job, eligible: true, message: 'm', model: 'gpt-6-luna' })).toBe(true);
-        expect(runner).toHaveBeenCalledTimes(1);
+        expect(titleCoveredForTurn({ hasTitle: false, job, eligible: true })).toBe(true);
+        expect(runner).not.toHaveBeenCalled();
     });
 
     it('shouldKeepTheInTurnInstructionWhenNotEligible', () => {
         const { job, runner } = setup();
-        expect(titleCoveredForTurn({ hasTitle: false, job, eligible: false, message: 'm' })).toBe(false);
+        expect(titleCoveredForTurn({ hasTitle: false, job, eligible: false })).toBe(false);
         expect(runner).not.toHaveBeenCalled();
     });
 
     it('shouldRestoreTheInTurnInstructionOnTheTurnAfterAFailedJob', async () => {
         const { job, run } = setup();
-        titleCoveredForTurn({ hasTitle: false, job, eligible: true, message: 'first' });
+        job.start('first', undefined);
         run.reject(new Error('exit 1'));
         await job.settled();
-        expect(titleCoveredForTurn({ hasTitle: false, job, eligible: true, message: 'second' })).toBe(false);
+        expect(titleCoveredForTurn({ hasTitle: false, job, eligible: true })).toBe(false);
     });
 });

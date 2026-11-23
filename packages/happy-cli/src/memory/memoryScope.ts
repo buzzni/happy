@@ -1,5 +1,19 @@
 import { readCheckpointSpawnContext } from '@/checkpoint/checkpointSpawnContext';
 import { isAutomationExecutionSessionId } from '@slopus/happy-wire';
+import { readFile } from 'node:fs/promises';
+import { isAbsolute, join } from 'node:path';
+
+export const MEMORY_DAEMON_HOME_ENV = 'HAPPY_LESSON_DAEMON_HOME';
+
+/** Only the account host's saved opt-in can authorize Happy's out-of-sandbox Codex memory workers. */
+export async function isCodexEventMemoryEnabled(env: NodeJS.ProcessEnv): Promise<boolean> {
+    const root = env[MEMORY_DAEMON_HOME_ENV];
+    if (!root || !isAbsolute(root)) return false;
+    try {
+        const settings = JSON.parse(await readFile(join(root, 'settings.json'), 'utf8'));
+        return settings?.codexEventMemoryEnabled === true;
+    } catch { return false; }
+}
 
 /**
  * The durable memory boundary for a provider session.

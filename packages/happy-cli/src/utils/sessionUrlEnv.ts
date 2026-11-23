@@ -34,3 +34,22 @@ export function applySessionUrlEnv(
     env.APLUS_SESSION_URL = buildSessionWebUrl(sessionId, webappUrl);
     env.APLUS_SESSION_ID = sessionId;
 }
+
+export type SessionLinks = { APLUS_SESSION_ID: string; APLUS_SESSION_URL: string };
+
+/** Validate the public links before forwarding them through a provider's late settings. */
+export function readSessionLinks(env: NodeJS.ProcessEnv): SessionLinks | undefined {
+    const id = env.APLUS_SESSION_ID, link = env.APLUS_SESSION_URL;
+    if (!id || !/^[\w-]{1,160}$/.test(id) || !link) return;
+    try {
+        const url = new URL(link);
+        if (!['https:', 'http:'].includes(url.protocol) || url.pathname !== `/session/${id}`
+            || url.username || url.password || url.search || url.hash) return;
+        return { APLUS_SESSION_ID: id, APLUS_SESSION_URL: link };
+    } catch { return undefined; }
+}
+
+export function withoutSessionLinks(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const { APLUS_SESSION_ID: _id, APLUS_SESSION_URL: _url, ...remaining } = env;
+    return remaining;
+}

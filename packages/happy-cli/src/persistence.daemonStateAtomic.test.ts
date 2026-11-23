@@ -3,7 +3,7 @@ import * as fs from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { configuration } from './configuration';
-import { readDaemonState, writeDaemonState, type DaemonLocallyPersistedState } from './persistence';
+import { flushDaemonState, readDaemonState, writeDaemonState, writeDaemonStateDebounced, type DaemonLocallyPersistedState } from './persistence';
 
 vi.mock('node:fs', async (original) => {
     const actual = await original<typeof import('node:fs')>();
@@ -43,6 +43,17 @@ describe('daemon state is replaced, never rewritten in place', () => {
 
     const others = () => fs.readdirSync(directory).filter((name) => name !== 'daemon.state.json');
     const pidOnDisk = () => JSON.parse(fs.readFileSync(stateFile, 'utf-8')).pid as number;
+
+    it('keeps connection health recorded while a session state write is queued', async () => {
+        const initial = state(111);
+        let connection: Pick<DaemonLocallyPersistedState, 'socketConnected'> = {};
+        writeDaemonState(initial);
+        writeDaemonStateDebounced(() => ({ ...initial, ...connection, lastHeartbeat: 'session saved' }));
+        connection = { socketConnected: true };
+        writeDaemonState({ ...initial, ...connection });
+        flushDaemonState();
+        expect(await readDaemonState()).toMatchObject({ socketConnected: true, lastHeartbeat: 'session saved' });
+    });
 
     it.skipIf(process.platform === 'win32')('swaps in a new owner-only file so a concurrent reader sees the old or the new state, never a partial one', () => {
         writeDaemonState(state(111));

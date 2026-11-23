@@ -1,11 +1,12 @@
 import { decodeBase64, encodeBase64, encodeBase64Url } from "@/api/encryption";
 import { configuration } from "@/configuration";
 import { randomBytes } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import tweetnacl from 'tweetnacl';
 import axios from 'axios';
 import { displayQRCode } from "./qrcode";
 import { delay } from "@/utils/time";
-import { writeCredentialsLegacy, readCredentials, updateSettings, Credentials, writeCredentialsDataKey, provisionLegacyMachineKey, readPersistedSessions, readMachineIdentity, writeMachineIdentity, writePrivateFileSync } from "@/persistence";
+import { writeCredentialsLegacy, readCredentials, readSettings, updateSettings, Credentials, writeCredentialsDataKey, provisionLegacyMachineKey, readPersistedSessions, readMachineIdentity, writeMachineIdentity, writePrivateFileSync } from "@/persistence";
 import { buildMachineIdentity, reusableDataKeyMachineKey, reusableMachineId } from "@/machineIdentity";
 import { planDataKeyOnboarding } from "@/datakey/onboarding";
 import { existsSync, readFileSync } from "node:fs";
@@ -306,17 +307,18 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
     // Server machine entity will be created either by the daemon or by the CLI
     // specs/machine-identity-reuse — the same account comes back as the same machine.
     const identity = readMachineIdentity();
-    const settings = await updateSettings(async s => {
-        if (newAuth || !s.machineId) {
+    let settings = await readSettings();
+    if (newAuth || !settings.machineId) {
+        settings = await updateSettings(s => {
+            if (!newAuth && s.machineId) return s;
             const reused = reusableMachineId(identity, credentials!);
             if (reused) logger.debug(`[AUTH] Reusing machine ID from the previous login of this account`);
             return {
                 ...s,
                 machineId: reused ?? randomUUID()
             };
-        }
-        return s;
-    });
+        });
+    }
 
     logger.debug(`[AUTH] Machine ID: ${settings.machineId}`);
 
@@ -374,7 +376,8 @@ export async function authAndSetupMachineIfNeeded(): Promise<{
     }
 
     try {
-        writeMachineIdentity(buildMachineIdentity(settings.machineId!, credentials, identity));
+        const nextIdentity = buildMachineIdentity(settings.machineId!, credentials, identity);
+        if (!isDeepStrictEqual(identity, nextIdentity)) writeMachineIdentity(nextIdentity);
     } catch (e) {
         // Only the next re-login's reuse is lost; this login is complete.
         logger.debug('[AUTH] Could not record machine identity — the next re-login registers a new machine', e);

@@ -19,6 +19,7 @@ import { isSessionDigestMcpInvocation } from './utils/sessionDigestMcpInvocation
 import { execSync, type ChildProcess } from 'node:child_process';
 import { spawn as crossSpawn } from 'cross-spawn';
 import { createInterface, type Interface as ReadlineInterface } from 'node:readline';
+import { resolve } from 'node:path';
 import { logger } from '@/ui/logger';
 import { createProviderExitObserver, type ProviderExitObserver } from '@/managed/managedProviderExitObserver';
 import { probeProcessGroup } from '@/daemon/managedProcessGroup';
@@ -31,8 +32,13 @@ import { CodexSubagentTracker, type CodexSubagentSpawn } from './codexSubagentTr
 import { readCodexOutput } from './codexOutputReader';
 import { resolveCodexStateEnvironment } from './codexStateRecovery';
 import { bindCodexThreadToProject } from './codexProjectBinding';
+import { hasNoNativeHooks, permitsPreparedSessionLinks } from './codexPreparedSessionLinks';
+import type { SessionLinks } from '@/utils/sessionUrlEnv';
+import {
+    applyCodexAppServerLogFilter, codexAppServerArgs, codexAppServerInitialization,
+    resolveCodexAppServerBaseEnvironment, type PreparedCodexAppServer,
+} from './preparedCodexAppServer';
 import type {
-    InitializeParams,
     NewConversationParams,
     NewConversationResponse,
     ResumeConversationParams,
@@ -77,7 +83,6 @@ import { AGENT_PLAN_PROVIDER_ID } from '@/launcher/agentPlanLaunch';
 import { initializeSandbox, wrapForMcpTransport } from '@/sandbox/manager';
 import { MandatorySandboxError, resolveSandboxInitFailureAction, type SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { describeSandboxCapabilityFailure, verifySandboxExecutionCapability } from '@/sandbox/executionCapability';
-import packageJson from '../../package.json';
 import { resolveCodexSandboxPolicy } from './executionPolicy';
 import { CodexAuthRecoveryError, type CodexAuthCheck, type CodexAuthSource } from './codexAuthRecovery';
 import { sanitizeChildEnv } from '@/utils/childEnv';
@@ -364,6 +369,7 @@ export class CodexAppServerClient {
     private usageCoverage = new Map<string, { snapshot: boolean; response: boolean }>();
     private usageCoverageGapThreads = new Set<string>();
     private processEpoch = 0;
+    private deferredPluginConfig: { cwd: string; enabled: boolean; sessionLinks?: SessionLinks } | null = null;
     private connected = false;
     private sandboxConfig?: SandboxConfig;
     private readonly sandboxPolicyMode: SandboxPolicyMode;
@@ -1305,7 +1311,7 @@ export class CodexAppServerClient {
 
     // ─── Lifecycle ──────────────────────────────────────────────
 
-    async connect(): Promise<void> {
+    async connect(checkedCliVersion?: string, prepared?: PreparedCodexAppServer): Promise<void> {
         const scopeConfirmation = takeScopeConfirmation();
         const revision = this.disconnectRevision;
         this.assertInputOpen();
@@ -1316,7 +1322,7 @@ export class CodexAppServerClient {
             await this.cleanupMultiAuthProxy();
         }
 
-        const codexVersion = readCodexCliVersion();
+        const codexVersion = (checkedCliVersion && parseCodexCliVersion(checkedCliVersion)) || readCodexCliVersion();
         if (!isAppServerAvailable(codexVersion)) {
             throw new Error(
                 'Codex CLI is not installed\n\n' +
@@ -1329,8 +1335,7 @@ export class CodexAppServerClient {
 
         // Build env — same filtering as the old MCP client
         // The agent works inside this session: lineage and spawn seeds stop here.
-        let env: Record<string, string> = sanitizeChildEnv(process.env, { boundary: 'in-session' });
-        env = await resolveCodexStateEnvironment({ ...env, ...this.startupEnvironment });
+        let env = await resolveCodexAppServerBaseEnvironment(process.env, this.startupEnvironment);
         if (!this.managedProviderArgs && !this.agentPlanProviderArgs) {
             // Account rotation swaps in another account's proxy, its own
             // client key and its own base URL. For a managed run that is a
@@ -1349,10 +1354,7 @@ export class CodexAppServerClient {
 
         let command = 'codex';
         let args = [
-            'app-server',
-            '--listen',
-            'stdio://',
-            '-c', 'features.default_mode_request_user_input=true',
+            ...codexAppServerArgs,
             ...(this.managedProviderArgs ?? this.agentPlanProviderArgs ?? this.multiAuthProxy?.args ?? []),
             ...(this.isolatedAutomationContext ? ['-c', 'memories.use_memories=false', '-c', 'memories.generate_memories=false',
                 '-c', 'features.memories=false', '-c', 'features.hooks=false'] : []),
@@ -1403,12 +1405,7 @@ export class CodexAppServerClient {
         }
 
         // Mute noisy rollout list logging
-        const filter = 'codex_core::rollout::list=off';
-        if (!env.RUST_LOG) {
-            env.RUST_LOG = filter;
-        } else if (!env.RUST_LOG.includes('codex_core::rollout::list=')) {
-            env.RUST_LOG += `,${filter}`;
-        }
+        applyCodexAppServerLogFilter(env);
         // The native seatbelt marker disables Codex's model proxy path on Linux.
         // Linux remains protected by the external bubblewrap wrapper.
         if (this.sandboxEnabled && process.platform === 'darwin') {
@@ -1430,10 +1427,24 @@ export class CodexAppServerClient {
         // Native child_process.spawn fails with ENOENT for .cmd shims (issues #980, #1016).
         let proc: ReturnType<typeof crossSpawn>;
         const observeExit = this.isolatedAutomationContext || this.workspaceExitObservation;
+        let alreadyInitialized = false;
         try {
+            const launch = { command, args, env, cwd: process.cwd() };
+            const reusable = !scopeConfirmation && !this.sandboxConfig?.enabled && !this.protectedWriterTree
+                && !observeExit && !this.managedProviderArgs && !this.agentPlanProviderArgs && !this.multiAuthProxy;
             this.assertInputOpen();
             if (revision !== this.disconnectRevision) throw new Error('Codex connection cancelled by disconnect');
-            proc = crossSpawn(command, args, {
+            const ready = reusable ? prepared?.claim(launch) : undefined;
+            alreadyInitialized = ready !== undefined;
+            if (prepared) logger.debug(`[timing] codex prepared app-server ${ready ? 'claimed' : 'discarded'}`);
+            this.deferredPluginConfig = ready && typeof prepared?.pluginsEnabled === 'boolean'
+                ? { cwd: resolve(launch.cwd), enabled: prepared.pluginsEnabled, sessionLinks: prepared.sessionLinks } : null;
+            if (prepared && !ready) {
+                await prepared.dispose();
+                this.assertInputOpen();
+                if (revision !== this.disconnectRevision) throw new Error('Codex connection cancelled by disconnect');
+            }
+            proc = ready ?? crossSpawn(command, args, {
                 stdio: ['pipe', 'pipe', 'pipe'],
                 env,
                 windowsHide: true,
@@ -1535,23 +1546,10 @@ export class CodexAppServerClient {
             });
         }
 
-        // Perform initialize handshake
-        const initParams: InitializeParams = {
-            clientInfo: {
-                name: 'happy-codex',
-                title: 'Happy Codex Client',
-                version: packageJson.version,
-            },
-            capabilities: {
-                experimentalApi: true,
-                // Raw events are on for `rawResponse/completed` only; the items they also carry are never read.
-                optOutNotificationMethods: ['rawResponseItem/completed'],
-            },
-        };
         try {
-            await this.request('initialize', initParams);
+            if (!alreadyInitialized) await this.request('initialize', codexAppServerInitialization);
             if (revision !== this.disconnectRevision) throw new Error('Codex connection cancelled by disconnect');
-            this.notify('initialized');
+            if (!alreadyInitialized) this.notify('initialized');
             this.initializedEpoch = epoch;
             this.connected = true;
             this.subagentTrackingAvailable = isSubagentTrackingAvailable(codexVersion);
@@ -1847,6 +1845,7 @@ export class CodexAppServerClient {
             }
 
             this.process = null;
+            this.deferredPluginConfig = null;
             this.connected = false;
             this._turnId = null;
             this.notificationProtocol = 'unknown';
@@ -1984,12 +1983,35 @@ export class CodexAppServerClient {
         return servers as Record<string, unknown>;
     }
 
+    private async canSupplyPreparedSessionLinks(cwd: string, mcpServers?: Record<string, unknown>): Promise<boolean> {
+        try {
+            // MCPs can explicitly inherit process variables. Thread shell settings do not reach them.
+            if (/APLUS_SESSION_(?:ID|URL)/i.test(JSON.stringify(mcpServers ?? {}))) return false;
+            const [config, requirements, hooks] = await Promise.all([
+                this.request('config/read', { cwd, includeLayers: false }, 3000),
+                this.request('configRequirements/read', undefined, 3000),
+                this.request('hooks/list', { cwds: [cwd] }, 3000),
+            ]);
+            return permitsPreparedSessionLinks(config, requirements) && hasNoNativeHooks(hooks, cwd);
+        } catch { return false; }
+    }
+
     private async buildThreadConfig(
         mcpServers?: Record<string, unknown>,
         writableRoots?: readonly string[],
         cwd = process.cwd(),
     ): Promise<Record<string, unknown> | null> {
-        const config: Record<string, unknown> = {};
+        const prepared = this.deferredPluginConfig;
+        if (prepared && (prepared.cwd !== resolve(cwd)
+            || (prepared.sessionLinks && !await this.canSupplyPreparedSessionLinks(cwd, mcpServers)))) {
+            await this.disconnectInternal({ awaitProcessExit: true, preserveThreadState: true });
+            await this.connect();
+        }
+        const config: Record<string, unknown> = this.deferredPluginConfig
+            ? { features: { plugins: this.deferredPluginConfig.enabled } } : {};
+        if (this.deferredPluginConfig?.sessionLinks) {
+            config.shell_environment_policy = { set: this.deferredPluginConfig.sessionLinks };
+        }
         // Never log this response: native config can contain credentials.
         let nativeRead: Promise<unknown> | null = null;
         const readNativeServers = () => nativeRead ??= (this.request('config/read', { cwd, includeLayers: false }, 3000) as Promise<{
@@ -2343,7 +2365,7 @@ export class CodexAppServerClient {
         return turns;
     }
 
-    async listMcpServerStatus(opts: { threadId: string; serverNames?: string[]; measureServer?: <T>(action: () => Promise<T>) => Promise<T> }): Promise<ListMcpServerStatusResponse> {
+    async listMcpServerStatus(opts: { threadId: string; serverNames?: string[]; signal?: AbortSignal; measureServer?: <T>(action: () => Promise<T>) => Promise<T> }): Promise<ListMcpServerStatusResponse> {
         const data: ListMcpServerStatusResponse['data'] = [];
         // A selected server reads the current thread runtime; an unscoped
         // request builds a separate status-only snapshot in Codex 0.160.0.
@@ -2355,6 +2377,7 @@ export class CodexAppServerClient {
                 let cursor: string | null = null;
                 const seenCursors = new Set<string>();
                 do {
+                    opts.signal?.throwIfAborted();
                     const params: ListMcpServerStatusParams = {
                         threadId: opts.threadId,
                         ...(serverName === undefined ? {} : { serverName }),
@@ -3152,6 +3175,9 @@ export class CodexAppServerClient {
 
     /** Default timeout for RPC requests (ms). */
     private static readonly REQUEST_TIMEOUT_MS = 30_000;
+    // A cold Windows thread can take over 30s even with the native Codex configuration.
+    // Keep the original request pending through startup so a late reply still owns its thread.
+    private static readonly WINDOWS_THREAD_START_TIMEOUT_MS = 60_000;
 
     private request(method: string, params?: unknown, timeoutMs?: number,
         dispatch?: { beforeDispatch?: () => void; onDispatched?: () => void }): Promise<unknown> {
@@ -3161,7 +3187,9 @@ export class CodexAppServerClient {
         // The private workspace drain still needs a fresh read-only background snapshot after input freeze.
         const workspaceBackgroundRead = this.workspaceExitObservation && method === 'thread/backgroundTerminals/list';
         if (this.shutdownInputFrozen && method !== 'turn/interrupt' && !workspaceBackgroundRead) return Promise.reject(new Error('Codex input is frozen for shutdown'));
-        const timeout = timeoutMs ?? CodexAppServerClient.REQUEST_TIMEOUT_MS;
+        const timeout = timeoutMs ?? (method === 'thread/start' && process.platform === 'win32'
+            ? CodexAppServerClient.WINDOWS_THREAD_START_TIMEOUT_MS
+            : CodexAppServerClient.REQUEST_TIMEOUT_MS);
         return new Promise((resolve, reject) => {
             if (!this.process?.stdin?.writable) {
                 reject(new Error(`Cannot send ${method}: stdin not writable`));

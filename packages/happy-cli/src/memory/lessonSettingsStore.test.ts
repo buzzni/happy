@@ -7,6 +7,22 @@ import { describe, expect, it } from 'vitest';
 
 import { createLessonReviewOutcomeStore, createLessonSettingsStore } from './lessonSettingsStore';
 
+it('starts with both project lesson features off and preserves independently saved choices', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'lesson-opt-in-'));
+    const path = join(dir, 'settings.json');
+    try {
+        const store = createLessonSettingsStore(path);
+        const defaults = await store.read();
+        expect(defaults).toMatchObject({ recallEnabled: false, reviewEnabled: false });
+        await expect(readFile(path)).rejects.toMatchObject({ code: 'ENOENT' });
+        for (const [recallEnabled, reviewEnabled] of [[true, false], [false, true], [false, false]]) {
+            const { revision, dailyMicroUsd, dailyTokens } = await store.read();
+            expect(await store.write({ expectedRevision: revision, recallEnabled, reviewEnabled, dailyMicroUsd, dailyTokens })).toMatchObject({ ok: true });
+            expect(await createLessonSettingsStore(path).read()).toMatchObject({ recallEnabled, reviewEnabled });
+        }
+    } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
 describe('createLessonReviewOutcomeStore', () => {
     it('keeps the refusal reason next to the outcome without changing what read() reports', async () => {
         const dir = await mkdtemp(join(tmpdir(), 'lesson-outcome-'));

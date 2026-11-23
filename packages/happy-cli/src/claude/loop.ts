@@ -10,7 +10,7 @@ import { Session } from "./session"
 import type { LessonSessionHost } from '@/memory/lessonSessionHost'
 import { claudeLocalLauncher, LauncherResult } from "./claudeLocalLauncher"
 import { claudeRemoteLauncher } from "./claudeRemoteLauncher"
-import { ApiClient } from "@/lib"
+import type { ApiClient } from "@/api/api"
 import type { JsRuntime } from "./runClaude"
 import type { SandboxConfig } from "@/persistence"
 import type { SandboxPolicyMode } from "@/sandbox/sandboxPolicy"

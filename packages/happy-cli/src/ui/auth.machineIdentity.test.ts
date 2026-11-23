@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
@@ -39,6 +39,15 @@ describe('authAndSetupMachineIfNeeded machine identity', () => {
     const result = await authAndSetupMachineIfNeeded()
     expect(result.machineId).toBe('machine-before-logout')
     expect(JSON.parse(readFileSync(join(home, 'settings.json'), 'utf8')).machineId).toBe('machine-before-logout')
+  })
+
+  it('reuses an already configured machine without rewriting its settings or identity on each chat', async () => {
+    const first = await authAndSetupMachineIfNeeded()
+    const files = ['settings.json', 'machine-identity.json'].map(name => join(home, name))
+    for (const file of files) utimesSync(file, 1234567890, 1234567890)
+    const before = files.map(file => statSync(file).mtimeMs)
+    expect((await authAndSetupMachineIfNeeded()).machineId).toBe(first.machineId)
+    expect(files.map(file => statSync(file).mtimeMs)).toEqual(before)
   })
 
   it('registers a new machine for another account and records it', async () => {

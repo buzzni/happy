@@ -10,12 +10,10 @@ import { homedir } from 'node:os'
 import { isAbsolute, join } from 'node:path'
 import type { QueryOptions, QueryPrompt, SDKMessage } from './types'
 import type { SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
-import { ensureLocalProxyBypass } from '../utils/proxyBypass'
-import { resolveHappyEntrypoint } from './happyEntrypoint'
+import { claudeSdkEnvironment, takeClaudeDraft } from './preparedClaudeDraft'
 import { queryWithPinnedCredential, queryWithPinnedEndpoint } from './credentialPin'
 import { foldModelToOrgEndpoint } from '../utils/orgEndpointModel'
 import { orgEndpointRoutingSettingsEnv } from '../utils/orgEndpointEnvKeys'
-import { sanitizeChildEnv } from '@/utils/childEnv'
 import { RECALL_OWNER_ENV } from '@/memory/recallOwnerMarker'
 import { LESSON_OWNER_ENV } from '@/memory/lessonOwnerMarker'
 
@@ -27,7 +25,32 @@ const isolatedMemoryEnvironment = Object.freeze({
  * Wraps the official SDK query() with our QueryOptions adapter
  */
 export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): Query {
-    const opts = params.options
+    return launchQuery(params, buildSdkOptions(params.options));
+}
+
+/** The first remote turn is the only caller allowed to consume a parked conversation process. */
+export async function queryForConversation(params: { prompt: AsyncIterable<SDKUserMessage>; options?: QueryOptions }): Promise<Query> {
+    const lease = takeClaudeDraft();
+    if (!lease) return query(params);
+    let options: Options;
+    try { options = buildSdkOptions(params.options); }
+    catch (error) { await lease.dispose(); throw error; }
+    const env = options.env ?? {};
+    // These routes must retain their existing live credential pin before any input is read.
+    if (params.options?.personalClaudeAuth || env.HAPPY_AI_AUTH_SOURCE === 'org-bundle' || isPinnedModelSource(env)) {
+        await lease.dispose();
+    } else {
+        const response = await lease.claim(options, params.prompt);
+        if (response) {
+            console.error(`[draft-timing] provider-claimed provider=claude pid=${process.pid} at=${Date.now()}`);
+            return response;
+        }
+    }
+    console.error(`[draft-timing] provider-discarded provider=claude pid=${process.pid} at=${Date.now()}`);
+    return launchQuery(params, options);
+}
+
+function buildSdkOptions(opts: QueryOptions | undefined): Options {
     const endpointRouting = orgEndpointRoutingSettingsEnv(process.env)
     const settings = resolveSettings(opts, endpointRouting)
 
@@ -91,13 +114,9 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
     // CLAUDE_CODE_ENTRYPOINT="sdk-ts" and the picker would hide every Happy
     // session. See slopus/happy#1202.
     // The agent works inside this session: lineage and spawn seeds stop here.
-    const env: Record<string, string> = sanitizeChildEnv(process.env, { boundary: 'in-session' })
-    env.CLAUDE_CODE_ENTRYPOINT = resolveHappyEntrypoint(process.env.CLAUDE_CODE_ENTRYPOINT)
+    const env = claudeSdkEnvironment(process.env, !!opts?.mcpServers && Object.keys(opts.mcpServers).length > 0)
     if (opts?.isolatedAutomationContext) Object.assign(env, isolatedMemoryEnvironment)
     if (opts?.emitSessionStateEvents) env.CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS = '1'
-    if (opts?.mcpServers && Object.keys(opts.mcpServers).length > 0) {
-        ensureLocalProxyBypass(env)
-    }
     if (['platform-plan', 'platform-plan-pending'].includes(env.HAPPY_AI_AUTH_SOURCE ?? '')) {
         sdkOptions.disallowedTools = [...new Set([...(sdkOptions.disallowedTools ?? []), 'WebSearch'])]
         sdkOptions.effort = 'medium'
@@ -121,9 +140,14 @@ export function query(params: { prompt: QueryPrompt; options?: QueryOptions }): 
         }
     }
 
-    if (opts?.personalClaudeAuth) return queryWithPinnedCredential(sdkQuery, {
+    return sdkOptions;
+}
+
+function launchQuery(params: { prompt: QueryPrompt; options?: QueryOptions }, sdkOptions: Options): Query {
+    const env = sdkOptions.env!;
+    if (params.options?.personalClaudeAuth) return queryWithPinnedCredential(sdkQuery, {
         prompt: params.prompt as string | AsyncIterable<SDKUserMessage>, options: sdkOptions,
-    }, opts.personalClaudeAuth.oauthToken)
+    }, params.options.personalClaudeAuth.oauthToken)
 
     // The daemon already selected this session's organization OAuth token. Pin it after
     // filesystem settings load too: settings.env can otherwise replace the spawn's token.

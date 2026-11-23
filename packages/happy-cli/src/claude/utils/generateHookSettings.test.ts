@@ -1,8 +1,14 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import { configuration } from '@/configuration';
+import { projectPath } from '@/projectPath';
+import { sessionToolPolicyHookFiles } from '@/toolPolicy/claudeHook';
 import { ORG_ENDPOINT_CLEARED_ENV_KEYS, orgEndpointRoutingSettingsEnv } from './orgEndpointEnvKeys';
 import { buildHookSettings, cleanupHookSettingsFile, generateHookSettingsFile, toolPolicyHookCommands } from './generateHookSettings';
 import { resolveMachineLockdownPolicy } from '@/daemon/machineLockdownPolicy';
+import { buildSessionHookSettings } from './sessionHookSettings';
 
 const base = { hookCommand: 'node fwd 1234', broadKillGuardCommand: 'node guard', homeDir: '/home/trial' };
 
@@ -61,10 +67,11 @@ describe('buildHookSettings', () => {
 
     it('passes protected directories and the skill lock file beside the policy file to the file guard', () => {
         const input = { execPath: '/n', scriptsDir: '/s', port: 1, secretFile: '/sec', policyFile: '/h/tool-policy.json' };
-        const skillLocks = ' --skill-locks "/h/skill-locks.json" --hook 1 "/sec"';
-        expect(toolPolicyHookCommands(input).fileGuardCommand).toBe(`"/n" "/s/tool_policy_file_guard.cjs" "/h/tool-policy.json"${skillLocks}`);
+        const skillLocks = ` --skill-locks "${join('/h', 'skill-locks.json')}" --hook 1 "/sec"`;
+        const fileGuard = `"/n" "${join('/s', 'tool_policy_file_guard.cjs')}" "/h/tool-policy.json"`;
+        expect(toolPolicyHookCommands(input).fileGuardCommand).toBe(`${fileGuard}${skillLocks}`);
         expect(toolPolicyHookCommands({ ...input, protectedDirs: ['/h/org-requirements'] }).fileGuardCommand)
-            .toBe(`"/n" "/s/tool_policy_file_guard.cjs" "/h/tool-policy.json" --dir "/h/org-requirements"${skillLocks}`);
+            .toBe(`${fileGuard} --dir "/h/org-requirements"${skillLocks}`);
     });
 
     // aplus specs/org-llm-endpoints r2 — the terminal's Claude reads settings files the daemon cannot pin live.
@@ -91,6 +98,21 @@ describe('buildHookSettings', () => {
 // The unit setup points HAPPY_HOME_DIR at a temporary directory, so this writes nothing outside it.
 describe('generateHookSettingsFile for an organization LLM endpoint session', () => {
     afterEach(() => { vi.unstubAllEnvs(); });
+
+    it('builds identical policy hooks before the draft worker has a session secret', () => {
+        const port = 4321;
+        const toolPolicy = sessionToolPolicyHookFiles(configuration.happyHomeDir);
+        const prepared = buildSessionHookSettings({ installRoot: projectPath(), execPath: process.execPath,
+            homeDir: homedir(), env: process.env, port, toolPolicy, disableBypassPermissions: true });
+        expect(existsSync(toolPolicy.secretFile)).toBe(false);
+        const path = generateHookSettingsFile(port, toolPolicy, { disableBypassPermissions: true });
+        try {
+            expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual(prepared);
+            expect(JSON.stringify(prepared)).toContain('policy_hook_forwarder.cjs');
+            expect(JSON.stringify(prepared)).toContain('tool_policy_file_guard.cjs');
+            expect(existsSync(toolPolicy.secretFile)).toBe(false);
+        } finally { cleanupHookSettingsFile(path); }
+    });
 
     it('writes the routing block from the session environment into the file Claude gets as --settings, without the token', () => {
         vi.stubEnv('HAPPY_AI_AUTH_SOURCE', 'org-endpoint');

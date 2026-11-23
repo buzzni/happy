@@ -9,42 +9,13 @@
 
 import chalk from 'chalk'
 import net from 'node:net'
-import path from 'node:path'
-import { existsSync, readFileSync } from 'node:fs'
 import { configuration } from '@/configuration'
 import { readDaemonState } from '@/persistence'
-import { projectPath } from '@/projectPath'
 import { readOrCreateBrowserBridgeToken } from '@/daemon/browserBridgeToken'
 import { fetchBrowserStatus } from '@/daemon/browserClient'
 import { DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from '@/daemon/browserBridgeServer'
-import { computeChromeExtensionId } from './browserExtensionId'
-
-/**
- * Where to point the user at the extension's source.
- *
- * An installed happy-cli has the extension bundled alongside it (built by
- * scripts/copy-browser-extension.cjs, shipped via package.json "files") —
- * that's the common case and takes priority. Running from the monorepo
- * source tree (no build step run) has no bundled copy, so fall back to the
- * sibling package. Without this fallback, dev checkouts print a path that
- * doesn't exist — which is exactly the bug that prompted this function.
- */
-export function resolveExtensionDir(): string {
-    const bundled = path.join(projectPath(), 'browser-extension')
-    if (existsSync(path.join(bundled, 'manifest.json'))) return bundled
-    return path.join(projectPath(), '..', 'happy-browser-extension')
-}
-
-/**
- * manifest.json pins a "key", which fixes the extension's id regardless of
- * which path it was loaded from — that's what lets us build a working
- * chrome-extension://<id>/... link before the extension has ever reported
- * anything back to the daemon.
- */
-export function resolveExtensionId(extensionDir: string): string {
-    const manifest = JSON.parse(readFileSync(path.join(extensionDir, 'manifest.json'), 'utf8')) as { key: string }
-    return computeChromeExtensionId(manifest.key)
-}
+import { resolveExtensionDir, resolveExtensionId } from './browserExtensionId'
+export { resolveExtensionDir, resolveExtensionId } from './browserExtensionId'
 
 export interface BrowserStatusInput {
     token: string

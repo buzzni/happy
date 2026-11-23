@@ -207,12 +207,13 @@ describe('foreground lesson proposals', () => {
         expect(h.host.calls).toHaveLength(0);
         await rm(h.dir, { recursive: true, force: true });
     });
-    it('defaults new projects on without overwriting an explicit off', async () => {
+    it('keeps proposal capture off for both a saved opt-out and a new project', async () => {
         const h = await harness({}, false);
         expect((await h.settings.read()).reviewEnabled).toBe(false);
         await rm(join(h.dir, 'settings.json'));
-        expect(await h.worker.prepareReviewTurn!()).toEqual({ revision: 1 });
-        expect(await h.worker.reviewFinishedTurn({ ...input(), settingsRevision: 1 })).toBe('reviewed');
+        expect(await h.worker.prepareReviewTurn!()).toBeNull();
+        expect(await h.worker.reviewFinishedTurn({ ...input(), settingsRevision: 1 })).toBe('disabled');
+        expect(h.host.calls).toHaveLength(0);
         await rm(h.dir, { recursive: true, force: true });
     });
     it.each([

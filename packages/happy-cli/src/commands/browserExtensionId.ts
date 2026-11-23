@@ -1,4 +1,19 @@
 import { createHash } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
+import path from 'node:path'
+import { projectPath } from '@/projectPath'
+
+/** Installed packages bundle the extension. Source checkouts can use its sibling package. */
+export function resolveExtensionDir(): string {
+    const bundled = path.join(projectPath(), 'browser-extension')
+    if (existsSync(path.join(bundled, 'manifest.json'))) return bundled
+    return path.join(projectPath(), '..', 'happy-browser-extension')
+}
+
+export function resolveExtensionId(extensionDir: string): string {
+    const manifest = JSON.parse(readFileSync(path.join(extensionDir, 'manifest.json'), 'utf8')) as { key: string }
+    return computeChromeExtensionId(manifest.key)
+}
 
 /**
  * Reproduces Chrome's extension id derivation: SHA-256 of the DER-encoded

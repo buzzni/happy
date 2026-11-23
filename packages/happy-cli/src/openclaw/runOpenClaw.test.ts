@@ -74,7 +74,7 @@ vi.mock('@/api/api', () => ({
   ApiClient: { create: mocks.mockApiCreate },
 }));
 
-vi.mock('@/daemon/run', () => ({
+vi.mock('@/daemon/initialMachineMetadata', () => ({
   initialMachineMetadata: {
     host: 'host', platform: 'darwin', happyCliVersion: 'test',
     homeDir: '/tmp', happyHomeDir: '/tmp/.happy', happyLibDir: '/tmp/happy',

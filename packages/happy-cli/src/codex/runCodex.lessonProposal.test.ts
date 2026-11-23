@@ -63,7 +63,7 @@ vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: vi.fn() }));
 vi.mock('@/persistence', async (original) => ({ ...await original<typeof import('@/persistence')>(), readSettings: vi.fn(async () => ({ machineId: 'machine' })) }));
 vi.mock('@/api/api', () => ({ ApiClient: { create: vi.fn(async () => ({ getOrCreateMachine: vi.fn(), getOrCreateSession: vi.fn(async () => ({ id: 'lesson-session' })) })) } }));
 vi.mock('@/utils/setupOfflineReconnection', () => ({ setupOfflineReconnection: () => ({ session: fixture.session }) }));
-vi.mock('@/daemon/run', () => ({ initialMachineMetadata: {} }));
+vi.mock('@/daemon/initialMachineMetadata', () => ({ initialMachineMetadata: {} }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionStarted: vi.fn(async () => ({})) }));
 vi.mock('@/checkpoint/checkpointSessionComposition', () => ({ createCheckpointSessionComposition: vi.fn(async () => ({})) }));
 vi.mock('@/codex/codexSkills', () => ({ discoverCodexSkillCommands: vi.fn(async () => []) }));

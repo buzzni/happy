@@ -29,7 +29,7 @@ vi.mock('@/persistence', async (original) => ({
     ...await original<typeof import('@/persistence')>(),
     readSettings: vi.fn(async () => ({ machineId: 'machine-1' })),
 }));
-vi.mock('@/daemon/run', () => ({ initialMachineMetadata: {} }));
+vi.mock('@/daemon/initialMachineMetadata', () => ({ initialMachineMetadata: {} }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionStarted: vi.fn(async () => ({})) }));
 vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: vi.fn() }));
 vi.mock('@/utils/serverConnectionErrors', () => ({

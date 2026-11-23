@@ -17,7 +17,7 @@ import { installHappyCommandShim } from '@/utils/happyCommandShim';
 import { Credentials, readSettings } from '@/persistence';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
-import { initialMachineMetadata } from '@/daemon/run';
+import { initialMachineMetadata } from '@/daemon/initialMachineMetadata';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
 import { MessageQueue2 } from '@/utils/MessageQueue2';

@@ -18,7 +18,7 @@ export type CodexMcpServerInventory = {
 
 type CodexMcpRuntimeClient = {
     getMcpStartupStatuses: () => CodexMcpStartupStatus[];
-    listMcpServerStatus: (opts: { threadId: string; serverNames?: string[]; measureServer?: <T>(action: () => Promise<T>) => Promise<T> }) => Promise<{
+    listMcpServerStatus: (opts: { threadId: string; serverNames?: string[]; signal?: AbortSignal; measureServer?: <T>(action: () => Promise<T>) => Promise<T> }) => Promise<{
         data: CodexMcpServerInventory[];
         nextCursor?: string | null;
     }>;
@@ -127,7 +127,7 @@ export class CodexMcpRuntimeRecovery {
     }
 
     /** Read-only: normal readiness must be visible even when no recovery ran. */
-    async readStatuses(input: RecoveryInput): Promise<McpRuntimeServerStatus[]> {
+    async readStatuses(input: RecoveryInput, signal?: AbortSignal): Promise<McpRuntimeServerStatus[]> {
         // An empty reporting scope always yields []; querying all configured
         // app-server MCPs here can wait for unrelated startup on every turn.
         if (input.expectedServerNames.length === 0) return [];
@@ -142,7 +142,7 @@ export class CodexMcpRuntimeRecovery {
         }
         let inventory: Map<string, CodexMcpServerInventory> | undefined;
         try {
-            const result = await this.client.listMcpServerStatus({ threadId: input.threadId, serverNames: input.expectedServerNames });
+            const result = await this.client.listMcpServerStatus({ threadId: input.threadId, serverNames: input.expectedServerNames, ...(signal ? { signal } : {}) });
             inventory = new Map(result.data.map((entry) => [entry.name, entry]));
         } catch {
             // No inventory is unknown, never proof of a healthy connection.
@@ -267,7 +267,8 @@ export class CodexMcpRuntimeRecovery {
                 // report the earlier inventory as a post-resume observation.
                 latest.runtimeStatuses = undefined;
             }
-            if (this.backoffMs > 0) {
+            // Wait before another attempt or its verification. A final rejected resume has neither.
+            if (this.backoffMs > 0 && (resumed || attempt + 1 < this.maxAttempts)) {
                 await this.measure(input, 'mcp-backoff', () => this.sleep(this.backoffMs * (attempt + 1)));
             }
             if (!resumed) continue;

@@ -1,3 +1,5 @@
+import { initialMachineMetadata } from './initialMachineMetadata';
+export { initialMachineMetadata } from './initialMachineMetadata';
 import { AGENT_PLAN_DESCRIPTOR_ENV } from '@/launcher/agentPlanLaunch';
 import { bindPersonalEndpointLease, assertPersonalEndpointWorkspace, personalEndpointEnvironment, releasePersonalEndpointEnvironment, personalEndpointMarker, PERSONAL_ENDPOINT_BINDING_ENV, type PersonalEndpointSelection } from './personalLlmEndpoint';
 
@@ -6,6 +8,7 @@ import { readBrowserTaskPidStartTime } from './browserTaskSessionOwner';
 import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
 import { createOwnedSpawnRuntime, createOwnedStartGuard } from './ownedSpawnRuntime';
+import { prewarmWindowsClaude } from './windowsClaudeEnvironment';
 import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
 import { drainBashRpcs } from '@/modules/common/bashRpcScheduler';
@@ -41,14 +44,13 @@ import { readAgentRelationHost } from './agentRelationAuthority';
 import * as tmp from 'tmp';
 import axios from 'axios';
 import * as z from 'zod';
-import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
-import { AUTOMATION_PROTOCOL_VERSION, PROJECT_PURGE_CAPABILITY, RPC_BINDING_CAPABILITY, SEALED_SPAWN_ENV_CAPABILITY, WORKSPACE_SYNC_CAPABILITY, WORKTREE_OPS_CAPABILITY } from '@slopus/happy-wire';
+import { AUTOMATION_PROTOCOL_VERSION } from '@slopus/happy-wire';
 import { createHash, randomUUID } from 'node:crypto';
 import { createScriptAutomationWorker, ScriptRequestError } from './automations/scriptAutomationWorker';
 import { prepareManagedScriptRuntime, probeManagedScriptEngine, recoverManagedScriptContainers } from './automations/managedScriptRuntime';
 import { runManagedScript } from './automations/managedScriptRunner';
 
-import { ApiClient } from '@/api/api';
+import { ApiClient } from '@/api/machineApiClient';
 import { TrackedSession, SessionEncryptionData } from './types';
 import { MachineMetadata, DaemonState, Metadata, Machine } from '@/api/types';
 import {
@@ -58,8 +60,6 @@ import {
   type SpawnSessionOptions,
   type SpawnSessionResult,
 } from '@/modules/common/registerCommonHandlers';
-import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
-import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher';
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
 import { reseedCompanyKey, settleMachineControl } from '@/datakey/machineControl';
@@ -113,7 +113,7 @@ import { isWorkerPtySession } from './terminalWorker/workerPtySession';
 import { startBrowserBridgeServer, retryBrowserBridgeServer, DEFAULT_BROWSER_BRIDGE_PORT, resolveBrowserBridgeHost } from './browserBridgeServer';
 import { readOrCreateBrowserBridgeToken } from './browserBridgeToken';
 import { prepareBrowserNativeMessaging, registerBrowserNativeHost } from './browserNativeHostRegistration';
-import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser';
+import { resolveExtensionDir, resolveExtensionId } from '@/commands/browserExtensionId';
 import { handoffToReplacedBundle, prepareDaemonStartup, resolveStatePreservation } from './handoff';
 import { createBundleReplacementWatcher, readOwnDaemonIdentity } from './daemonIdentity';
 import { daemonRestartingRefusal } from './restartDrainLifecycle';
@@ -126,10 +126,13 @@ import { stageUserCredentials, unstageUserCredentials, sweepOrphanUserHomeDirs }
 import { existsSync, statSync } from 'fs';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'path';
 import { projectPath } from '@/projectPath';
+import { DraftWorkerHost } from './draftWorkerHost';
+import { resolveConnectedClaudeDraft, resolveConnectedCodexDraft } from './connectedProviderDraft';
+import { NativeDraftWorkerHost } from './nativeDraftWorkerHost';
+import { startResidentModuleHost } from './residentModuleHost';
 import { getTmuxUtilities, isTmuxAvailable, parseTmuxSessionIdentifier, formatTmuxSessionIdentifier } from '@/utils/tmux';
 import { expandEnvironmentVariables } from '@/utils/expandEnvVars';
 import {
-  AI_AUTH_SELECTION_CAPABILITY,
   applyAppliedAiAuthSourceEnv,
   applyConfirmedPromptDeliveryFlag,
   buildManagedSessionSpawnEnvironment,
@@ -152,7 +155,7 @@ import {
   SETUP_TOKEN_BINDING_ENV,
   SETUP_TOKEN_RESUME_REBOUND_ENV,
 } from './sessionEnv';
-import { sanitizeChildEnv } from '@/utils/childEnv';
+import { RESIDENT_MODULE_HOST_ENV, sanitizeChildEnv } from '@/utils/childEnv';
 import { resolveRecoveredInputEvidenceEnvironment } from '@/utils/inputEvidenceSettings';
 import { createSetupTokenAccountSwitch, type SetupTokenAccountSwitch } from './setupTokenAccountSwitch';
 import { createOrgLlmEndpointStudioClient } from './orgLlmEndpointStudio';
@@ -167,7 +170,6 @@ import { buildResumeLaunch, resumeLaunchAgent } from '@/resume/handleResumeComma
 import { agentMcpServerNames, prepareLaunchMcpServers, type LaunchMcpRequest, type PreparedLaunchMcpServers } from '@/aplus/launchMcpServers';
 import { stageLaunchMcpServersSeedFile } from '@/aplus/launchMcpSeed';
 import { fetchAplusMcpServerNames } from '@/aplus/fetchAplusMcpServers';
-import { detectResumeSupport } from '@/resume/localHappyAgentAuth';
 import { decodeBase64, decrypt, encodeBase64, encrypt } from '@/api/encryption';
 import {
   DIFFICULTY_ROUTING_MAX_INPUT_CHARS,
@@ -202,7 +204,7 @@ import { decideResumeCursorPersist } from './resumeCursorPersistence';
 import { createSessionRetention, retentionProtects } from './sessionRetention';
 import { readStaleRuntimeRestartConfig, sweepStaleRuntimeSessions } from './staleRuntimeSessionRestart';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
-import { outputFormatSeed, STRUCTURED_OUTPUT_CAPABILITY } from '@/claude/structuredOutput';
+import { outputFormatSeed } from '@/claude/structuredOutput';
 import {
   removeDeferredContinuationContextFile,
   stageDeferredContinuationContext,
@@ -357,7 +359,7 @@ import {
   prepareMcpChildEnvironment,
   resolveResumeMcpGrantSource,
 } from './mcpCallerGrantEnvelope';
-import { AgentPlanGrantEnvelopeConsumer, agentPlanCapabilityForPlatform, prepareAgentPlanLaunch } from './agentPlanGrantEnvelope';
+import { AgentPlanGrantEnvelopeConsumer, prepareAgentPlanLaunch } from './agentPlanGrantEnvelope';
 import { agentPlanThreadsDir, isAgentPlanThread } from '@/launcher/agentPlanThreads';
 import { createSetupTokenBindingVerifier, readTrustedStudioOrigin } from './setupTokenBindingProof';
 import { createClaudeSwapSupervisor } from './claudeSwapSupervisor';
@@ -371,7 +373,6 @@ import {
   decideUntrackedSessionRecovery,
 } from './sessionRecovery';
 import {
-  ADDITIONAL_DIRECTORIES_CAPABILITY,
   prepareAdditionalDirectories,
   reapplyAdditionalDirectoriesOnResume,
 } from './additionalDirectories';
@@ -444,12 +445,6 @@ import { enforceLeaseRenewal } from './managedGenerationRearm';
 import { systemMonotonicNow } from '@/launcher/supervisor';
 import { createLauncherClient, createUnixSocketRequest } from './launch/launcherClient';
 import { defaultProvisioningDeps } from './managedRuntimeIdentity';
-import {
-  MACHINE_RUN_MAX_OUTPUT_BYTES,
-  MACHINE_RUN_MAX_TIMEOUT_MS,
-} from '@/modules/common/typedMachineRun';
-import { machineRunCapabilitySupported, TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
-import { hostManagedMachineTools } from '@/modules/common/moaiMachineRunProfiles';
 import { toolPolicyMachineCapability, toolPolicyMetadataUpdate } from '@/toolPolicy/claudeHook';
 import { orgRequirementsMachineCapability, orgRequirementsMetadataUpdate, orgScopeHintEnvironment } from '@/orgRequirements/gate';
 import { createOrgRequirementsStore } from '@/orgRequirements/store';
@@ -459,51 +454,6 @@ import { createOrgRequirementsAuditLog } from '@/orgRequirements/audit';
 function shellescape(s: string): string {
     return "'" + s.replace(/'/g, "'\\''") + "'";
 }
-
-// Prepare initial metadata
-// Suffix host with `-dev` for the HAPPY_VARIANT=dev variant so the dev daemon
-// is visually distinct from the stable one in the machine list (they otherwise
-// share the same hostname and look identical).
-const hostSuffix = process.env.HAPPY_VARIANT === 'dev' ? '-dev' : '';
-export const initialMachineMetadata: MachineMetadata = {
-  host: os.hostname() + hostSuffix,
-  platform: os.platform(),
-  happyCliVersion: packageJson.version,
-  homeDir: os.homedir(),
-  happyHomeDir: configuration.happyHomeDir,
-  happyLibDir: projectPath(),
-  resumeSupport: { ...detectResumeSupport(), rpcAvailable: true },
-  automationSupport: {
-    rpcAvailable: true,
-    sessionFollowup: true,
-    protocolVersion: AUTOMATION_PROTOCOL_VERSION,
-  },
-  additionalDirectories: ADDITIONAL_DIRECTORIES_CAPABILITY,
-  channelSupport: CHANNEL_SUPPORT_CAPABILITY,
-  aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
-  ...(agentPlanCapabilityForPlatform(process.platform) ? { agentPlan: agentPlanCapabilityForPlatform(process.platform) } : {}),
-  structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
-  writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
-  listFilesPage: LIST_FILES_PAGE_CAPABILITY,
-  permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
-  machineRun: {
-    protocolVersion: 1,
-    // The machine-scope handler installs the managed write policy (apiMachine).
-    supported: machineRunCapabilitySupported(TRUSTED_MACHINE_RUN_PROFILE_REGISTRY, process.platform, true, hostManagedMachineTools(configuration.happyHomeDir)),
-    shell: false,
-    stdin: 'none',
-    maxTimeoutMs: MACHINE_RUN_MAX_TIMEOUT_MS,
-    maxOutputLimitBytes: MACHINE_RUN_MAX_OUTPUT_BYTES,
-  },
-  rpcBinding: RPC_BINDING_CAPABILITY,
-  sealedSpawnEnv: SEALED_SPAWN_ENV_CAPABILITY,
-  worktreeOps: WORKTREE_OPS_CAPABILITY,
-  projectPurge: PROJECT_PURGE_CAPABILITY,
-  workspaceSync: WORKSPACE_SYNC_CAPABILITY,
-  ...(agentBrowserMachineCapability() ? { agentBrowser: agentBrowserMachineCapability() } : {}),
-  ...(toolPolicyMachineCapability(process.env) ? { toolPolicy: toolPolicyMachineCapability(process.env) } : {}),
-  ...(orgRequirementsMachineCapability(process.env) ? { orgRequirements: orgRequirementsMachineCapability(process.env) } : {}),
-};
 
 // Agent children import the base metadata to register their existing machine.
 // Discovering every provider here used to launch four synchronous PowerShell
@@ -726,6 +676,7 @@ export function shouldRunScriptAutomations(input: {
 }
 
 export async function startDaemon(): Promise<void> {
+  prewarmWindowsClaude(process.env);
   // Host bootstrap belongs to this incarnation, never to spawned agent children.
   const writeScopeHostEnvironment = Object.fromEntries(Object.entries(process.env)
     .filter(([key]) => key.startsWith('HAPPY_WRITE_SCOPE_HOST_')));
@@ -890,6 +841,8 @@ export async function startDaemon(): Promise<void> {
   let stopLogHousekeeping: () => void = () => undefined;
   let stopClaudeSwapSupervisor: () => void = () => undefined;
   let standaloneWindows: Awaited<ReturnType<typeof createStandaloneWindowsRuntime>>;
+  let nativeDraftWorkers: NativeDraftWorkerHost<Awaited<ReturnType<NonNullable<typeof standaloneWindows>['owner']['prepare']>>> | undefined;
+  let residentModuleHost: ReturnType<typeof startResidentModuleHost> | undefined;
   let stopUsageRecovery: () => Promise<void> = async () => undefined;
   let stopScriptWorker: () => Promise<void> = async () => undefined;
   let stopBrowserAttention: () => Promise<void> = async () => undefined;
@@ -1481,7 +1434,7 @@ export async function startDaemon(): Promise<void> {
     const getCurrentChildren = () => Array.from(pidToTrackedSession.values());
     standaloneWindows = await createStandaloneWindowsRuntime({ homeDir: configuration.happyHomeDir,
       env: process.env, managed: managedIdentity.status === 'active', getChildren: getCurrentChildren,
-      onRetired: pid => onChildExited(pid) });
+      onRetired: pid => onChildExited(pid), retireIdleDraft: () => nativeDraftWorkers?.close() });
     // Terminals run under the verified launcher in their own Job and close with the drain (W0-5h).
     if (standaloneWindows) configureWindowsTerminalHost(standaloneWindows.terminalHost);
     const contextIsolationHostEnabled = process.env.HAPPY_CONTEXT_ISOLATION_HOST !== '0'
@@ -1922,6 +1875,20 @@ export async function startDaemon(): Promise<void> {
     let releaseSetupTokenAccounts = (_managedAccountIds: string[]): void => {};
 
     const launchReadiness = createLaunchReadinessGate();
+    if (process.platform === 'win32' && !process.versions.electron && !process.versions.bun
+      && process.env.HAPPY_DISABLE_RESIDENT_MODULES !== '1') {
+      residentModuleHost = startResidentModuleHost(projectPath());
+    }
+    const allowDraftWorker = process.platform === 'win32' && !process.versions.electron
+      && managedIdentity.status !== 'active' && process.env.HAPPY_DISABLE_DRAFT_PREWARM !== '1';
+    const nativeOwner = standaloneWindows?.owner;
+    if (allowDraftWorker && nativeOwner) nativeDraftWorkers = new NativeDraftWorkerHost(projectPath(), input => nativeOwner.prepare(input));
+    const registeredDraftWorkers = allowDraftWorker && !nativeOwner
+      ? new DraftWorkerHost(projectPath(), () => {
+          const stdio = captureSpawnOutputStdio('daemon-session-startup.log', 'Preparing local draft runner');
+          return { stdio: stdio ?? 'ignore', close: () => closeCapturedSpawnOutputStdio(stdio) };
+        }) : undefined;
+    const draftWorkers = nativeDraftWorkers ?? registeredDraftWorkers;
     const ownsUnresolvedJob = (pid: number) => standaloneWindows?.owner.ownsRoot(pid) ?? false;
 
     // Spawn a new session (sessionId reserved for future --resume functionality)
@@ -2617,7 +2584,7 @@ export async function startDaemon(): Promise<void> {
           permissionMode: options.permissionMode,
           isolatedAutomation: options.filterInheritedCredentials,
         });
-        const inheritedSpawnEnvironment = resolveInheritedSpawnEnvironment({
+        const inheritedSpawnEnvironment = await resolveInheritedSpawnEnvironment({
           agent: options.agent,
           env: process.env,
           filterCredentials: filterInheritedCredentials,
@@ -2820,6 +2787,7 @@ export async function startDaemon(): Promise<void> {
             spawnEnvironment.HAPPY_SANDBOX_POLICY_MODE = 'mandatory';
           }
           return await finishSpawn(spawnTrackedHappyProcess({
+            draftRunnerId: options.draftRunnerId,
             onOwnedChild: contextOwnedChildren.get(options),
             onProcessSubmission: () => {
               if (workspaceLaunch) workspaceLaunch.submitted = true;
@@ -2861,6 +2829,7 @@ export async function startDaemon(): Promise<void> {
     };
 
     const spawnTrackedHappyProcess = async ({
+      draftRunnerId,
       onOwnedChild,
       onProcessSubmission,
       onTracked,
@@ -2879,6 +2848,7 @@ export async function startDaemon(): Promise<void> {
     }: {
       /** Internal dispatch evidence; never transported in provider env or RPC options. */
       onOwnedChild?: (child: import('node:child_process').ChildProcess) => void;
+      draftRunnerId?: string;
       onProcessSubmission?: () => void;
       onTracked?: () => void;
       onWorkspaceExit?: () => Promise<void>;
@@ -2902,16 +2872,26 @@ export async function startDaemon(): Promise<void> {
       if (standaloneWindows && (!standaloneWindows.owner.acceptingLaunches || !acceptsStandaloneWindowsLaunch(args))) {
         return { type: 'error', errorMessage: 'Windows trial launch is closed or this provider is unsupported' };
       }
+      if (residentModuleHost && draftRunnerId && args[0] === 'codex'
+        && (onOwnedChild || resumeTargetSessionId || env.HAPPY_WRITE_SCOPE_SESSION === '1'
+          || env.HAPPY_SANDBOX_POLICY_MODE === 'mandatory' || Object.keys(managedAiCredentialEnvironment ?? {}).length)) {
+        draftWorkers?.release(draftRunnerId, 'codex');
+        draftRunnerId = undefined;
+      }
       const workspaceReservation = contextWorkspace && !onOwnedChild
         ? await contextWorkspace.beginManualLaunch([cwd, ...readAdditionalDirectoriesEnvironment(env)]) : null;
       if (workspaceReservation && !workspaceReservation.acquired) return manualLaunchRefusal(workspaceReservation);
       const workspaceLaunch = { submitted: false, tracked: false };
       let exitObserved = false;
       try {
+      const residentDescriptor = args[0] === 'claude' || args[0] === 'codex' ? residentModuleHost?.descriptor() : undefined;
+      if (residentDescriptor) env = { ...env, [RESIDENT_MODULE_HOST_ENV]: residentDescriptor };
       // Native preparation creates a suspended root; authorize execution at resume below.
       const prepareStartedAt = Date.now();
       if (standaloneWindows) { workspaceLaunch.submitted = true; onProcessSubmission?.(); }
-      const prepared = standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined;
+      const nativeDraft = standaloneWindows && draftRunnerId && standaloneWindows.owner.acceptingLaunches
+        ? await nativeDraftWorkers?.claim(draftRunnerId, args, cwd, env) : null;
+      const prepared = nativeDraft ?? (standaloneWindows ? await standaloneWindows.owner.prepare({ args, cwd, env }) : undefined);
       if (prepared) logger.debug(`[timing] spawn windows-prepare ${Date.now() - prepareStartedAt}ms`);
       const scopeReports = env.HAPPY_WRITE_SCOPE_SESSION === '1' ? writeScopeRuntime?.prepareReports(resumeTargetSessionId) : undefined;
       // Protected/other providers keep their existing path; unknown writers retain custody.
@@ -2927,16 +2907,27 @@ export async function startDaemon(): Promise<void> {
       const withOwnerPipe = (base: import('child_process').SpawnOptions['stdio']) =>
         ownerLaunch?.stdio(base ?? 'ignore') ?? { stdio: base, environment: {} };
       const startupLogFileName = 'daemon-session-startup.log';
+      const draftProvider = args[0] === 'claude' || args[0] === 'codex' ? args[0] : null;
+      if (draftRunnerId && draftProvider && (ownerLaunch || scopeReports)) draftWorkers?.release(draftRunnerId, draftProvider);
+      const warm = !prepared && !scopeReports && !ownerLaunch && draftRunnerId && draftProvider
+        ? await registeredDraftWorkers?.claim(draftRunnerId, draftProvider, env) : null;
       const happyProcess = prepared?.childProcess ?? await launchManagedAiCredentialSession(launchAuthorityEnvironment,
         () => {
           const { stdio, environment: ownerEnvironment } = withOwnerPipe(scopeReports ? ['ignore', 'ignore', 'ignore', 'pipe']
             : captureSpawnOutputStdio(startupLogFileName, `session ${resumeTargetSessionId ?? 'new'} from ${cwd}`));
           try {
-            workspaceLaunch.submitted = true; onProcessSubmission?.();
             const childStdio: import('node:child_process').SpawnOptions['stdio'] = onOwnedChild || workspaceControlId
               ? [...(Array.isArray(stdio) ? stdio : [stdio ?? 'ignore', stdio ?? 'ignore', stdio ?? 'ignore']), 'ipc'] : stdio;
-            const child = spawnHappyCLI(args, { cwd, detached: true, stdio: childStdio, env: { ...env, ...scopeReports?.environment, ...ownerEnvironment,
-              ...(workspaceControlId ? { [WORKSPACE_CONTEXT_CONTROL_ENV]: workspaceControlId } : {}) } });
+            const childEnv = { ...env, ...scopeReports?.environment, ...ownerEnvironment,
+              ...(workspaceControlId ? { [WORKSPACE_CONTEXT_CONTROL_ENV]: workspaceControlId } : {}) };
+            let child: import('node:child_process').ChildProcess;
+            try {
+              workspaceLaunch.submitted = true; onProcessSubmission?.();
+              if (warm) {
+                child = warm.child;
+                warm.activate({ args, cwd, env: childEnv, keepIpc: !!(onOwnedChild || workspaceControlId) });
+              } else child = spawnHappyCLI(args, { cwd, detached: true, stdio: childStdio, env: childEnv });
+            } catch (error) { warm?.stop(); throw error; }
             if (workspaceControlId && workspaceReservation?.acquired && child.pid) {
               const reservation = workspaceReservation, pid = child.pid;
               const owned = observeWorkspaceContextChild({ child, launchId: workspaceControlId, persist: async () => {
@@ -2966,7 +2957,7 @@ export async function startDaemon(): Promise<void> {
             return child;
           }
           finally { closeCapturedSpawnOutputStdio(stdio); }
-        });
+        }).catch(error => { warm?.stop(); throw error; });
       scopeReports?.attach(happyProcess);
       ownerLaunch?.attach(happyProcess);
       const rootPid = prepared?.pid ?? happyProcess.pid;
@@ -3179,6 +3170,7 @@ export async function startDaemon(): Promise<void> {
     };
 
     type ResumeSessionOptions = {
+      draftRunnerId?: string;
       model?: string;
       /** Saycode specs/claude-org-personal-coexistence I: resume only on the recorded organization binding. */
       aiAuthRequirement?: ResumeAuthRequirement;
@@ -3522,7 +3514,7 @@ export async function startDaemon(): Promise<void> {
           : null;
 
         const resumeAgent = resumeLaunchAgent(launch);
-        const inheritedResumeEnvironment = resolveInheritedSpawnEnvironment({
+        const inheritedResumeEnvironment = await resolveInheritedSpawnEnvironment({
           agent: resumeAgent,
           env: process.env,
           filterCredentials: options?.automation !== undefined,
@@ -3707,6 +3699,7 @@ export async function startDaemon(): Promise<void> {
               env = { ...env, ...options.writeScopeEnvironment, ...scopeSelection?.environment };
             }
             return spawnTrackedHappyProcess({
+              draftRunnerId: options?.draftRunnerId,
               args: launch.args,
               cwd: launch.cwd,
               // This launch alone receives the validated reconnect lineage.
@@ -4619,6 +4612,23 @@ export async function startDaemon(): Promise<void> {
       log: (message) => logger.debug(message),
     });
     const { port: controlPort, stop: stopControlServer, controlSecret, adoptTerminals } = await startDaemonControlServer({
+      ...(draftWorkers ? { draftRunner: async (action, id, provider, targetMachine, directory) => {
+        if (targetMachine !== machineId) return false;
+        if (action === 'release') { draftWorkers.release(id, provider); return true; }
+        if (action === 'renew') return draftWorkers.renew(id, provider);
+        const ready = () => targetMachine === machineId && launchReadiness.isReady() && launchReadiness.restartDeadline() === null;
+        if (directory) {
+          if (nativeOwner && !acceptsStandaloneWindowsLaunch([provider])) return false;
+          const input = { directory, ready,
+            allowedRoot: resolveDaemonAllowedRoot(process.env, os.homedir()),
+            approvedRoots: () => resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir)?.() ?? [],
+          };
+          const scope = provider === 'claude' ? await resolveConnectedClaudeDraft(input) : resolveConnectedCodexDraft(input);
+          if (scope) return draftWorkers.prepareProvider(id, provider, scope);
+          return provider === 'claude' && ready() && isAbsolute(directory) && !directory.includes('\0') && draftWorkers.prepare(id, provider);
+        }
+        return !residentModuleHost && ready() && draftWorkers.prepare(id, provider);
+      } } : {}),
       ...(managedRuntimeActive ? {} : { sessionRetention }),
       terminalWorkers,
       restartDrain: restartDrainControlPort,
@@ -4710,15 +4720,16 @@ export async function startDaemon(): Promise<void> {
       debug: (message, details) => logger.debug(message, details),
     });
 
-    // Now that fileState is available, assign the real implementation
-    persistTrackedSessions = () => {
-      writeDaemonStateDebounced({
-        ...fileState,
-        state: 'running',
-        lastHeartbeat: new Date().toLocaleString(),
-        trackedSessions: serializeTrackedSessions(),
-      });
-    };
+    // A session write can arrive just after a heartbeat. Both writers use the
+    // latest connection sample so the session write cannot clear it again.
+    let connectionFileState: Pick<DaemonLocallyPersistedState, 'socketConnected' | 'socketDisconnectedSeconds'> = {};
+    const currentFileState = (): DaemonLocallyPersistedState => ({
+      ...fileState,
+      ...connectionFileState,
+      lastHeartbeat: new Date().toLocaleString(),
+      trackedSessions: serializeTrackedSessions(),
+    });
+    persistTrackedSessions = () => writeDaemonStateDebounced(currentFileState);
 
     // Capture the bundled CLI's mtime at startup so the heartbeat can detect
     // when npm replaces `dist/index.mjs` on disk (= the user ran `npm i -g happy`).
@@ -6309,6 +6320,8 @@ export async function startDaemon(): Promise<void> {
           await channelHost?.stop();
           await bashRpcsDrained;
           apiMachine.shutdown();
+          await draftWorkers?.close();
+          await residentModuleHost?.close();
           await stopControlServer();
           // Kept by a ready drain → left running for the replacement; otherwise closed (HR3).
           await terminalWorkers.stop();
@@ -6659,24 +6672,13 @@ export async function startDaemon(): Promise<void> {
         // this daemon can actually reach the server, not merely that its
         // process is alive — see specs/daemon-socket-watchdog/.
         const connection = apiMachine.getConnectionHealth();
-        const updatedState: DaemonLocallyPersistedState = {
-          pid: process.pid,
-          ...(fileState.windowsCandidateId ? { windowsCandidateId: fileState.windowsCandidateId } : {}),
-          ...(fileState.windowsProcessIdentity ? { windowsProcessIdentity: fileState.windowsProcessIdentity } : {}),
-          httpPort: controlPort,
-          startTime: fileState.startTime,
-          startedWithCliVersion: packageJson.version,
-          lastHeartbeat: new Date().toLocaleString(),
-          daemonLogPath: fileState.daemonLogPath,
-          state: 'running',
+        connectionFileState = {
           socketConnected: connection.connected,
           ...(connection.disconnectedForMs === null
             ? {}
             : { socketDisconnectedSeconds: Math.round(connection.disconnectedForMs / 1000) }),
-          trackedSessions: serializeTrackedSessions(),
-          controlSecret: fileState.controlSecret,
-          ...(fileState.identity ? { identity: fileState.identity } : {}),
         };
+        const updatedState = currentFileState();
         writeDaemonState(updatedState);
         if (process.env.DEBUG) {
           logger.debug(`[DAEMON RUN] Health check completed at ${updatedState.lastHeartbeat}`);
@@ -6741,6 +6743,8 @@ export async function startDaemon(): Promise<void> {
       // HR3: SIGTERM/SIGINT and plain stops close the worker terminals; an uncaught exception is a
       // crash and leaves them; `daemon stop --for-restart` keeps what its ready drain kept.
       terminalWorkers.setKeeping(keepsWorkerTerminalsOnExit({ source, readyDrainKeeps: terminalWorkers.isKeeping() }));
+      await draftWorkers?.close();
+      await residentModuleHost?.close();
       await stopControlServer();
       await terminalWorkers.stop();
       await writeScopeRuntime?.close();
@@ -6811,6 +6815,7 @@ export async function startDaemon(): Promise<void> {
     const bashRpcsDrained = drainBashRpcs();
     await stopUsageRecovery();
     await stopBrowserAttention();
+    await residentModuleHost?.close().catch(() => {});
     await standaloneWindows?.owner.close().catch(() => {});
     stopLogHousekeeping();
     stopClaudeSwapSupervisor();

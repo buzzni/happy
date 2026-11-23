@@ -8,7 +8,7 @@ type Budget = { remainingMs(): number };
 export type NativeReceipt = { launchId: string; instanceId: string; launched: boolean; resumed: boolean;
   rootExit: number | null; jobEmpty: boolean; forced: boolean; nativeError: number; ownerTerminated: boolean };
 type Prepared = { pid: number; childProcess: ChildProcess; resume(): void | Promise<void>; cancelBeforeResume?(): void; terminate?(): Promise<void>; exit: Promise<NativeReceipt> };
-type LaunchInput = { args: string[]; cwd: string; env: NodeJS.ProcessEnv };
+type LaunchInput = { args: string[]; cwd: string; env: NodeJS.ProcessEnv; draftWorker?: true };
 type Proof = { stored: boolean; releaseAcknowledged: boolean };
 type Evidence = { stored: boolean; runtimeExited: boolean; jobEmpty: boolean };
 const blocked: Evidence = { stored: false, runtimeExited: false, jobEmpty: false };
@@ -68,7 +68,7 @@ export class StandaloneSessionOwner {
   get acceptingLaunches(): boolean { return !this.frozen && !this.closed && !this.startupUnresolved; }
   launchIdForRoot(pid: number): string | undefined { return [...this.entries.values()].find(entry => !entry.retired && entry.pid === pid)?.id; }
   ownsRoot(pid: number): boolean { return this.launchIdForRoot(pid) !== undefined; }
-  prepare(input: LaunchInput): Promise<Prepared & { launchId: string }> {
+  prepare(input: LaunchInput): Promise<Prepared & { launchId: string; retired: Promise<Evidence> }> {
     if (!this.acceptingLaunches) return Promise.reject(new Error('Standalone launch gate closed'));
     const id = randomUUID();
     // Register before any asynchronous reservation so freeze includes in-flight launches.
@@ -107,7 +107,7 @@ export class StandaloneSessionOwner {
         return evidence;
       });
     start();
-    return entry.prepared.then(prepared => ({ ...prepared, launchId: id }));
+    return entry.prepared.then(prepared => ({ ...prepared, launchId: id, retired: entry.final }));
   }
   private retire(entry: Entry) {
     entry.retired = true;
@@ -206,8 +206,10 @@ export class StandaloneSessionOwner {
     return Boolean(entry && !this.closed && !entry.recoverable && (!this.frozen || (entry.attempt
       && (!entry.lastProof || (entry.lastProof.stored && entry.lastProof.releaseAcknowledged)))));
   }
-  async freeze(signal: AbortSignal, budget: Budget): Promise<{ launchIds: string[]; unresolved: boolean }> {
+  async freeze(signal: AbortSignal, budget: Budget, retireIdle?: () => Promise<void> | undefined): Promise<{ launchIds: string[]; unresolved: boolean }> {
     this.frozen = true;
+    const retirement = retireIdle?.();
+    if (retirement) await within(retirement, signal, budget);
     const captured = [...this.entries.values()];
     this.observing = new Map(captured.map(entry => [entry.id, entry]));
     for (const entry of captured) {

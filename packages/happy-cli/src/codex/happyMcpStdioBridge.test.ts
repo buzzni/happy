@@ -52,8 +52,9 @@ async function upstream(options: { stallInitialize?: boolean; deferInitialize?: 
     initializeRequests: () => initializeRequests, releaseInitialize };
 }
 
-function bridge(url: string, packaged = false) {
-  const entry = packaged ? [resolve('bin/happy-mcp.mjs')] : ['--import', 'tsx', resolve('src/codex/happyMcpStdioBridge.ts')];
+const bridgeEntry = resolve('bin/happy-mcp.mjs');
+function bridge(url: string, useLauncherDefaults = false) {
+  const entry = useLauncherDefaults ? [bridgeEntry] : ['--no-warnings', '--no-deprecation', bridgeEntry];
   const child = spawn(process.execPath, [...entry, '--url', url], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, HAPPY_HTTP_MCP_HEADERS: '' },
@@ -87,7 +88,7 @@ function isRunning(child: ChildProcessWithoutNullStreams) {
 
 describe('Happy MCP bridge process lifetime', { timeout: 15_000 }, () => {
   it('fails loudly when the session socket is set without its token', async () => {
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/codex/happyMcpStdioBridge.ts'), '--url', 'http://localhost/'], {
+    const child = spawn(process.execPath, ['--no-warnings', '--no-deprecation', bridgeEntry, '--url', 'http://localhost/'], {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env, SAYCODE_MCP_SOCKET: '/nonexistent/mcp.sock', SAYCODE_MCP_TOKEN: '' },
     });
@@ -136,9 +137,9 @@ describe('Happy MCP bridge process lifetime', { timeout: 15_000 }, () => {
     expect(http.requests()).toBe(0);
   });
 
-  it.each([false, true])('exits after EOF and preserves a peer bridge (packaged=%s)', async (packaged) => {
+  it.each([false, true])('exits after EOF and preserves a peer bridge (launcher defaults=%s)', async (useLauncherDefaults) => {
     const http = await upstream();
-    const owner = bridge(http.url, packaged);
+    const owner = bridge(http.url, useLauncherDefaults);
     const peer = bridge(http.url);
     await initialize(owner);
     await initialize(peer);

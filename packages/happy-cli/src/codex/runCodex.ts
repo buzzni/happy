@@ -30,6 +30,7 @@ const CODEX_END_INPUT_BUDGET_MS = 10_000;
 import { ApiClient } from '@/api/api';
 import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidenceOption } from '@/utils/inputEvidenceSettings';
 import { CodexAppServerClient } from './codexAppServerClient';
+import type { PreparedCodexAppServer } from './preparedCodexAppServer';
 import { describeCodexFailure, describeCodexInactivityAbort } from './codexAbortNotice';
 import {
     CODEX_CAPACITY_CONTINUE_PROMPT,
@@ -49,7 +50,7 @@ import { installHappyCommandShim } from '@/utils/happyCommandShim';
 import { Credentials, readSettings } from '@/persistence';
 import { resolveSessionSandboxConfig } from '@/sandbox/resolveSessionSandboxConfig';
 import { resolveSessionSandboxPolicyMode } from '@/sandbox/sandboxPolicy';
-import { initialMachineMetadata } from '@/daemon/run';
+import { initialMachineMetadata } from '@/daemon/initialMachineMetadata';
 import { configuration } from '@/configuration';
 import packageJson from '../../package.json';
 import { MessageQueue2, type CollectedBatch, type PendingAttachment, type QueueLatencyTrace } from '@/utils/MessageQueue2';
@@ -234,6 +235,8 @@ type ClaimedUserMessage = {
 export async function runCodex(opts: {
     principal: RunnerPrincipal;
     standaloneLaunch?: StandaloneLaunchBootstrap;
+    /** Owned by the local CLI bootstrap until the app-server client claims it. */
+    preparedAppServer?: PreparedCodexAppServer;
     startedBy?: 'daemon' | 'terminal';
     noSandbox?: boolean;
     resumeThreadId?: string;
@@ -307,6 +310,12 @@ export async function runCodex(opts: {
     const automationRunOnceRequested = consumeAutomationRunOnce(process.env);
     const reconnectSession = consumeReconnectSessionEnvironment(process.env);
     const reconnectSessionId = reconnectSession?.id;
+    let preparedAppServer = opts.preparedAppServer;
+    if (preparedAppServer && (managedStartup || opts.startedBy !== 'daemon' || reconnectSession || opts.resumeThreadId
+        || process.env.HAPPY_FORK_CODEX_THREAD_ID || automationRunOnceRequested)) {
+        await preparedAppServer.dispose();
+        preparedAppServer = undefined;
+    }
     assertNotAgentPlanThreadWithoutPlan({
         launch: agentPlanLaunch,
         threadsDir: agentPlanThreadsDir(configuration.happyHomeDir),
@@ -323,8 +332,11 @@ export async function runCodex(opts: {
     });
 
     // Early check: ensure Codex CLI is installed before proceeding
+    const codexLookupScope = () => JSON.stringify([process.cwd(), process.env.PATH, process.env.PATHEXT]);
+    const checkedLookupScope = codexLookupScope();
+    let initialCliVersion: string;
     try {
-        execSync('codex --version', { encoding: 'utf8', stdio: 'pipe', windowsHide: true });
+        initialCliVersion = execSync('codex --version', { encoding: 'utf8', stdio: 'pipe', windowsHide: true });
     } catch {
         console.error('\n\x1b[1m\x1b[33mCodex CLI is not installed\x1b[0m\n');
         console.error('Please install Codex CLI using one of these methods:\n');
@@ -1272,7 +1284,8 @@ export async function runCodex(opts: {
         hasTitle: () => session.hasTitle(),
         log: (message, detail) => logger.warn(message, detail),
     });
-    let workspaceTitleObserved = false;
+    let pendingTitle: { message: string; model?: string } | undefined;
+    let assistantTextForTitle = false;
     // `/btw` (Desktop specs/codexcli-side-question): an ephemeral fork on its own app-server process.
     // It reads plain data off the session client and never calls into it.
     const sideQuestion = new CodexSideQuestionBridge({
@@ -2009,6 +2022,7 @@ export async function runCodex(opts: {
                 });
             }
         } else if (msg.type === 'agent_message') {
+            if (pendingTitle && typeof msg.message === 'string' && msg.message.trim()) assistantTextForTitle = true;
             messageBuffer.addMessage((msg as any).message, 'assistant');
         } else if (msg.type === 'agent_reasoning_delta') {
             // Skip reasoning deltas in the UI to reduce noise
@@ -2170,6 +2184,7 @@ export async function runCodex(opts: {
     const turnCards = createTurnCardSwitch('codex');
     // Start Happy MCP server (HTTP) and prepare STDIO bridge config for Codex
     const happyServer = await startHappyServer(session, {
+        useStdioBridge: true,
         protectedToolAccess: () => toolPolicy?.protectedAccess,
         hostToolsAllowed: accountToken !== null,
         hostMcpServers: async () => accountToken !== null ? { ...launchMcpServers, ...await client.readHostMcpServers(process.cwd()) } : {},
@@ -2346,7 +2361,12 @@ export async function runCodex(opts: {
         },
     });
     const mcpRuntimeRecovery = new CodexMcpRuntimeRecovery(client);
-    const reportMcpStatuses = async (inspectedStatuses?: McpRuntimeServerStatus[]) => {
+    let backgroundMcpReport: AbortController | undefined;
+    const reportMcpStatuses = async (
+        inspectedStatuses?: McpRuntimeServerStatus[],
+        background?: { signal: AbortSignal; recoveryStatuses: McpRuntimeServerStatus[] },
+    ) => {
+        if (!background) backgroundMcpReport?.abort();
         const threadId = client.threadId;
         if (!threadId) return [];
         // Reporting status is informational. It runs on the turn path, where a
@@ -2359,15 +2379,17 @@ export async function runCodex(opts: {
                 threadId,
                 mcpServers: mcpConfigSynchronizer.mcpServers,
                 expectedServerNames: listConfiguredExternalServices(mcpConfigSynchronizer.mcpServers),
-            });
+            }, background?.signal);
         } catch (error) {
             logger.debug('[codex]: MCP status probe failed, leaving statuses unchanged', error);
             return [];
         }
+        if (background && (background.signal.aborted || runtimeGate?.isClosed() || client.threadId !== threadId)) return [];
+        const recoveryStatuses = background?.recoveryStatuses ?? [];
         const statuses = [
             ...runtimeStatuses.filter((entry) => !configStatuses.some(({ name }) => name === entry.name)),
             ...configStatuses,
-        ];
+        ].filter((entry) => !recoveryStatuses.some(({ name }) => name === entry.name)).concat(recoveryStatuses);
         session.updateMetadata((current) => ({ ...current, mcpServers: statuses }));
         return statuses;
     };
@@ -2385,7 +2407,7 @@ export async function runCodex(opts: {
     try {
         logger.debug('[codex]: client.connect begin');
         try {
-            await client.connect();
+            await client.connect(codexLookupScope() === checkedLookupScope ? initialCliVersion : undefined, preparedAppServer);
             logger.debug('[codex]: client.connect done');
             if (agentPlanSession) reportAgentPlanApplied(process.env, client.agentPlanApplied);
 
@@ -2812,13 +2834,21 @@ export async function runCodex(opts: {
                         includeRuntimeStatuses: true,
                         measure: latency ? measure : undefined,
                     }));
-                    await measure('mcp-status', () => reportMcpStatuses(runtimeRecovery.runtimeStatuses));
-                    if (runtimeRecovery.status !== 'ready') {
-                        const metadataStatuses = buildCodexMcpRecoveryMetadataStatuses({
-                            recovery: runtimeRecovery,
-                            connectorNames: readExpectedConnectors(),
-                            checkedAt: Date.now(),
-                        });
+                    const metadataStatuses = runtimeRecovery.status === 'ready' ? [] : buildCodexMcpRecoveryMetadataStatuses({
+                        recovery: runtimeRecovery,
+                        connectorNames: readExpectedConnectors(),
+                        checkedAt: Date.now(),
+                    });
+                    backgroundMcpReport?.abort();
+                    if (runtimeRecovery.runtimeStatuses !== undefined) {
+                        await measure('mcp-status', () => reportMcpStatuses(runtimeRecovery.runtimeStatuses));
+                    } else {
+                        // Required recovery has finished. Only fresh display metadata is missing.
+                        backgroundMcpReport = new AbortController();
+                        void reportMcpStatuses(undefined, { signal: backgroundMcpReport.signal, recoveryStatuses: metadataStatuses })
+                            .catch(error => logger.debug('[codex]: background MCP status report failed', error));
+                    }
+                    if (metadataStatuses.length > 0) {
                         for (const metadataStatus of metadataStatuses) {
                             session.updateMetadata((currentMetadata) => ({
                                 ...currentMetadata,
@@ -2908,6 +2938,10 @@ export async function runCodex(opts: {
                     // a cancelled turn or consume its pending startup context in that case.
                     if (owningForegroundSignal.aborted) { lessonProposalTurn.cancel(); continue; }
                     if (owningReviewSignal.aborted) { lessonProposalTurn.cancel(); reviewInstruction = ''; }
+                    const offTurnTitleEligible = isOffTurnTitleEligible({
+                        sideCommandAllowed: client.sideCommandAllowed,
+                        exitAfterFirstTurn,
+                    });
                     const turnPrompt = (reviewInstruction ? `${reviewInstruction}\n\n` : '') + buildCodexTurnPrompt({
                         message: message.message,
                         mode: message.mode,
@@ -2915,20 +2949,11 @@ export async function runCodex(opts: {
                         hasTitle: titleCoveredForTurn({
                             hasTitle: session.hasTitle(),
                             job: offTurnTitle,
-                            eligible: isOffTurnTitleEligible({
-                                sideCommandAllowed: client.sideCommandAllowed,
-                                exitAfterFirstTurn,
-                            }),
-                            message: message.message,
-                            model: message.mode.model,
+                            eligible: offTurnTitleEligible,
                         }),
                         ...(lessonRecall?.outcome === 'selected' ? { lessonBlock: lessonRecall.block } : {}),
                         ...(memoryRecall?.reason === 'context_returned' ? { memoryBlock: buildCodexMemoryReferenceBlock(memoryRecall.context) } : {}),
                     });
-                    if ((workspaceControl || automationExecution) && runtimeGate && !workspaceTitleObserved && offTurnTitle.covers()) {
-                        workspaceTitleObserved = true;
-                        void runtimeGate.admit(() => offTurnTitle.settled(), 'writer').catch(() => logger.warn('[workspace-context] Title writer unconfirmed'));
-                    }
                     // The worker awaited after the permit was granted. Keep consumption at
                     // the synchronous dispatch boundary so channel cancellation still wins.
                     if (!isCurrentCapacityContinuation(message.mode)) { lessonProposalTurn.cancel(); continue; }
@@ -2965,6 +2990,7 @@ export async function runCodex(opts: {
                         if (validInput?.items) messageQueue.queue.unshift(...validInput.items);
                         continue;
                     }
+                    assistantTextForTitle = false;
                     const result = await client.sendTurnAndWait(turnPrompt, {
                         beforeDispatch: () => {
                             const valid = messageQueue.revalidateBatch(message);
@@ -2979,7 +3005,12 @@ export async function runCodex(opts: {
                                 throw new Error('Codex continuation was cancelled before dispatch');
                             }
                         },
-                        onDispatched: () => { dispatchedWithoutStart = true; },
+                        onDispatched: () => {
+                            dispatchedWithoutStart = true;
+                            if (offTurnTitleEligible && offTurnTitle.canStart() && !pendingTitle && !message.continuation && message.message.trim()) {
+                                pendingTitle = { message: message.message.slice(0, 4000), model: message.mode.model };
+                            }
+                        },
                         ...(memoryRecall?.reason === 'context_returned' ? { onSubmitted: () => recallHost?.markSubmitted(activeThreadId, memoryRecall.startupIncluded === true) } : {}),
                         ...(memoryIngest ? { onCompleted: memoryIngest.onCompleted,
                             onCompletionObservationSettled: memoryIngest.onSettled } : {}),
@@ -2999,6 +3030,19 @@ export async function runCodex(opts: {
                         });
                     });
                     latency?.finish(result.aborted ? 'cancelled' : 'completed');
+                    if (!result.aborted && !turnServerOverloaded && assistantTextForTitle && pendingTitle) {
+                        const title = pendingTitle;
+                        pendingTitle = undefined;
+                        const generate = () => {
+                            offTurnTitle.start(title.message, title.model);
+                            return offTurnTitle.settled();
+                        };
+                        if ((workspaceControl || automationExecution) && runtimeGate) {
+                            void runtimeGate.admit(generate, 'writer').catch(() => logger.warn('[workspace-context] Title writer unconfirmed'));
+                        } else {
+                            void generate();
+                        }
+                    }
                     lessonFrame.acceptingSteer = false;
                     if (lessonFrame.pendingSteer) preemptLessonReview();
                     if (includeAppendSystemPrompt) {
@@ -3201,6 +3245,7 @@ export async function runCodex(opts: {
         }
 
     } finally {
+        backgroundMcpReport?.abort();
         cancelCapacityRetry();
         // A side question is an admitted writer. Cancel it before producer settlement or the
         // drain decision, otherwise its longer timeout can exhaust the shutdown budget.

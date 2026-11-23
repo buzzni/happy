@@ -2,7 +2,7 @@ import { AbortError } from '@anthropic-ai/claude-agent-sdk';
 import type { Options, Query, SDKUserMessage, query } from '@anthropic-ai/claude-agent-sdk';
 import { CLAUDE_AUTH_OVERRIDE_ENV_KEYS } from '../utils/claudeAuthOverrideEnv';
 
-import { logger } from '@/lib';
+import { logger } from '@/ui/logger';
 import { ORG_ENDPOINT_CLEARED_ENV_KEYS, ORG_ENDPOINT_VALUE_ENV_KEYS, ORG_ENDPOINT_OPTIONAL_VALUE_ENV_KEYS, ORG_ENDPOINT_MACHINE_ENV_KEYS } from '../utils/orgEndpointEnvKeys';
 import {
     ClaudeAuthNotVerifiedError, ORG_ENDPOINT_CLAUDE_AUTH_FAILURE, ORGANIZATION_CLAUDE_AUTH_FAILURE, PERSONAL_CLAUDE_AUTH_FAILURE,

@@ -21,6 +21,7 @@ import {
     type LessonOwnerDecision,
 } from './lessonOwnerMarker';
 import { tokensShareIdentity } from '@/daemon/resumeCredentials';
+import { isProjectLessonHostEnabled } from './lessonSettingsStore';
 
 export type LessonLaunchInput = {
     /** The environment after caller sanitization. Never mutated. */
@@ -71,7 +72,8 @@ export async function applyLessonLaunchEnvironment(
         callerSupported: lessonCallerSharesIdentity(input.callerToken, input.daemonToken),
         // Never open as the daemon on behalf of a session caller. The provider
         // obtains its own signed path and identity after its session is registered.
-        hostIsReady: async () => !input.hasSessionAuthority && Boolean(input.projectId) && input.hostIsReady(),
+        hostIsReady: async () => !input.hasSessionAuthority && !!input.projectId
+            && await isProjectLessonHostEnabled(input.daemonHomeDir, input.projectId) && input.hostIsReady(),
         load: input.load,
     });
     return {

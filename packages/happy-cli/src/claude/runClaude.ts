@@ -33,7 +33,7 @@ import { specialCommandResponse } from '@/claude/specialCommandResponse';
 import { getEnvironmentInfo } from '@/ui/doctor';
 import { configuration } from '@/configuration';
 import { notifyDaemonSessionStarted } from '@/daemon/controlClient';
-import { initialMachineMetadata } from '@/daemon/run';
+import { initialMachineMetadata } from '@/daemon/initialMachineMetadata';
 import { createChangeTitleHandler, startHappyServer } from '@/claude/utils/startHappyServer';
 import { linkedPullRequestToolsAllowed } from '@/claude/utils/linkedPullRequestTools';
 import { startHookServer } from '@/claude/utils/startHookServer';

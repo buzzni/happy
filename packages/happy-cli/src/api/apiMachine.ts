@@ -172,7 +172,6 @@ import { randomUUID } from 'node:crypto';
 import { exec } from 'node:child_process';
 import { readDaemonState } from '@/persistence';
 import { fetchBrowserStatus } from '@/daemon/browserClient';
-import { runPairing, formatPairOutcome } from '@/commands/browserPair';
 import {
     canSudoWithoutPassword,
     detectChrome,
@@ -951,6 +950,7 @@ export class ApiMachineClient {
     // the browser; a CDP port cannot recreate or replace the pipe later.
     private browserCdpPipes = new Map<number, BrowserCdpPipe>();
     private resumeSessionHandler: ((sessionId: string, options?: {
+        draftRunnerId?: string;
         model?: string;
         permissionMode?: string;
         environmentVariables?: Record<string, string>;
@@ -1554,6 +1554,7 @@ export class ApiMachineClient {
 
             const result = await spawnSession({
                 directory,
+                ...(typeof params.draftRunnerId === 'string' && UUID_RE.test(params.draftRunnerId) ? { draftRunnerId: params.draftRunnerId } : {}),
                 sessionId,
                 machineId,
                 approvedNewDirectoryCreation,
@@ -3535,6 +3536,7 @@ export class ApiMachineClient {
         viewerKey?: string,
         forceExtensionReload?: boolean,
     ): Promise<BrowserPairResult> {
+        const { runPairing, formatPairOutcome } = await import('@/commands/browserPair');
         const cdpPipe = this.browserCdpPipes.get(cdpPort);
         const facts = await runPairing({
             cdpPort,
@@ -3721,6 +3723,7 @@ export class ApiMachineClient {
                     }
 
                     const result = await handler(sessionId, {
+                        ...(typeof params.draftRunnerId === 'string' && UUID_RE.test(params.draftRunnerId) ? { draftRunnerId: params.draftRunnerId } : {}),
                         model,
                         permissionMode,
                         environmentVariables,

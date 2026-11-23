@@ -55,8 +55,8 @@ describe('spawnAgentCommand', () => {
     expect(resolveAgentAuthEnvironment(agent, env)).toEqual(expected)
   })
 
-  it('filters daemon credentials while restoring only the selected agent authentication', () => {
-    expect(resolveInheritedSpawnEnvironment({
+  it('filters daemon credentials while restoring only the selected agent authentication', async () => {
+    expect(await resolveInheritedSpawnEnvironment({
       agent: 'claude',
       filterCredentials: true,
       env: {

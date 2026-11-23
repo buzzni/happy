@@ -90,7 +90,7 @@ vi.mock('@/claude/utils/startHappyServer', () => ({
     startHappyServer: vi.fn(async () => ({ url: 'http://127.0.0.1:1/', toolNames: [], stop: vi.fn() })),
 }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionStarted: vi.fn(async () => {}) }));
-vi.mock('@/daemon/run', () => ({ initialMachineMetadata: {} }));
+vi.mock('@/daemon/initialMachineMetadata', () => ({ initialMachineMetadata: {} }));
 vi.mock('@/ui/logger', () => ({
     logger: { debug: vi.fn(), debugLargeJson: vi.fn(), info: vi.fn(), infoDeveloper: vi.fn() },
 }));

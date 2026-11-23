@@ -48,6 +48,33 @@ describe('handleCodexCommand', () => {
     mocks.mockRunCodex.mockResolvedValue(undefined)
   })
 
+  it('loads the Codex runner while the account daemon is becoming ready', async () => {
+    vi.resetModules()
+    let runnerLoaded = false
+    vi.doMock('@/codex/runCodex', () => {
+      runnerLoaded = true
+      return { runCodex: mocks.mockRunCodex }
+    })
+    let releaseDaemon: (() => void) | undefined
+    mocks.mockEnsureDaemonRunning.mockImplementationOnce(() => new Promise<void>(resolve => { releaseDaemon = resolve }))
+    const { handleCodexCommand: command } = await import('./codexCommand')
+    try {
+      expect(runnerLoaded).toBe(false)
+      const pending = command(['--started-by', 'terminal'])
+      try {
+        await vi.waitFor(() => expect(runnerLoaded).toBe(true))
+        expect(mocks.mockEnsureDaemonRunning).toHaveBeenCalledOnce()
+        expect(mocks.mockRunCodex).not.toHaveBeenCalled()
+      } finally {
+        releaseDaemon?.()
+        await pending
+      }
+      expect(mocks.mockRunCodex).toHaveBeenCalledOnce()
+    } finally {
+      vi.doMock('@/codex/runCodex', () => ({ runCodex: mocks.mockRunCodex }))
+    }
+  })
+
   it('ensures the daemon is running before starting a codex session', async () => {
     await handleCodexCommand(['--started-by', 'terminal'])
 
@@ -62,6 +89,45 @@ describe('handleCodexCommand', () => {
     expect(
       mocks.mockEnsureDaemonRunning.mock.invocationCallOrder[0],
     ).toBeLessThan(mocks.mockRunCodex.mock.invocationCallOrder[0])
+  })
+
+  it('hands a prepared app-server to the authenticated daemon session and releases any remaining preparation', async () => {
+    const prepared = { claim: vi.fn(), dispose: vi.fn(async () => {}) }
+    mocks.mockRunCodex.mockImplementationOnce(async options => {
+      expect(options.preparedAppServer).toBe(prepared)
+      expect(prepared.dispose).not.toHaveBeenCalled()
+    })
+
+    await handleCodexCommand(['--started-by', 'daemon'], prepared)
+
+    expect(mocks.mockRunCodex).toHaveBeenCalledOnce()
+    expect(mocks.mockEnsureDaemonRunning.mock.invocationCallOrder[0]).toBeLessThan(mocks.mockRunCodex.mock.invocationCallOrder[0])
+    expect(prepared.dispose).toHaveBeenCalledOnce()
+  })
+
+  it('disposes an unclaimed app-server when daemon authentication fails', async () => {
+    const prepared = { claim: vi.fn(), dispose: vi.fn(async () => {}) }
+    mocks.mockAuthAndSetupMachineIfNeeded.mockRejectedValueOnce(new Error('Authentication failed'))
+
+    await expect(handleCodexCommand(['--started-by', 'daemon'], prepared)).rejects.toThrow('Authentication failed')
+
+    expect(mocks.mockRunCodex).not.toHaveBeenCalled()
+    expect(prepared.dispose).toHaveBeenCalledOnce()
+  })
+
+  it.each(['terminal', 'resume'] as const)('disposes early and uses the ordinary startup for %s', async path => {
+    const prepared = { claim: vi.fn(), dispose: vi.fn(async () => {}) }
+    if (path === 'resume') {
+      mocks.mockExtractCodexResumeFlag.mockReturnValueOnce({ resumeThreadId: 'thread-123', args: ['--started-by', 'daemon'] })
+    }
+    mocks.mockRunCodex.mockImplementationOnce(async options => {
+      expect(options.preparedAppServer).toBeUndefined()
+      expect(prepared.dispose).toHaveBeenCalledOnce()
+    })
+
+    await handleCodexCommand(['--started-by', path === 'terminal' ? 'terminal' : 'daemon'], prepared)
+
+    expect(mocks.mockRunCodex).toHaveBeenCalledOnce()
   })
 
   it('passes parsed no-sandbox and resume flags through to runCodex', async () => {

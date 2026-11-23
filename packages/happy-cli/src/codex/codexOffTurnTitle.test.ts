@@ -104,6 +104,10 @@ describe('createCodexExecTitleRunner', () => {
         expect(prepare.mock.calls.map(([args]) => args[0])).toEqual(['mcp', 'exec']);
         expect(calls0.map((call) => call.command)).toEqual(['wrapped', 'wrapped']);
         expect(calls0.every((call) => call.env?.MARK === 'same-payer')).toBe(true);
+        expect(spawnImpl.mock.calls.map(([, , options]) => options)).toEqual([
+            expect.objectContaining({ windowsHide: true }),
+            expect.objectContaining({ windowsHide: true }),
+        ]);
     });
 
     it('shouldFailWithoutSpawningWhenNoLaunchIsAvailable', async () => {

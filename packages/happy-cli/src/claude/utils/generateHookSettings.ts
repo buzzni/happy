@@ -5,92 +5,15 @@
  * to notify our HTTP server when sessions change (new session, resume, compact, etc.)
  */
 
-import { dirname, join, resolve } from 'node:path';
+import { join } from 'node:path';
 import { homedir } from 'node:os';
 import { writeFileSync, mkdirSync, unlinkSync, existsSync } from 'node:fs';
 import { configuration } from '@/configuration';
 import { logger } from '@/ui/logger';
 import { projectPath } from '@/projectPath';
-import {
-    managedCredentialDenyRules,
-    resolveMachineLockdownPolicy,
-    type MachineLockdownPolicy,
-} from '@/daemon/machineLockdownPolicy';
-import { buildToolPolicyHookEntries, skillLocksFilePath } from '@/toolPolicy/claudeHook';
-import { orgEndpointRoutingSettingsEnv } from './orgEndpointEnvKeys';
+import { buildSessionHookSettings, type SessionToolPolicyHooks } from './sessionHookSettings';
 
-/**
- * Pure settings document. `permissions.deny` always guards broad kills; under
- * the trial lockdown policy it also hides the daemon-managed credential files
- * and environment dumps from the agent (aplus-dev-studio
- * specs/trial-auto-onboarding-budget D7 — a mitigation, not a sandbox).
- */
-export function buildHookSettings(input: {
-    hookCommand: string;
-    broadKillGuardCommand: string;
-    policy: MachineLockdownPolicy;
-    homeDir: string;
-    /** aplus-dev-studio specs/agent-tool-policy — absent when `HAPPY_TOOL_POLICY=off`. */
-    toolPolicy?: { forwarderCommand: string; fileGuardCommand: string };
-    /**
-     * An organization permission ceiling below bypass (aplus-dev-studio-desktop specs/codexcli-org-requirements
-     * R10.10): Claude refuses bypass from the command line and from its own mode cycling in the terminal.
-     */
-    disableBypassPermissions?: boolean;
-    /** An organization LLM endpoint session's routing (`orgEndpointRoutingSettingsEnv`), above the settings files. */
-    env?: Record<string, string>;
-}): Record<string, unknown> {
-    return {
-        ...(input.env ? { env: input.env } : {}),
-        permissions: {
-            deny: [
-                "Bash(killall:*)",
-                ...(input.policy.protectManagedCredentials ? managedCredentialDenyRules(input.homeDir) : []),
-            ],
-            ...(input.disableBypassPermissions ? { disableBypassPermissionsMode: 'disable' } : {}),
-        },
-        hooks: {
-            SessionStart: [
-                {
-                    matcher: "*",
-                    hooks: [
-                        {
-                            type: "command",
-                            command: input.hookCommand
-                        }
-                    ]
-                }
-            ],
-            PreToolUse: [
-                {
-                    matcher: "Bash",
-                    hooks: [
-                        {
-                            type: "command",
-                            command: input.broadKillGuardCommand
-                        }
-                    ]
-                },
-                ...(input.toolPolicy ? buildToolPolicyHookEntries(input.toolPolicy) : [])
-            ]
-        }
-    };
-}
-
-/**
- * The tool policy hook commands, exactly as Claude runs them. The gate must not depend on `node`
- * being on the hook shell's PATH: a hook that cannot start is a non-blocking error to Claude, i.e.
- * the call runs unchecked — so the daemon's own executable is quoted in.
- */
-export function toolPolicyHookCommands(input: { execPath: string; scriptsDir: string; port: number; secretFile: string; policyFile: string; protectedDirs?: string[] }): { forwarderCommand: string; fileGuardCommand: string } {
-    const dirs = (input.protectedDirs ?? []).map((dir) => ` --dir "${dir}"`).join('');
-    // aplus-dev-studio-desktop specs/skill-lock: the lock file sits beside the policy file Desktop writes.
-    const skillLocks = ` --skill-locks "${skillLocksFilePath(dirname(input.policyFile))}" --hook ${input.port} "${input.secretFile}"`;
-    return {
-        forwarderCommand: `"${input.execPath}" "${join(input.scriptsDir, 'policy_hook_forwarder.cjs')}" ${input.port} "${input.secretFile}"`,
-        fileGuardCommand: `"${input.execPath}" "${join(input.scriptsDir, 'tool_policy_file_guard.cjs')}" "${input.policyFile}"${dirs}${skillLocks}`,
-    };
-}
+export { buildHookSettings, toolPolicyHookCommands } from './sessionHookSettings';
 
 /**
  * Generate a temporary settings file with SessionStart hook configuration
@@ -100,7 +23,7 @@ export function toolPolicyHookCommands(input: { execPath: string; scriptsDir: st
  */
 export function generateHookSettingsFile(
     port: number,
-    toolPolicy?: { secretFile: string; policyFile: string; protectedDirs?: string[] },
+    toolPolicy?: SessionToolPolicyHooks,
     options: { disableBypassPermissions?: boolean } = {},
 ): string {
     const hooksDir = join(configuration.happyHomeDir, 'tmp', 'hooks');
@@ -110,33 +33,14 @@ export function generateHookSettingsFile(
     const filename = `session-hook-${process.pid}.json`;
     const filepath = join(hooksDir, filename);
 
-    // Path to the hook forwarder script
-    const forwarderScript = resolve(projectPath(), 'scripts', 'session_hook_forwarder.cjs');
-    const hookCommand = `node "${forwarderScript}" ${port}`;
-
-    // Guard against broad kills (`killall node`, `pkill -f node`, ...) that
-    // would take down the happy daemon and every agent session on the machine.
-    const broadKillGuardScript = resolve(projectPath(), 'scripts', 'broad_kill_guard.cjs');
-    const broadKillGuardCommand = `node "${broadKillGuardScript}"`;
-
-    const endpointEnv = orgEndpointRoutingSettingsEnv(process.env);
-    const settings = buildHookSettings({
-        hookCommand,
-        broadKillGuardCommand,
-        policy: resolveMachineLockdownPolicy(process.env),
+    const settings = buildSessionHookSettings({
+        installRoot: projectPath(),
+        execPath: process.execPath,
         homeDir: homedir(),
-        ...(toolPolicy ? {
-            toolPolicy: toolPolicyHookCommands({
-                execPath: process.execPath,
-                scriptsDir: resolve(projectPath(), 'scripts'),
-                port,
-                secretFile: toolPolicy.secretFile,
-                policyFile: toolPolicy.policyFile,
-                ...(toolPolicy.protectedDirs ? { protectedDirs: toolPolicy.protectedDirs } : {}),
-            }),
-        } : {}),
-        ...(options.disableBypassPermissions ? { disableBypassPermissions: true } : {}),
-        ...(endpointEnv ? { env: endpointEnv } : {}),
+        env: process.env,
+        port,
+        toolPolicy,
+        disableBypassPermissions: options.disableBypassPermissions,
     });
 
     writeFileSync(filepath, JSON.stringify(settings, null, 2), { mode: 0o600 });

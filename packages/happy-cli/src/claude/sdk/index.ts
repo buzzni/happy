@@ -3,7 +3,7 @@
  * Uses official @anthropic-ai/claude-agent-sdk
  */
 
-export { query } from './query'
+export { query, queryForConversation } from './query'
 export { AbortError } from './types'
 export type {
     QueryOptions,

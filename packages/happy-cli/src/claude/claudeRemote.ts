@@ -27,7 +27,7 @@ import type { NativeAutomationContextExitEvidence } from '@/utils/automationCont
 import { bindManagedQueryOptions } from '@/launcher/managedClaudeOptions'
 import type { ClaudeTitleBridge } from './claudeOffTurnTitle'
 import { sideQuestionRequestOf, type ClaudeSideQuestionChannel } from './claudeSideQuestion'
-import { query, type QueryOptions, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
+import { queryForConversation, type QueryOptions, type SDKMessage, type SDKSystemMessage, AbortError, SDKUserMessage } from '@/claude/sdk'
 import type { MessageParam } from '@anthropic-ai/sdk/resources'
 import { mapToClaudeMode } from "./utils/permissionMode";
 import { claudeCheckSession } from "./utils/claudeCheckSession";
@@ -36,7 +36,7 @@ import { createUsageLimitsCollector, usageReaderOf } from "./utils/usageLimitsCo
 import type { UsageLimitsPatch } from "./utils/usageLimits";
 import { join } from 'node:path';
 import { parseSpecialCommand } from "@/parsers/specialCommands";
-import { logger } from "@/lib";
+import { logger } from "@/ui/logger";
 import { PushableAsyncIterable } from "@/utils/PushableAsyncIterable";
 import { getProjectPath } from "./utils/path";
 import { awaitFileExist } from "@/modules/watcher/awaitFileExist";
@@ -818,7 +818,7 @@ function readTurnText(content: unknown): string {
     if (opts.signal?.aborted || initial.commitInput?.() === false) return 'not-started' as const;
     // Start the loop
     const queryStartedAt = Date.now();
-    const response = query({
+    const response = await queryForConversation({
         prompt: messages,
         options: sdkOptions,
     });

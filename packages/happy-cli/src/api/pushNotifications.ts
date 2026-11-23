@@ -1,6 +1,6 @@
 import axios from 'axios'
 import { logger } from '@/ui/logger'
-import { Expo, ExpoPushMessage } from 'expo-server-sdk'
+import type { Expo, ExpoPushMessage } from 'expo-server-sdk'
 import type { Metadata } from './types'
 import { configuration } from '@/configuration'
 
@@ -74,12 +74,11 @@ export function getSessionNotificationCopy(
 export class PushNotificationClient {
     private readonly token: string
     private readonly baseUrl: string
-    private readonly expo: Expo
+    private expo?: Expo
 
     constructor(token: string, baseUrl: string = 'https://api.cluster-fluster.com') {
         this.token = token
         this.baseUrl = baseUrl
-        this.expo = new Expo()
     }
 
     /**
@@ -127,6 +126,8 @@ export class PushNotificationClient {
      */
     async sendPushNotifications(messages: ExpoPushMessage[]): Promise<void> {
         logger.debug(`Sending ${messages.length} push notifications`)
+        if (!messages.length) return
+        const { Expo } = await import('expo-server-sdk')
 
         // Filter out invalid push tokens
         const validMessages = messages.filter(message => {
@@ -142,7 +143,8 @@ export class PushNotificationClient {
         }
 
         // Create chunks to respect Expo's rate limits
-        const chunks = this.expo.chunkPushNotifications(validMessages)
+        const expo = this.expo ??= new Expo()
+        const chunks = expo.chunkPushNotifications(validMessages)
 
         for (const chunk of chunks) {
             // Retry with exponential backoff for 5 minutes
@@ -152,7 +154,7 @@ export class PushNotificationClient {
             
             while (true) {
                 try {
-                    const ticketChunk = await this.expo.sendPushNotificationsAsync(chunk)
+                    const ticketChunk = await expo.sendPushNotificationsAsync(chunk)
                     
                     // Log any errors but don't throw
                     const errors = ticketChunk.filter(ticket => ticket.status === 'error')

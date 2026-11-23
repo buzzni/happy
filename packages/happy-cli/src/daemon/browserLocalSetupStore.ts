@@ -2,7 +2,7 @@ import { readFile, mkdir, open, rename } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { randomBytes } from 'node:crypto'
-import { resolveExtensionDir, resolveExtensionId } from '@/commands/browser'
+import { resolveExtensionDir, resolveExtensionId } from '@/commands/browserExtensionId'
 import type { BrowserSetupPolicy } from './browserBridge'
 
 export async function readBrowserSetupPolicy(file: string): Promise<BrowserSetupPolicy> {

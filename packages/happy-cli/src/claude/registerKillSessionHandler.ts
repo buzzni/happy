@@ -1,5 +1,5 @@
 import { RpcHandlerManager } from "@/api/rpc/RpcHandlerManager";
-import { logger } from "@/lib";
+import { logger } from "@/ui/logger";
 
 interface KillSessionRequest {
     // No parameters needed

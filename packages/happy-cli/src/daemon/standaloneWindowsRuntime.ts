@@ -1,12 +1,14 @@
 import { randomUUID } from 'node:crypto';
 import { copyFile, constants } from 'node:fs/promises';
 import { join } from 'node:path';
+import { projectPath } from '../projectPath';
 import { StandaloneDrain } from './standaloneDrain';
 import { StandaloneLaunchControl } from './standaloneLaunchControl';
 import { STANDALONE_DRAIN_PROVIDERS, standaloneDrainProviderForArgs } from './standaloneLaunchProtocol';
 import { StandaloneLaunchJournal, protectStandaloneObservationDirectory } from './standaloneLaunchJournal';
 import { StandaloneLaunchFailure, StandaloneSessionOwner } from './standaloneSessionOwner';
 import { launchWindowsSession, probeWindowsProcessIdentity, readWindowsSessionReceipt, verifyWindowsSessionLauncher, WindowsSessionLaunchError } from './windowsSessionLauncher';
+import { RESIDENT_MODULE_HOST_ENV } from '@/utils/childEnv';
 import { resolveHappyCliSpawnCommand } from '../utils/spawnHappyCLI';
 import { terminateAllDaemonTerminalSessions } from './daemonTerminalSessions';
 import type { TerminateOutcome, WindowsTerminalHost } from './remoteTerminal';
@@ -98,6 +100,7 @@ export async function freezeWithTerminals<T extends { unresolved: boolean }>(
 /** Explicit local-trial composition. Public CLI versions alone never advertise this capability. */
 export async function createStandaloneWindowsRuntime(options: {
   homeDir: string; env: NodeJS.ProcessEnv; managed: boolean; getChildren(): readonly { pid: number }[]; onRetired?(pid: number, launchId: string): void;
+  retireIdleDraft?(): Promise<void> | undefined;
 }) {
   const candidateId = readStandaloneCandidateId(options.env);
   const source = options.env.HAPPY_STANDALONE_WINDOWS_LAUNCHER;
@@ -133,7 +136,9 @@ export async function createStandaloneWindowsRuntime(options: {
       isNoProcessError: error => error instanceof WindowsSessionLaunchError,
       launch: async input => {
         await protectStandaloneObservationDirectory(nativeDirectory);
-        const command = resolveHappyCliSpawnCommand(input.args);
+        const command = input.draftWorker
+          ? { args: ['--no-warnings', '--no-deprecation', join(projectPath(), 'bin', 'happy-draft-worker.mjs'), input.args[0]] }
+          : resolveHappyCliSpawnCommand(input.args, undefined, !!input.env[RESIDENT_MODULE_HOST_ENV]);
         const native = await launchWindowsSession({ helperPath, helperSha256: digest,
           executable: process.execPath, args: command.args, cwd: input.cwd, env: input.env,
           instanceId: input.instanceId, launchId: input.launchId,
@@ -159,7 +164,7 @@ export async function createStandaloneWindowsRuntime(options: {
       targets: STANDALONE_WINDOWS_TARGETS,
       canTerminate: id => owner.canTerminate(id),
       terminate: id => owner.resolveTermination(id),
-      freeze: (signal, budget) => freezeWithTerminals(() => owner.freeze(signal, budget), terminateAllDaemonTerminalSessions),
+      freeze: (signal, budget) => freezeWithTerminals(() => owner.freeze(signal, budget, options.retireIdleDraft), terminateAllDaemonTerminalSessions),
       drain: (launchId, signal, budget) => owner.drain(launchId, signal, budget),
     }) };
   } catch (error) { await control.close(); throw error; }

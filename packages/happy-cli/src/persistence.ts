@@ -55,6 +55,8 @@ interface Settings {
   machineId?: string
   machineIdConfirmedByServer?: boolean
   daemonAutoStartWhenRunningHappy?: boolean
+  /** Explicit account-host consent to inject project event memory and import completed Codex turns. */
+  codexEventMemoryEnabled?: boolean
   chromeMode?: boolean
   sandboxConfig?: SandboxConfig
   serverUrl?: string
@@ -698,7 +700,7 @@ export function writeDaemonStateIfUnchanged(expectedRaw: string | null, state: D
   return true;
 }
 
-let pendingDaemonState: DaemonLocallyPersistedState | null = null;
+let pendingDaemonState: (() => DaemonLocallyPersistedState) | null = null;
 let daemonStateDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 const DAEMON_STATE_DEBOUNCE_MS = 500;
 
@@ -706,18 +708,12 @@ const DAEMON_STATE_DEBOUNCE_MS = 500;
  * Debounced write for daemon state — avoids excessive I/O during rapid session mutations.
  * Call flushDaemonState() before shutdown to ensure final state is written.
  */
-export function writeDaemonStateDebounced(state: DaemonLocallyPersistedState): void {
-  pendingDaemonState = state;
+export function writeDaemonStateDebounced(readLatest: () => DaemonLocallyPersistedState): void {
+  pendingDaemonState = readLatest;
   if (daemonStateDebounceTimer) {
     clearTimeout(daemonStateDebounceTimer);
   }
-  daemonStateDebounceTimer = setTimeout(() => {
-    if (pendingDaemonState) {
-      writeDaemonState(pendingDaemonState);
-    }
-    pendingDaemonState = null;
-    daemonStateDebounceTimer = null;
-  }, DAEMON_STATE_DEBOUNCE_MS);
+  daemonStateDebounceTimer = setTimeout(flushDaemonState, DAEMON_STATE_DEBOUNCE_MS);
 }
 
 /**
@@ -728,10 +724,9 @@ export function flushDaemonState(): void {
     clearTimeout(daemonStateDebounceTimer);
     daemonStateDebounceTimer = null;
   }
-  if (pendingDaemonState) {
-    writeDaemonState(pendingDaemonState);
-    pendingDaemonState = null;
-  }
+  const readLatest = pendingDaemonState;
+  pendingDaemonState = null;
+  if (readLatest) writeDaemonState(readLatest());
 }
 
 /**

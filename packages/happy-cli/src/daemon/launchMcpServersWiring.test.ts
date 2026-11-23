@@ -77,7 +77,7 @@ describe('session process start', () => {
     const text = await source(path)
     const body = text.slice(text.indexOf(start))
     const firstStatement = body.slice(body.indexOf('): Promise<void> {') + '): Promise<void> {'.length).trimStart()
-    expect(firstStatement.replace(/^(\/\/.*\n\s*)+/, '')).toMatch(/^const launchMcpServers = consumeLaunchMcpServersSeed\(process\.env\);/)
+    expect(firstStatement.replace(/^(\/\/.*\r?\n\s*)+/, '')).toMatch(/^const launchMcpServers = consumeLaunchMcpServersSeed\(process\.env\);/)
   })
 })
 

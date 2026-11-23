@@ -11,9 +11,9 @@ import { evaluateToolCall } from './evaluate';
 
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync, unlinkSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createToolPolicyAuditLog, type ToolPolicyAuditRecord } from './audit';
-import { toolPolicyFilePath } from './claudeHook';
+import { sessionToolPolicyHookFiles } from './claudeHook';
 import { registerToolPolicyGrantRpcs } from './grantControl';
 import { createPolicyGrantStore, type PolicyGrantStore } from './grants';
 import type { OrgToolRules } from './evaluate';
@@ -47,13 +47,11 @@ export function createToolPolicyRuntime(input: {
     rpc: Parameters<typeof registerToolPolicyGrantRpcs>[0];
 }): ToolPolicyRuntime {
     const secret = randomBytes(32).toString('hex');
-    const hooksDir = join(input.happyHomeDir, 'tmp', 'hooks');
-    mkdirSync(hooksDir, { recursive: true, mode: 0o700 });
-    const secretFile = join(hooksDir, `policy-secret-${process.pid}`);
+    const { secretFile, policyFile } = sessionToolPolicyHookFiles(input.happyHomeDir);
+    mkdirSync(dirname(secretFile), { recursive: true, mode: 0o700 });
     writeFileSync(secretFile, secret, { mode: 0o600 });
     chmodSync(secretFile, 0o600);
 
-    const policyFile = toolPolicyFilePath(input.happyHomeDir);
     const grants = createPolicyGrantStore({ grantTtlMs: input.grantTtlMs });
     registerToolPolicyGrantRpcs(input.rpc, grants);
     const loadMachinePolicy = createMachinePolicyLoader(policyFile);

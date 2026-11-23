@@ -28,7 +28,7 @@ import { tmpdir } from 'node:os';
 import { createFilesystemWriteAdmission, createWorkspaceTurnAdmission, createUnfencedSubprocessAdmission,
     createLegacyDispatchAdmission, createSubprocessWriteAdmission } from '@/utils/workspaceTurnAdmission';
 import { sealSpawnEnv } from '@/modules/common/sealedSpawnEnv';
-import { ApiClient } from './api';
+import { ApiClient } from '../lib';
 import { hkdfSync, randomBytes } from 'node:crypto';
 
 const {
@@ -194,7 +194,8 @@ describe('ApiMachineClient machine RPC server lane', () => {
     });
 
     it('passes host process admission from the account API factory without adding it to default registration', async () => {
-        const api = await ApiClient.create({ token: 'fake-token', encryption: { type: 'legacy', secret: new Uint8Array(32) } });
+        const { create } = ApiClient;
+        const api = await create({ token: 'fake-token', encryption: { type: 'legacy', secret: new Uint8Array(32) } });
         const admitSubprocess = vi.fn(async (_roots: readonly string[]) => undefined);
         Reflect.apply(api.machineSyncClient, api, [makeMachine(), undefined, undefined, null, undefined, admitSubprocess]);
         expect(registeredCommonHandlers.mock.calls.at(-1)![2].admitSubprocess).toBe(admitSubprocess);

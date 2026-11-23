@@ -44,6 +44,16 @@ afterEach(() => {
 });
 
 describe('launchMcpServers RPC field', () => {
+    it('passes a valid prepared runner to resume and ignores an invalid identifier', async () => {
+        const draftRunnerId = 'fb53e7c0-b2a4-42b6-9f9e-a76b436bcd54';
+        const resumeSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-1' });
+        const { resume } = await handlers(vi.fn(), resumeSession);
+        await resume({ sessionId: 'happy-1', draftRunnerId });
+        expect(resumeSession).toHaveBeenLastCalledWith('happy-1', expect.objectContaining({ draftRunnerId }));
+        await resume({ sessionId: 'happy-1', draftRunnerId: 'invalid' });
+        expect(resumeSession.mock.calls[1][1]).not.toHaveProperty('draftRunnerId');
+    });
+
     it('hands spawn the checked request and answers with the drops', async () => {
         const dropped = [{ name: 'Bad', reason: 'invalid' }, { name: 'docs', reason: 'name-conflict' }];
         const spawnSession = vi.fn().mockResolvedValue({ type: 'success', sessionId: 'happy-1', launchMcpDropped: dropped });

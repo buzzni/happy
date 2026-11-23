@@ -16,10 +16,10 @@ import type { UsageLimits } from '@/api/types';
 import { getProjectPath } from './utils/path';
 import { wrapClientTurnPrompt } from '@slopus/happy-wire';
 
-vi.mock('@/claude/sdk', () => ({
-    query: vi.fn(),
-    AbortError: class AbortError extends Error {},
-}));
+vi.mock('@/claude/sdk', () => {
+    const query = vi.fn();
+    return { query, queryForConversation: query, AbortError: class AbortError extends Error {} };
+});
 
 const mode: EnhancedMode = {
     permissionMode: 'default',

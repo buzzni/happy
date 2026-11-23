@@ -12,7 +12,8 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
     query: sdkQuery,
 }));
 
-import { query } from './query';
+import { query, queryForConversation } from './query';
+import { offerClaudeDraft } from './preparedClaudeDraft';
 
 describe('query adapter', () => {
     let configDirectory: string;
@@ -63,6 +64,16 @@ describe('query adapter', () => {
             }), token, 'organization');
         }
         expect(sdkQuery).not.toHaveBeenCalled();
+    });
+
+    it('keeps the selected personal credential pin when a Claude process is parked', async () => {
+        const draft = { claim: vi.fn(async () => undefined), dispose: vi.fn(async () => {}) };
+        offerClaudeDraft(draft);
+        const prompt = (async function* () {})();
+        await queryForConversation({ prompt, options: { personalClaudeAuth: { oauthToken: 'fixture-personal' } } });
+        expect(draft.dispose).toHaveBeenCalledOnce();
+        expect(draft.claim).not.toHaveBeenCalled();
+        expect(pinnedQuery).toHaveBeenCalledWith(sdkQuery, expect.objectContaining({ prompt }), 'fixture-personal');
     });
 
     // A stored fallback written before a catalog swap migrates onto the same successor as the main model

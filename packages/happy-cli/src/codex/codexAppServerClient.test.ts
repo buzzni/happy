@@ -153,6 +153,165 @@ const sandboxConfig: SandboxConfig = {
 describe('CodexAppServerClient sandbox integration', () => {
     const originalRustLog = process.env.RUST_LOG;
 
+    it('uses the version already checked by runCodex for its initial connection', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const client = new CodexAppServerClient();
+        try {
+            await client.connect('codex-cli 0.171.0');
+            expect(mockExecSync).not.toHaveBeenCalledWith('codex --version', expect.anything());
+        } finally {
+            await client.disconnect();
+        }
+    });
+
+    it.each([
+        'unchanged', 'project disables plugins', 'organization disables plugins',
+        'account changed', 'environment changed', 'scope unavailable', 'owner cancelled', 'thread directory changed',
+        'session links', 'native hook added', 'shell policy changed', 'MCP expects session links',
+    ] as const)('claims a prepared server and preserves its execution scope (%s)', async condition => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const { prepareCodexAppServer: prepareFromSessionEnvironment } = await import('../commands/residentCodexEntry');
+        const baseline = new CodexAppServerClient();
+        await baseline.connect('codex-cli 0.171.0');
+        const [command, args, launch] = mockSpawn.mock.calls[0];
+        await baseline.disconnect();
+        mockSpawn.mockClear();
+
+        const requests: MockRpcMessage[] = [];
+        let claiming = false;
+        const sessionLinks = { APLUS_SESSION_ID: 'synthetic-session', APLUS_SESSION_URL: 'https://saycode.example/session/synthetic-session' };
+        const hasSessionLinks = ['session links', 'native hook added', 'shell policy changed', 'MCP expects session links'].some(value => value === condition);
+        mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (message, stdout) => {
+            requests.push(message);
+            if (message.method === 'config/read') {
+                pushJsonLine(stdout, { id: message.id, result: {
+                    config: { features: { plugins: false },
+                        ...(claiming && condition === 'shell policy changed' ? { shell_environment_policy: { inherit: 'none' } } : {}) },
+                    layers: [
+                        { name: { type: 'sessionFlags' }, config: { features: { plugins: false } } },
+                        { name: { type: 'project' }, config: { features: { plugins: false } },
+                            ...(condition === 'project disables plugins' ? {} : { disabledReason: 'untrusted' }) },
+                        { name: { type: 'user' }, config: {} },
+                    ],
+                } });
+            }
+            if (message.method === 'configRequirements/read') {
+                pushJsonLine(stdout, { id: message.id, result: {
+                    requirements: condition === 'organization disables plugins' ? { featureRequirements: { plugins: false } } : null,
+                } });
+            }
+            if (message.method === 'experimentalFeature/list') {
+                pushJsonLine(stdout, { id: message.id, result: {
+                    data: [{ name: 'plugins', defaultEnabled: true, enabled: false }],
+                } });
+            }
+            if (message.method === 'hooks/list') {
+                pushJsonLine(stdout, { id: message.id, result: { data: [{ cwd: process.cwd(),
+                    hooks: condition === 'native hook added' ? [{ enabled: true }] : [], warnings: [], errors: [] }] } });
+            }
+            if (message.method === 'thread/start') {
+                pushJsonLine(stdout, { id: message.id, result: { thread: { id: 'prepared-thread' }, model: 'test' } });
+            }
+        } }));
+        const owner = new AbortController();
+        const prepared = await prepareFromSessionEnvironment(
+            { command, args, env: {
+                ...process.env,
+                HAPPY_INITIAL_PROMPT: 'synthetic launch seed',
+                CLAUDE_MEMORY_RECALL_OWNER: 'stale owner marker',
+                ...(condition === 'environment changed' ? { OPENAI_BASE_URL: 'http://127.0.0.1:42/v1' } : {}),
+            }, cwd: process.cwd() },
+            { signal: owner.signal, isCurrent: () => {
+                if (claiming && condition === 'scope unavailable') throw new Error('Scope owner disconnected');
+                return !claiming || condition !== 'account changed';
+            } },
+        );
+        const preparedChild = mockSpawn.mock.results[0].value;
+        const client = new CodexAppServerClient();
+        try {
+            if (condition === 'unchanged') expect(mockSpawn.mock.calls[0][2].env).toEqual(launch.env);
+            claiming = true;
+            if (hasSessionLinks) for (const [key, value] of Object.entries(sessionLinks)) vi.stubEnv(key, value);
+            if (condition === 'owner cancelled') owner.abort();
+            const threadPathChanged = condition === 'thread directory changed';
+            const recheckFails = hasSessionLinks && condition !== 'session links';
+            const reuse = condition === 'unchanged' || condition === 'project disables plugins' || condition === 'organization disables plugins'
+                || condition === 'session links';
+            const initiallyReused = reuse || recheckFails || threadPathChanged;
+            await client.connect('codex-cli 0.171.0', prepared);
+            owner.abort();
+            expect(mockSpawn).toHaveBeenCalledTimes(initiallyReused ? 1 : 2);
+            if (!initiallyReused) expect(preparedChild.exitCode).toBe(0);
+            else expect(preparedChild.kill).not.toHaveBeenCalled();
+            const mcpServers = condition === 'MCP expects session links' ? { probe: { command: 'probe', env_vars: ['APLUS_SESSION_URL'] } } : undefined;
+            await expect(client.startThread({ cwd: threadPathChanged ? 'different-project' : process.cwd(), mcpServers }))
+                .resolves.toMatchObject({ threadId: 'prepared-thread' });
+            if (threadPathChanged || recheckFails) expect(preparedChild.exitCode).toBe(0);
+            expect(requests.filter(row => row.method === 'initialize')).toHaveLength(reuse ? 1 : 2);
+            expect(requests.filter(row => row.method === 'thread/start')).toHaveLength(1);
+            expect(mockSpawn.mock.calls[0][1]).toEqual([...args, '--disable', 'plugins']);
+            const threadConfig = requests.find(row => row.method === 'thread/start')?.params.config;
+            expect(threadConfig?.features?.plugins).toBe(reuse ? condition === 'unchanged' || condition === 'session links' : undefined);
+            expect(threadConfig?.shell_environment_policy?.set).toEqual(condition === 'session links' ? sessionLinks : undefined);
+            if (recheckFails) expect(mockSpawn.mock.calls[1][2].env).toMatchObject(sessionLinks);
+        } finally {
+            await client.disconnect();
+            await prepared.dispose();
+            vi.unstubAllEnvs();
+        }
+    });
+
+    it('disposes the prepared server when native plugin settings are inconclusive', async () => {
+        const { codexAppServerArgs, prepareCodexAppServer } = await import('./preparedCodexAppServer');
+        const child = createMockProcess({ onRequest: (message, stdout) => {
+            if (message.id !== undefined && message.method !== 'initialize') {
+                pushJsonLine(stdout, { id: message.id, result: {} });
+            }
+        } });
+        mockSpawn.mockReturnValue(child);
+        const preparation = prepareCodexAppServer(
+            { command: 'codex', args: codexAppServerArgs, env: {}, cwd: process.cwd() },
+            { isCurrent: () => true },
+        );
+        try {
+            await expect(preparation).rejects.toThrow('could not verify startup configuration');
+            expect(child.exitCode).toBe(0);
+        } finally {
+            await preparation.then(prepared => prepared.dispose(), () => {});
+        }
+    });
+
+    it.each(['direct process', 'Windows command shim'] as const)('waits for the prepared server to exit when its owner cancels initialization (%s)', async launcher => {
+        const { codexAppServerArgs, prepareCodexAppServer } = await import('./preparedCodexAppServer');
+        const owner = new AbortController();
+        const child = createMockProcess({
+            initializeDelayMs: 20,
+            onRequest: message => {
+                if (message.method === 'initialize') queueMicrotask(() => owner.abort());
+            },
+        });
+        const wrapped = launcher === 'Windows command shim';
+        if (wrapped) {
+            child.spawnfile = 'C:\\Windows\\System32\\cmd.exe';
+            child.stdin.once('finish', () => {
+                child.exitCode = 0;
+                child.emit('exit', 0, null);
+            });
+        }
+        mockSpawn.mockReturnValue(child);
+        const preparation = prepareCodexAppServer(
+            { command: 'codex', args: codexAppServerArgs, env: {}, cwd: process.cwd() },
+            { signal: owner.signal, isCurrent: () => true },
+        );
+        try {
+            await expect(preparation).rejects.toThrow();
+            expect(child.kill).toHaveBeenCalledTimes(wrapped ? 0 : 1);
+            expect(child.exitCode).toBe(0);
+        } finally {
+            await preparation.then(prepared => prepared.dispose(), () => {});
+        }
+    });
+
     beforeEach(() => {
         vi.clearAllMocks();
         mockResolveCodexStateEnvironment.mockImplementation(async env => env);
@@ -169,6 +328,32 @@ describe('CodexAppServerClient sandbox integration', () => {
 
     afterAll(() => {
         process.env.RUST_LOG = originalRustLog;
+    });
+
+    it.skipIf(process.platform !== 'win32')('accepts one Windows thread after a slow model and MCP startup', async () => {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        let starts = 0;
+        let reply: (() => void) | undefined;
+        mockSpawn.mockImplementation(() => createMockProcess({ onRequest: (message, stdout) => {
+            if (message.method === 'thread/start') {
+                starts++;
+                reply = () => pushJsonLine(stdout, { id: message.id, result: { thread: { id: 'slow-thread' }, model: 'test' } });
+            }
+        } }));
+        const client = new CodexAppServerClient();
+        try {
+            await client.connect();
+            vi.useFakeTimers();
+            const result = client.startThread({}).then(thread => thread.threadId, (error: Error) => error.message);
+            await vi.waitFor(() => expect(reply).toBeDefined());
+            await vi.advanceTimersByTimeAsync(37_253);
+            reply!();
+            expect(await result).toBe('slow-thread');
+            expect(starts).toBe(1);
+        } finally {
+            vi.useRealTimers();
+            await client.disconnect();
+        }
     });
 
     it.each([false, true])('starts the original thread and accepted turn without waiting for optional native project binding (initial rejection=%s)', async initialRejection => {

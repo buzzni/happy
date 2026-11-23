@@ -10,10 +10,10 @@ import {
     type SessionTurnEndStatus,
 } from '@slopus/happy-wire';
 import {
+    BASH_STREAM_AGENT_TOOL_NAME,
     setActiveBashStreamCall,
     clearActiveBashStreamCall,
 } from './bashStreamCallRegistry';
-import { BASH_STREAM_AGENT_TOOL_NAME } from './startHappyServer';
 import { recordToolUse, getToolNameById, shouldRedact } from '@/redact/redactGate';
 import { backgroundTaskNoticeId, sdkBackgroundTaskCompletion, stoppedBackgroundTaskCompletion } from './backgroundTaskCompletion';
 import { toolResultText } from './toolResultText';

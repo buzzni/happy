@@ -54,16 +54,12 @@ import { createBrokerGrantSource } from '@/browserRuntime/brokerGrantSource';
 import { BrowserRuntimeError } from '@/browserRuntime/contracts';
 import { BROWSER_TASK_UNAVAILABLE_REASON_ENV, BROWSER_TASK_UNAVAILABLE_REASON_PATTERN } from '@/daemon/browserTaskBroker';
 
-// chat-tool-output-streaming Phase 3 — bash_stream emits its agent-side
-// tool name via this constant so per-runner mappers (sessionProtocolMapper
-// for Claude, AcpSessionManager for ACP, …) consistently key the call
-// registry against the same name.
 import { runScriptAutomationTool, scriptAutomationToolRequestSchema } from './scriptAutomationTools';
 import { runScheduledTaskTool, scheduledTaskToolRequestSchema } from './scheduledTaskTools';
 import { registerTurnCardTools, TURN_CARD_TOOL_NAMES, type TurnCards } from './turnCardTools';
 import { LINKED_PULL_REQUEST_TOOL_NAMES, registerLinkedPullRequestTools, withLinkedPullRequestCapability } from './linkedPullRequestTools';
 
-export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
+export { BASH_STREAM_AGENT_TOOL_NAME } from './bashStreamCallRegistry';
 
 export interface HappyServerHandlers {
     protectedToolAccess?: () => ReturnType<typeof createProtectedToolAccess> | null | undefined;
@@ -641,6 +637,8 @@ const MCP_BEARER_ENV = 'SAYCODE_MCP_BEARER';
 export async function startHappyServer(
     client: ApiSessionClient,
     options: {
+        /** Codex attaches the authenticated stdio bridge to its thread after provider startup. */
+        useStdioBridge?: boolean;
         agentControl?: boolean;
         protectedToolAccess?: HappyServerHandlers['protectedToolAccess'];
         hostMcpServers?: () => Promise<Record<string, unknown>>;
@@ -848,9 +846,10 @@ export async function startHappyServer(
     // Claude receives this config as `--mcp-config` argv, which other local users can read. With a socket
     // the owner-only directory is the boundary and the token is defence in depth. Over TCP the bearer is
     // the boundary, so the config only references it and Claude expands it from its own environment.
-    if (!socketPath) process.env[MCP_BEARER_ENV] = token;
-    const mcpConfig: { type: 'stdio' | 'http'; command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> } = socketPath
-        ? { type: 'stdio', command: process.execPath, args: [join(projectPath(), 'bin/happy-mcp.mjs')], env: bridgeEnv }
+    const useStdioBridge = Boolean(socketPath) || options.useStdioBridge === true;
+    if (!useStdioBridge) process.env[MCP_BEARER_ENV] = token;
+    const mcpConfig: { type: 'stdio' | 'http'; command?: string; args?: string[]; env?: Record<string, string>; url?: string; headers?: Record<string, string> } = useStdioBridge
+        ? { type: 'stdio', command: process.execPath, args: [join(projectPath(), 'bin/happy-mcp.mjs'), ...(socketPath ? [] : ['--url', baseUrl.toString()])], env: bridgeEnv }
         : { type: 'http', url: baseUrl.toString(), headers: { Authorization: `Bearer \${${MCP_BEARER_ENV}}` } };
 
     logger.debug(`[happyMCP] server:ready sessionId=${client.sessionId} url=${baseUrl.toString()}`);

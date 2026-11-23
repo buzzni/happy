@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, realpathSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, type SpawnOptionsWithoutStdio } from 'node:child_process';
@@ -7,7 +8,11 @@ import { prepareCodexRecallHost, buildCodexMemoryReferenceBlock, readRecallDiagn
 import { withCodexRecallOwnership } from './recallOwnerMarker';
 
 const fixtures: string[] = [];
-afterEach(() => { for (const dir of fixtures.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(async () => {
+    for (const dir of fixtures.splice(0)) {
+        await rm(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    }
+});
 
 function fixture(workerBody?: string) {
     const root = mkdtempSync(join(tmpdir(), 'happy-recall-host-'));
@@ -23,10 +28,11 @@ function fixture(workerBody?: string) {
     });`;
     writeFileSync(join(root, 'hooks', 'codex-session-start.js'), script);
     writeFileSync(join(root, 'hooks', 'codex-user-prompt-submit.js'), script);
+    writeFileSync(join(root, 'settings.json'), JSON.stringify({ codexEventMemoryEnabled: true }));
     return {
         root,
         options: {
-            accountOwned: true, sandboxEnabled: true, sandboxPolicyMode: 'owner-choice' as const, projectPath: root, env: { CLAUDE_MEMORY_RECALL_OWNER: 'host', CLAUDE_MEMORY_DEBUG: '1' },
+            accountOwned: true, sandboxEnabled: true, sandboxPolicyMode: 'owner-choice' as const, projectPath: root, env: { HAPPY_LESSON_DAEMON_HOME: root, CLAUDE_MEMORY_RECALL_OWNER: 'host', CLAUDE_MEMORY_DEBUG: '1' },
             deps: {
                 resolveEntry: vi.fn(async () => join(root, 'services', 'lesson-host-service.js')),
                 runtimeCompatible: vi.fn(async () => true),
@@ -38,6 +44,22 @@ function fixture(workerBody?: string) {
 const turn = (extra = {}) => ({ threadId: 'native-thread', prompt: 'original request', resumed: false, signal: new AbortController().signal, ...extra });
 
 describe('Codex event-memory host', () => {
+    it('requires persisted opt-in even if CML is installed and stops recall after revocation', async () => {
+        const { root, options } = fixture();
+        const file = join(root, 'settings.json');
+        rmSync(file);
+        expect(await prepareCodexRecallHost(options)).toBeNull();
+        for (const value of ['{"codexEventMemoryEnabled":false}', '{"codexEventMemoryEnabled":"true"}', '{']) {
+            writeFileSync(file, value);
+            expect(await prepareCodexRecallHost(options)).toBeNull();
+        }
+        expect(options.deps.resolveEntry).not.toHaveBeenCalled();
+        writeFileSync(file, '{"codexEventMemoryEnabled":true}');
+        const host = await prepareCodexRecallHost(options);
+        expect(host).not.toBeNull();
+        writeFileSync(file, '{"codexEventMemoryEnabled":false}');
+        expect(await host!.recall(turn())).toEqual({ reason: 'disabled', context: '' });
+    });
     it('does not open a project memory host without an authenticated project path', async () => {
         const { options } = fixture();
         expect(await prepareCodexRecallHost({ ...options, projectPath: null })).toBeNull();

@@ -6,6 +6,11 @@ import { applyLessonLaunchEnvironment, lessonCallerSharesIdentity } from './less
 import { LESSON_OWNER_ENV, LESSON_HOST_DISABLED_ENV } from './lessonOwnerMarker';
 import { LESSON_DAEMON_HOME_ENV } from './lessonSessionHost';
 import { prepareMcpChildEnvironment } from '@/daemon/mcpCallerGrantEnvelope';
+import { isProjectLessonHostEnabled } from './lessonSettingsStore';
+vi.mock('./lessonSettingsStore', async importOriginal => ({
+    ...await importOriginal<typeof import('./lessonSettingsStore')>(),
+    isProjectLessonHostEnabled: vi.fn(async () => true),
+}));
 
 function jwt(payload: Record<string, unknown>): string {
     const encode = (value: Record<string, unknown>) =>
@@ -39,6 +44,13 @@ describe('lessonCallerSharesIdentity', () => {
 });
 
 describe('applyLessonLaunchEnvironment', () => {
+    it('keeps native lessons behind host policy without opening the project store when settings are off', async () => {
+        vi.mocked(isProjectLessonHostEnabled).mockResolvedValueOnce(false);
+        const hostIsReady = vi.fn(async () => true);
+        const result = await applyLessonLaunchEnvironment({ ...base, environment: {}, callerToken: undefined, hostIsReady });
+        expect(result.decision.owner).toBe('host');
+        expect(hostIsReady).not.toHaveBeenCalled();
+    });
     it.each([false, true])('applies daemon lesson eligibility without an RPC machineId (Windows trial=%s)', async trial => {
         // Execute the real spawn binding and eligibility expression without
         // starting a daemon or importing its CLI side effects.

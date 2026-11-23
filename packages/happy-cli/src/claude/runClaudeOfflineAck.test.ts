@@ -50,7 +50,7 @@ vi.mock('@/utils/serverConnectionErrors', async (importOriginal) => ({
 }));
 vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: mockInstallBroadKillShims }));
 vi.mock('@/ui/doctor', () => ({ getEnvironmentInfo: async () => ({}) }));
-vi.mock('@/daemon/run', () => ({ initialMachineMetadata: () => ({}) }));
+vi.mock('@/daemon/initialMachineMetadata', () => ({ initialMachineMetadata: () => ({}) }));
 
 // Imported statically, as runClaude.test.ts does: loading runClaude's whole
 // module graph costs ~1.1–1.3s of CPU on a cold worker, and on a loaded host

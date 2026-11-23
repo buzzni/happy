@@ -326,6 +326,8 @@ interface CopyFileResponse {
 */
 
 export interface SpawnSessionOptions {
+    /** Optional correlation with a neutral local draft; never grants permission to spawn. */
+    draftRunnerId?: string;
     machineId?: string;
     directory: string;
     sessionId?: string;

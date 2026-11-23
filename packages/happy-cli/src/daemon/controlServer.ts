@@ -121,6 +121,7 @@ export function startDaemonControlServer({
   standaloneDrain,
   restartDrain,
   canRefreshCodexRunner,
+  draftRunner,
   writeScopeRuntime,
   browserLocalSetup,
   desktopBrowserLogin,
@@ -146,6 +147,7 @@ export function startDaemonControlServer({
   /** aplus codexcli-daemon-restart-drain — absent on preflight and in tests that do not drain. */
   restartDrain?: RestartDrainControlPort;
   canRefreshCodexRunner?: () => boolean | null;
+  draftRunner?: (action: 'prepare' | 'renew' | 'release', id: string, provider: 'claude' | 'codex', machineId: string, directory?: string) => Promise<boolean>;
   browserLocalSetup?: BrowserLocalSetup;
   desktopBrowserLogin?: { status(): unknown; attach(input: unknown): Promise<void>; adminSocket(): string | undefined };
   getChildren: () => TrackedSession[];
@@ -256,6 +258,7 @@ export function startDaemonControlServer({
         const allowed = new Set(['/session-started', '/session-runtime', '/list', '/spawn-session', '/stop-session', '/stop',
           '/allocate-port', '/release-port', '/get-port', '/port-registry', '/standalone-drain/capabilities',
           '/standalone-drain/begin', '/standalone-drain/status', '/standalone-drain/commit', '/standalone-drain/terminate']);
+        if (draftRunner) allowed.add('/draft-runner');
         if (!allowed.has(path)) {
           await reply.code(403).send({ error: 'Endpoint unavailable in the standalone Windows Codex trial',
             code: 'STANDALONE_WINDOWS_TRIAL_UNSUPPORTED' });
@@ -344,6 +347,13 @@ export function startDaemonControlServer({
     app.setValidatorCompiler(validatorCompiler);
     app.setSerializerCompiler(serializerCompiler);
     const typed = app.withTypeProvider<ZodTypeProvider>();
+    if (draftRunner) typed.post('/draft-runner', { bodyLimit: 8192, schema: { body: z.object({
+      version: z.literal(1), action: z.enum(['prepare', 'renew', 'release']), id: z.string().uuid(),
+      provider: z.enum(['claude', 'codex']), machineId: z.string().min(1).max(256),
+      directory: z.string().min(1).max(1024).optional(),
+    }).strict().refine(body => body.directory === undefined || body.action === 'prepare') } }, async ({ body }) => ({
+      version: 1, accepted: await draftRunner(body.action, body.id, body.provider, body.machineId, body.directory),
+    }));
 
     typed.post('/session-write-scope', { schema: { body: z.discriminatedUnion('action', [
       z.object({ action: z.literal('list'), sessionId: z.string().min(1).max(128) }).strict(),
@@ -677,6 +687,7 @@ export function startDaemonControlServer({
         body: z.object({
           directory: z.string(),
           sessionId: z.string().optional(),
+          draftRunnerId: z.string().uuid().optional(),
           agent: z.enum(['claude', 'codex', 'gemini', 'grok', 'openclaw', 'opencode']).optional(),
           environmentVariables: z.record(z.string(), z.string()).optional(),
           happyToken: z.string().optional(),
@@ -733,6 +744,7 @@ export function startDaemonControlServer({
       }
       const result = await spawnSession({
         directory,
+        ...(request.body.draftRunnerId ? { draftRunnerId: request.body.draftRunnerId } : {}),
         sessionId,
         agent,
         environmentVariables,

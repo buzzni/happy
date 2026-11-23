@@ -81,7 +81,7 @@ async function httpMcp(listings: Array<Array<{ name: string; annotations?: Recor
 }
 
 function stdioChild(args: string[], env: Record<string, string>) {
-    const child = spawn(process.execPath, ['--import', 'tsx', resolve('src/codex/happyMcpStdioBridge.ts'), ...args], {
+    const child = spawn(process.execPath, ['--no-warnings', '--no-deprecation', resolve('bin/happy-mcp.mjs'), ...args], {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, HAPPY_HTTP_MCP_HEADERS: '', ...env },
     });

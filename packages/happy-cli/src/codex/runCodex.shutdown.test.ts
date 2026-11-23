@@ -1,4 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
+import type { PreparedCodexAppServer } from './preparedCodexAppServer';
 
 const fixture = vi.hoisted(() => ({
     submit: null as null | ((input: { token: string; proposal: unknown }) => { accepted: boolean }),
@@ -13,7 +14,7 @@ const fixture = vi.hoisted(() => ({
     onInterrupt: null as null | (() => void),
     onSend: null as null | (() => Promise<void>),
     onSteer: null as null | (() => Promise<void>),
-    onConnect: null as null | (() => Promise<void>),
+    onConnect: null as null | ((preparation?: PreparedCodexAppServer) => Promise<void>),
     onResumeThread: null as null | (() => Promise<void>),
     onClearThreadState: null as null | (() => void),
     proposal: { name: 'Verified recovery' },
@@ -80,7 +81,7 @@ vi.mock('@/utils/serverConnectionErrors', async (original) => ({
     },
 }));
 vi.mock('@/utils/automationContextExit', () => ({ reportAutomationContextExit: fixture.reportAutomationExit }));
-vi.mock('@/daemon/run', () => ({ initialMachineMetadata: {} }));
+vi.mock('@/daemon/initialMachineMetadata', () => ({ initialMachineMetadata: {} }));
 vi.mock('@/daemon/controlClient', () => ({ notifyDaemonSessionStarted: vi.fn(async () => ({})) }));
 vi.mock('@/ui/auth', () => ({ authAndSetupMachineIfNeeded: vi.fn(async () => ({ credentials: { token: 'test-token' } })) }));
 vi.mock('@/daemon/ensureDaemonRunning', () => ({ ensureDaemonRunning: vi.fn(async () => {}) }));
@@ -126,7 +127,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({ CodexAppServerClient: class {
     sandboxEnabled = false;
     threadRolloutPath = '/tmp/native-rollout.jsonl';
     prepareSideAppServer = fixture.prepareSideAppServer;
-    connect = async () => { await fixture.onConnect?.(); };
+    connect = async (_version?: string, preparation?: PreparedCodexAppServer) => { await fixture.onConnect?.(preparation); };
     resumeThread = async ({ threadId }: { threadId: string }) => { await fixture.onResumeThread?.(); this.threadId = threadId; return { threadId, model: 'test' }; };
     disconnect = fixture.disconnect;
     steerTurn = async (text: string) => { fixture.steerText = text; await fixture.onSteer?.(); };
@@ -182,7 +183,7 @@ afterEach(() => { process.exitCode = originalExitCode; vi.restoreAllMocks(); vi.
 afterEach(() => { fixture.recoverMcp.mockReset().mockResolvedValue({ status: 'ready', affectedServers: [] }); fixture.readMcpStatuses.mockReset().mockResolvedValue([]); });
 afterEach(() => { fixture.sideConnection = null; fixture.prepareSideAppServer.mockReset().mockResolvedValue(null); });
 afterEach(() => { fixture.offline = false; fixture.reconnectOffline = null; delete (fixture.session as { runtimeId?: string }).runtimeId; });
-async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string, reconnect?: import('@/daemon/reconnectSessionEnv').ReconnectSessionClientSnapshot, launch?: { args?: string[]; modelSeed?: string; keepOpen?: boolean }) {
+async function start(prompt = 'Test input', confirmed = false, review?: import('@/memory/lessonReviewWorker').LessonReviewWorker, standaloneLaunch?: StandaloneLaunchBootstrap, resumeThreadId?: string, reconnect?: import('@/daemon/reconnectSessionEnv').ReconnectSessionClientSnapshot, launch?: { args?: string[]; modelSeed?: string; keepOpen?: boolean; preparedAppServer?: PreparedCodexAppServer }) {
     for (const key of Object.keys(process.env)) {
         if (/^(HAPPY_RECONNECT_|HAPPY_INITIAL_|HAPPY_FORK|HAPPY_MANAGED_|SAYCODE_PROVIDER_|HAPPY_AUTOMATION_)/.test(key)) vi.stubEnv(key, undefined);
     }
@@ -199,7 +200,15 @@ async function start(prompt = 'Test input', confirmed = false, review?: import('
         return handleCodexCommand(['--started-by', 'daemon', '--no-sandbox', ...(resumeThreadId ? ['--resume', resumeThreadId] : []), ...launch.args]);
     }
     const { runCodex } = await import('./runCodex');
-    return runCodex({ principal: { kind: 'account', credentials: { token: 'test-token' } as never }, noSandbox: true, ...(resumeThreadId ? { resumeThreadId } : {}), ...(standaloneLaunch ? { standaloneLaunch, startedBy: 'daemon' as const } : {}), ...(launch?.keepOpen ? { startedBy: 'daemon' as const } : {}), ...(review ? { lessons: { turn: null, review, sessionKind: 'foreground' as const } } : {}) });
+    return runCodex({
+        principal: { kind: 'account', credentials: { token: 'test-token' } as never },
+        noSandbox: true,
+        resumeThreadId,
+        standaloneLaunch,
+        startedBy: standaloneLaunch || launch?.keepOpen ? 'daemon' : undefined,
+        preparedAppServer: launch?.preparedAppServer,
+        ...(review ? { lessons: { turn: null, review, sessionKind: 'foreground' as const } } : {}),
+    });
 }
 async function finishFrozenFixture(running: Promise<void>) {
     await vi.waitFor(() => expect(fixture.events).toContain('loopExited'));
@@ -450,6 +459,22 @@ describe('Codex runtime producer bookkeeping', () => {
         expect(fixture.send).toHaveBeenCalledOnce();
     });
 
+    it('sends the turn while a fallback MCP status report is still pending', async () => {
+        let complete!: (rows: []) => void;
+        const pendingReport = new Promise<[]>(resolve => { complete = resolve; });
+        let began!: () => void;
+        const probeStarted = new Promise<void>(resolve => { began = resolve; });
+        fixture.readMcpStatuses.mockImplementation(() => { began(); return pendingReport; });
+        const running = start();
+        try {
+            await Promise.race([probeStarted, running.then(() => { throw new Error('Provider exited before status reporting'); })]);
+            await vi.waitFor(() => expect(fixture.send).toHaveBeenCalledOnce(), { timeout: 1_000 });
+        } finally {
+            complete([]);
+            await running;
+        }
+    }, 60_000);
+
     it('falls back to fresh status reporting when recovery supplied no valid snapshot', async () => {
         const fresh = [{ name: 'notion', status: 'reconnecting' as const, checkedAt: 5 }];
         fixture.readMcpStatuses.mockResolvedValue(fresh);
@@ -464,9 +489,14 @@ describe('Codex runtime producer bookkeeping', () => {
     // that the session has no Codex thread to resume.
     it('records why Codex failed to start in the session log and the conversation before ending the session', async () => {
         const failure = new Error('Unsupported codex-multi-auth version 2.15.0; supported: >=2.16.0');
-        fixture.onConnect = async () => { throw failure; };
+        const preparedAppServer = { claim: vi.fn(), dispose: vi.fn(async () => {}) };
+        fixture.onConnect = async preparation => {
+            expect(preparation).toBe(preparedAppServer);
+            throw failure;
+        };
 
-        await expect(start()).rejects.toBe(failure);
+        await expect(start('Test input', false, undefined, undefined, undefined, undefined,
+            { keepOpen: true, preparedAppServer })).rejects.toBe(failure);
 
         expect(logger.warn).toHaveBeenCalledWith('[codex]: Codex failed to start', failure);
         const notice = { type: 'message', message: 'Codex failed to start: Unsupported codex-multi-auth version 2.15.0; supported: >=2.16.0' };
@@ -477,7 +507,7 @@ describe('Codex runtime producer bookkeeping', () => {
         expect(noticeOrder).toBeLessThan(fixture.session.sendSessionDeath.mock.invocationCallOrder[0]);
         expect(noticeOrder).toBeLessThan(fixture.session.flush.mock.invocationCallOrder[0]);
         expect(fixture.send).not.toHaveBeenCalled();
-    });
+    }, 15_000);
 
     it('records why resuming the Codex thread failed instead of ending the session silently', async () => {
         fixture.onResumeThread = async () => { throw new Error('thread not found'); };

@@ -46,6 +46,18 @@
         "default": "./dist/lib.mjs"
       }
     },
+    "./internal/claude-message-schema": {
+      "import": "./dist/claude/types.mjs"
+    },
+    "./internal/claude-hook-server": {
+      "import": "./dist/claude/utils/parkedHookServer.mjs"
+    },
+    "./internal/claude-draft": {
+      "import": "./dist/claude/sdk/preparedClaudeDraft.mjs"
+    },
+    "./internal/resident-codex-entry": {
+      "import": "./dist/commands/residentCodexEntry.mjs"
+    },
     "./codex/happyMcpStdioBridge": {
       "require": {
         "types": "./dist/codex/happyMcpStdioBridge.d.cts",
@@ -104,7 +116,7 @@
     "bundle:server": "node scripts/bundle-server.cjs",
     "bundle:server:all": "node scripts/bundle-server.cjs --all-platforms",
     "bundle:webapp": "node scripts/bundle-webapp.cjs",
-    "build": "shx rm -rf dist && tsc --noEmit && pkgroll && node scripts/copy-browser-extension.cjs",
+    "build": "shx rm -rf dist && tsc --noEmit && pkgroll && node scripts/bundle-mcp-bridge.mjs && node scripts/bundle-resident-session.mjs && node scripts/copy-browser-extension.cjs",
     "test": "pnpm run build && vitest run --project unit",
     "test:integration": "pnpm run build && vitest run --project integration-empty --project integration-plan-mode --project integration-authenticated",
     "test:context-isolation-native": "vitest run --project integration-automation-context",
@@ -179,6 +191,7 @@
     "@types/ws": "^8.18.1",
     "cross-env": "^10.1.0",
     "dotenv": "^16.6.1",
+    "esbuild": "0.26.0",
     "eslint": "^9",
     "eslint-config-prettier": "^10",
     "jsdom": "29.1.1",

@@ -57,11 +57,12 @@
  * ensuring 1:1 mapping between Happy process and Claude session.
  */
 
-import { createServer, IncomingMessage, ServerResponse, Server } from 'node:http';
+import type { IncomingMessage, ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { logger } from '@/ui/logger';
 import type { ListedTool } from '@/toolPolicy/evaluate';
 import type { HookVerdict, PreToolUseCall } from '@/toolPolicy/policyGate';
+import { reserveClaudeHookServer, takeParkedClaudeHookServer } from './parkedHookServer';
 
 /** Header carrying the per-process secret the policy hook script reads from its 0600 file. */
 export const PRE_TOOL_USE_SECRET_HEADER = 'x-happy-hook-secret';
@@ -116,105 +117,94 @@ export interface HookServer {
 export async function startHookServer(options: HookServerOptions): Promise<HookServer> {
     const { onSessionHook, preToolUse } = options;
 
-    return new Promise((resolve, reject) => {
-        const server: Server = createServer(async (req: IncomingMessage, res: ServerResponse) => {
-            // Only handle POST to /hook/session-start
-            if (req.method === 'POST' && req.url === '/hook/session-start') {
-                // Set timeout to prevent hanging if Claude doesn't close stdin
-                const timeout = setTimeout(() => {
-                    if (!res.headersSent) {
-                        logger.debug('[hookServer] Request timeout');
-                        res.writeHead(408).end('timeout');
-                    }
-                }, 5000);
+    const handle = async (req: IncomingMessage, res: ServerResponse) => {
+        // Only handle POST to /hook/session-start
+        if (req.method === 'POST' && req.url === '/hook/session-start') {
+            // Set timeout to prevent hanging if Claude doesn't close stdin
+            const timeout = setTimeout(() => {
+                if (!res.headersSent) {
+                    logger.debug('[hookServer] Request timeout');
+                    res.writeHead(408).end('timeout');
+                }
+            }, 5000);
 
+            try {
+                const chunks: Buffer[] = [];
+                for await (const chunk of req) {
+                    chunks.push(chunk as Buffer);
+                }
+                clearTimeout(timeout);
+
+                const body = Buffer.concat(chunks).toString('utf-8');
+                logger.debug('[hookServer] Received session hook:', body);
+
+                let data: SessionHookData = {};
                 try {
-                    const chunks: Buffer[] = [];
-                    for await (const chunk of req) {
-                        chunks.push(chunk as Buffer);
-                    }
-                    clearTimeout(timeout);
-                    
-                    const body = Buffer.concat(chunks).toString('utf-8');
-                    logger.debug('[hookServer] Received session hook:', body);
-
-                    let data: SessionHookData = {};
-                    try {
-                        data = JSON.parse(body);
-                    } catch (parseError) {
-                        logger.debug('[hookServer] Failed to parse hook data as JSON:', parseError);
-                    }
-
-                    // Support both snake_case (from Claude) and camelCase
-                    const sessionId = data.session_id || data.sessionId;
-                    if (sessionId) {
-                        logger.debug(`[hookServer] Session hook received session ID: ${sessionId}`);
-                        onSessionHook(sessionId, data);
-                    } else {
-                        logger.debug('[hookServer] Session hook received but no session_id found in data');
-                    }
-
-                    res.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok');
-                } catch (error) {
-                    clearTimeout(timeout);
-                    logger.debug('[hookServer] Error handling session hook:', error);
-                    if (!res.headersSent) {
-                        res.writeHead(500).end('error');
-                    }
+                    data = JSON.parse(body);
+                } catch (parseError) {
+                    logger.debug('[hookServer] Failed to parse hook data as JSON:', parseError);
                 }
-                return;
-            }
 
-            if (req.method === 'POST' && req.url === '/hook/pre-tool-use' && preToolUse) {
-                await handlePreToolUse(req, res, preToolUse);
-                return;
-            }
-
-            if (req.method === 'POST' && req.url === '/hook/tools-listed' && preToolUse) {
-                await handleToolsListed(req, res, preToolUse);
-                return;
-            }
-
-            if (req.method === 'POST' && req.url === '/hook/attendance' && preToolUse?.unattended) {
-                const presented = req.headers[PRE_TOOL_USE_SECRET_HEADER];
-                req.resume();
-                if (typeof presented !== 'string' || !secretMatches(presented, preToolUse.secret)) {
-                    res.writeHead(403).end('forbidden');
-                    return;
+                // Support both snake_case (from Claude) and camelCase
+                const sessionId = data.session_id || data.sessionId;
+                if (sessionId) {
+                    logger.debug(`[hookServer] Session hook received session ID: ${sessionId}`);
+                    onSessionHook(sessionId, data);
+                } else {
+                    logger.debug('[hookServer] Session hook received but no session_id found in data');
                 }
-                res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ unattended: preToolUse.unattended() }));
-                return;
-            }
 
-            // 404 for anything else
-            res.writeHead(404).end('not found');
-        });
-
-        // Listen on random available port
-        server.listen(0, '127.0.0.1', () => {
-            const address = server.address();
-            if (!address || typeof address === 'string') {
-                reject(new Error('Failed to get server address'));
-                return;
-            }
-
-            const port = address.port;
-            logger.debug(`[hookServer] Started on port ${port}`);
-
-            resolve({
-                port,
-                stop: () => {
-                    server.close();
-                    logger.debug('[hookServer] Stopped');
+                res.writeHead(200, { 'Content-Type': 'text/plain' }).end('ok');
+            } catch (error) {
+                clearTimeout(timeout);
+                logger.debug('[hookServer] Error handling session hook:', error);
+                if (!res.headersSent) {
+                    res.writeHead(500).end('error');
                 }
-            });
-        });
+            }
+            return;
+        }
 
-        server.on('error', (err) => {
-            logger.debug('[hookServer] Server error:', err);
-            reject(err);
-        });
-    });
+        if (req.method === 'POST' && req.url === '/hook/pre-tool-use' && preToolUse) {
+            await handlePreToolUse(req, res, preToolUse);
+            return;
+        }
+
+        if (req.method === 'POST' && req.url === '/hook/tools-listed' && preToolUse) {
+            await handleToolsListed(req, res, preToolUse);
+            return;
+        }
+
+        if (req.method === 'POST' && req.url === '/hook/attendance' && preToolUse?.unattended) {
+            const presented = req.headers[PRE_TOOL_USE_SECRET_HEADER];
+            req.resume();
+            if (typeof presented !== 'string' || !secretMatches(presented, preToolUse.secret)) {
+                res.writeHead(403).end('forbidden');
+                return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ unattended: preToolUse.unattended() }));
+            return;
+        }
+
+        // 404 for anything else
+        res.writeHead(404).end('not found');
+    };
+
+    let server = takeParkedClaudeHookServer();
+    if (!server?.adopt(handle)) {
+        server?.stop();
+        server = await reserveClaudeHookServer();
+        if (!server.adopt(handle)) {
+            server.stop();
+            throw new Error('Claude hook server could not be bound');
+        }
+    }
+    const { port, stop } = server;
+    logger.debug(`[hookServer] Started on port ${port}`);
+    return { port, stop: () => {
+        stop();
+        logger.debug('[hookServer] Stopped');
+    } };
 }
 
 

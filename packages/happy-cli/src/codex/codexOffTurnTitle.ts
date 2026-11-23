@@ -118,6 +118,7 @@ async function runCodexCommand(spawnImpl: typeof crossSpawn, prepare: PrepareCod
     const child = spawnImpl(launch.command, launch.args, {
         cwd: opts.cwd,
         env: launch.env,
+        windowsHide: true,
         stdio: [opts.input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
     });
     let stdout = '';

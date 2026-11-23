@@ -138,12 +138,11 @@ const settingsSchema = z.object({
 
 export type LessonSettings = z.infer<typeof settingsSchema>;
 
-/** New projects use foreground lesson proposals by default. Existing explicit
- * settings, including review off and gateway budgets, remain unchanged. */
+/** Each project chooses lesson recall and proposal capture independently. */
 export const LESSON_SETTINGS_DEFAULT: LessonSettings = {
     revision: LESSON_SETTINGS_INITIAL_REVISION,
-    recallEnabled: true,
-    reviewEnabled: true,
+    recallEnabled: false,
+    reviewEnabled: false,
     dailyMicroUsd: 0,
     dailyTokens: 0,
 };
@@ -178,6 +177,13 @@ export interface LessonSettingsStore {
         dailyMicroUsd: number;
         dailyTokens: number;
     }): Promise<LessonSettingsWrite>;
+}
+
+export async function isProjectLessonHostEnabled(daemonHome: string, projectId: string): Promise<boolean> {
+    try {
+        const settings = await createLessonSettingsStore(lessonSettingsPath(daemonHome, projectId)).read();
+        return settings.recallEnabled || settings.reviewEnabled;
+    } catch { return false; }
 }
 
 export function createLessonSettingsStore(path: string): LessonSettingsStore {

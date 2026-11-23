@@ -62,7 +62,7 @@ describe('daemon MCP config CLI startup', () => {
     process.argv = ['node', 'happy', 'daemon', ...args]
     vi.mocked(process.exit).mockClear()
     vi.resetModules()
-    await import('./main')
+    await (await import('./main')).runHappyCli()
     await vi.waitFor(() => expect(process.exit).toHaveBeenCalledWith(0))
   }
 
@@ -238,7 +238,7 @@ describe('daemon MCP config CLI startup', () => {
     const error = vi.spyOn(console, 'error').mockImplementation(() => undefined)
     process.argv = ['node', 'happy', 'daemon', command]
     vi.resetModules()
-    await import('./main')
+    await (await import('./main')).runHappyCli()
     await vi.waitFor(() => expect(process.exit).toHaveBeenCalledWith(1))
     expect(error).toHaveBeenCalledWith(expect.stringContaining('Error:'), 'Failed to read settings')
     expect(mocks.spawn).not.toHaveBeenCalled()

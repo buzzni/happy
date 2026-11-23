@@ -16,9 +16,10 @@ function fixture(body = `return { importedPrompts: 1, importedResponses: 1, skip
     const entry = join(root, 'services', 'codex-host-ingest.js');
     writeFileSync(entry, `export const CML_CODEX_INGEST_CAPABILITIES = { version: 1, completedTurnsOnly: true };
         export async function importCodexCompletedTurns(input) { ${body} }`);
+    writeFileSync(join(root, 'settings.json'), JSON.stringify({ codexEventMemoryEnabled: true }));
     const options = {
         accountOwned: true, sandboxEnabled: true, sandboxPolicyMode: 'owner-choice' as const,
-        projectPath: root, env: { CLAUDE_MEMORY_RECALL_OWNER: 'host', CLAUDE_MEMORY_DEBUG: '1' },
+        projectPath: root, env: { HAPPY_LESSON_DAEMON_HOME: root, CLAUDE_MEMORY_RECALL_OWNER: 'host', CLAUDE_MEMORY_DEBUG: '1' },
         deps: {
             resolveEntry: vi.fn(async () => join(root, 'services', 'lesson-host-service.js')),
             load: vi.fn(async () => ({
@@ -34,6 +35,21 @@ const request = (root: string, throughTurnId = 'turn-1', threadId = 'native-thre
 });
 
 describe('Codex completed-turn memory host', () => {
+    it('does not load installed CML without consent or import a turn after the owner disables it', async () => {
+        const { root, options } = fixture();
+        const file = join(root, 'settings.json');
+        writeFileSync(file, '{"codexEventMemoryEnabled":false}');
+        expect(await prepareCodexIngestHost(options)).toBeNull();
+        expect(options.deps.resolveEntry).not.toHaveBeenCalled();
+        writeFileSync(file, '{"codexEventMemoryEnabled":true}');
+        const spawnWorker = vi.fn(() => { throw new Error('unexpected ingest worker'); });
+        const host = await prepareCodexIngestHost({ ...options, deps: { ...options.deps, spawn: spawnWorker } });
+        expect(host).not.toBeNull();
+        writeFileSync(file, '{"codexEventMemoryEnabled":false}');
+        expect(await host!.ingest(request(root))).toMatchObject({ reason: 'disabled', completedTurns: 0 });
+        expect(spawnWorker).not.toHaveBeenCalled();
+        await host!.close();
+    });
     it('does not open a project memory host without an authenticated project path', async () => {
         const { options } = fixture();
         expect(await prepareCodexIngestHost({ ...options, projectPath: null })).toBeNull();
@@ -184,6 +200,7 @@ describe('Codex completed-turn memory host', () => {
         const spawnSpy = vi.fn((command: string, args: string[], options: SpawnOptionsWithoutStdio) => spawn(command, args, options));
         const host = await prepareCodexIngestHost({ ...options, deps: { ...options.deps, spawn: spawnSpy } });
         const active = host!.ingest(request(root));
+        await vi.waitFor(() => expect(spawnSpy).toHaveBeenCalledOnce());
         const queued = host!.ingest(request(root, 'turn-2'));
         await host!.close();
         expect((await active).reason).toBe('cancelled');

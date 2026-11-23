@@ -9,13 +9,10 @@ import { ProviderUsageSpool } from '@/usage/providerUsageSpool';
 import { z } from 'zod';
 import { SessionOwnershipProofSchema, sessionCreateBodyHash, sessionTagHash, type SessionOwnershipProof } from '@slopus/happy-wire';
 import { HappySessionExecutionProofSchema, type HappySessionExecutionProof, type SessionExecutionCreateBody } from '@slopus/happy-wire';
-import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
-import type { DeviceKeys } from '@/daemon/deviceKeys';
 import axios from 'axios'
 import { logger } from '@/ui/logger'
 import type { AgentState, CreateSessionResponse, Metadata, Session, Machine, MachineMetadata, DaemonState } from '@/api/types'
 import { ApiSessionClient, type ApiSessionClientOptions } from './apiSession';
-import { ApiMachineClient } from './apiMachine';
 import { decodeBase64, encodeBase64, getRandomBytes, encrypt, decrypt, wrapDataEncryptionKey, buildMachineKeyEnvelopes } from './encryption';
 import { PushNotificationClient } from './pushNotifications';
 import { configuration } from '@/configuration';
@@ -24,8 +21,6 @@ import { Credentials } from '@/persistence';
 import { connectionState, isNetworkError, isConnectivityError, connectionErrorCode } from '@/utils/serverConnectionErrors';
 import { applySessionUrlEnv } from '@/utils/sessionUrlEnv';
 import type { ManagedAttachment } from '@/managed/managedSessionAttach';
-import type { CommonHandlerOptions } from '@/modules/common/registerCommonHandlers';
-import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
 
 /**
  * Who this client is.
@@ -75,8 +70,8 @@ export class OwnershipSessionCreationError extends Error {
 
 export class ApiClient {
 
-  static async create(credential: Credentials) {
-    return new ApiClient({ kind: 'account', credential });
+  static async create<C extends typeof ApiClient>(this: C, credential: Credentials): Promise<C['prototype']> {
+    return new this({ kind: 'account', credential });
   }
 
   /**
@@ -88,14 +83,14 @@ export class ApiClient {
    * refuses, and the paths that need account encryption material or a push
    * registration go through it.
    */
-  static managed(attachment: ManagedAttachment) {
-    return new ApiClient({ kind: 'managed-session', attachment });
+  static managed<C extends typeof ApiClient>(this: C, attachment: ManagedAttachment): C['prototype'] {
+    return new this({ kind: 'managed-session', attachment });
   }
 
   private readonly principal: ApiPrincipal;
   private readonly pushClient: PushNotificationClient | null;
 
-  private constructor(principal: ApiPrincipal) {
+  protected constructor(principal: ApiPrincipal) {
     this.principal = principal
     // Push registration is an **account** capability. A managed runtime must
     // not register for the customer's notifications: its bearer is scoped to
@@ -114,14 +109,14 @@ export class ApiClient {
    * the account's) or, worse, overwrite key material the server treats as
    * write-once — after which nothing could read the machine again.
    */
-  static managedMachine(input: {
+  static managedMachine<C extends typeof ApiClient>(this: C, input: {
     machineId: string;
     token: string;
     machineKey: Uint8Array;
     /** The Happy this credential was issued for, as the parent recorded it. */
     serverOrigin: string;
     usageRecoveryRoot?: string;
-  }) {
+  }): C['prototype'] {
     /*
      * The credential names its server, and this process talks to whatever
      * `configuration.serverUrl` says. Checked **here**, before any request:
@@ -134,7 +129,7 @@ export class ApiClient {
     if (new URL(input.serverOrigin).origin !== configured) {
       throw new Error('this managed credential was issued for a different server');
     }
-    return new ApiClient({
+    return new this({
       kind: 'managed-machine',
       machineId: input.machineId,
       token: input.token,
@@ -160,7 +155,7 @@ export class ApiClient {
   }
 
   /** The bearer this client presents, whichever principal it is. */
-  private bearer(): string {
+  protected bearer(): string {
     if (this.principal.kind === 'account') return this.principal.credential.token;
     if (this.principal.kind === 'managed-machine') return this.principal.token;
     return this.principal.attachment.scopedToken;
@@ -870,14 +865,6 @@ export class ApiClient {
     // over stale values inherited from a parent or an earlier resume process.
     applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
     return new ApiSessionClient(this.bearer(), session, undefined, { ...options, providerUsageStore: this.usageSpool(session) });
-  }
-
-  machineSyncClient(machine: Machine, deviceKeys?: DeviceKeys, deviceEnrollment?: ReturnType<typeof createDeviceEnrollment>, processState?: DaemonState,
-    withFilesystemMutation?: CommonHandlerOptions['withFilesystemMutation'], admitSubprocess?: CommonHandlerOptions['admitSubprocess'],
-    reserveLegacyDispatch?: (roots: readonly string[]) => Promise<LegacyDispatchReservation>): ApiMachineClient {
-    return withFilesystemMutation || admitSubprocess || reserveLegacyDispatch
-      ? new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState, withFilesystemMutation, admitSubprocess, reserveLegacyDispatch)
-      : new ApiMachineClient(this.bearer(), machine, deviceKeys, deviceEnrollment, processState);
   }
 
   /**

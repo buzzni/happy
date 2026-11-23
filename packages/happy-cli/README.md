@@ -25,6 +25,23 @@ demand when it needs it. Neither can fail the Happy install — a missing
 
 ## Usage
 
+### Optional project memory
+
+Happy's Codex host can inject project event memory into prompts and import the
+prompts and responses from completed turns using an installed Claude Memory
+Layer (CML). To enable these workers, set `"codexEventMemoryEnabled": true` in
+the machine daemon's existing `HAPPY_HOME_DIR/settings.json` and start a new
+project session. Change that field to `false` or remove it to stop future host
+recall and imports. Missing settings default to off. These workers run only
+for account-owned projects with an owner-choice sandbox.
+
+Codex's own CML integration is configured separately. Run
+`claude-memory-layer codex hooks install`, restart Codex, then trust the hooks
+in `/hooks` to enable native recall and import. Use
+`claude-memory-layer codex hooks uninstall` to remove the native hooks.
+Project lesson recall and lesson proposals each have their own opt-in in
+Saycode's project lesson settings.
+
 ### Claude Code (default)
 
 ```bash

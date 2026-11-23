@@ -1,5 +1,6 @@
 import type { SpawnSessionOptions } from '@/modules/common/registerCommonHandlers'
 import { filterCredentialsFromEnv } from '@/sandbox/config'
+import { applyWindowsClaudeDefaults } from './windowsClaudeEnvironment'
 
 type SpawnAgent = SpawnSessionOptions['agent']
 
@@ -36,20 +37,15 @@ export function resolveAgentAuthEnvironment(
   ) as Record<string, string>
 }
 
-export function resolveInheritedSpawnEnvironment(input: {
+export async function resolveInheritedSpawnEnvironment(input: {
   agent: SpawnAgent
   env: NodeJS.ProcessEnv
   filterCredentials: boolean
-}): Record<string, string> {
-  if (!input.filterCredentials) {
-    return Object.fromEntries(
-      Object.entries(input.env).filter((entry): entry is [string, string] => entry[1] !== undefined),
-    )
-  }
-  return {
-    ...filterCredentialsFromEnv(input.env),
-    ...resolveAgentAuthEnvironment(input.agent, input.env),
-  }
+}): Promise<Record<string, string>> {
+  const inherited = input.filterCredentials
+    ? { ...filterCredentialsFromEnv(input.env), ...resolveAgentAuthEnvironment(input.agent, input.env) }
+    : Object.fromEntries(Object.entries(input.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
+  return applyWindowsClaudeDefaults(input.agent, inherited)
 }
 
 export function resolveTmuxSpawnAgentCommand(agent: SpawnAgent): string | undefined {

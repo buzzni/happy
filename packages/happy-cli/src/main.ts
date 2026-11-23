@@ -11,39 +11,22 @@ import { rootDaemonWarning } from '@/daemon/rootDaemonWarning'
 import { takeStandaloneLaunchBootstrap } from '@/daemon/standaloneLaunchProtocol'
 import { configuration } from '@/configuration'
 import chalk from 'chalk'
-import { runClaude, StartOptions } from '@/claude/runClaude'
-import { runCodex } from '@/codex/runCodex'
+import type { StartOptions } from '@/claude/runClaude'
 import { assertProviderExecArguments } from '@/launcher/providerEntry'
 import { logger } from './ui/logger'
 import { readCredentials, readSettings } from './persistence'
 import { authAndSetupMachineIfNeeded } from './ui/auth'
 import packageJson from '../package.json'
 import { z } from 'zod'
-import { startDaemon } from './daemon/run'
 import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './daemon/controlClient'
 import { formatStopDaemonProgress, parseDaemonStopArgs, type StopDaemonProgress } from './daemon/restartDrainClient'
 import { getLatestDaemonLog } from './ui/logger'
-import { killRunawayHappyProcesses } from './daemon/doctor'
-import { install } from './daemon/install'
-import { uninstall } from './daemon/uninstall'
 import { ApiClient } from './api/api'
-import { runDoctorCommand, runDoctorDaemon } from './ui/doctor'
 import { listDaemonSessions, stopDaemonSession } from './daemon/controlClient'
-import { handleAuthCommand } from './commands/auth'
-import { handleConnectCommand } from './commands/connect'
-import { handleBrowserCommand } from './commands/browser'
-import { handleServerCommand } from './commands/server'
-import { handleDeviceCommand } from './commands/device'
-import { handleDataKeyCommand } from './commands/datakey'
 import { captureSpawnOutputStdio, spawnHappyCLI } from './utils/spawnHappyCLI'
-import { claudeCliPath } from './claude/claudeLocal'
 import { execFileSync } from 'node:child_process'
 import { extractNoSandboxFlag } from './utils/sandboxFlags'
-import { handleResumeCommand } from '@/resume/handleResumeCommand'
 import { ensureDaemonRunning } from './daemon/ensureDaemonRunning'
-import { handleCodexCommand } from './commands/codexCommand'
-import { runPreToolUseCli } from './hooks/runPreToolUseCli'
-import { preflightDaemonControlServer } from './daemon/controlServer'
 import { resolveDaemonPreset } from './aplus/mcpConfigPresets'
 import { readManagedStartup } from '@/managed/managedStartup';
 import { resolveDaemonMcpConfigEnvironment } from './daemon/daemonMcpConfig'
@@ -51,7 +34,7 @@ import { resolveDaemonStudioOriginEnvironment } from './daemon/daemonStudioOrigi
 import { waitForDaemonStart } from './daemon/waitForDaemonStart'
 
 
-(async () => {
+export async function runHappyCli() {
   const args = process.argv.slice(2)
 
   // If --version is passed - do not log, its likely daemon inquiring about our version
@@ -83,6 +66,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
 `)
         process.exit(0)
       }
+      const { killRunawayHappyProcesses } = await import('./daemon/doctor');
       const result = await killRunawayHappyProcesses()
       console.log(`Cleaned up ${result.killed} runaway processes`)
       if (result.errors.length > 0) {
@@ -90,11 +74,13 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       }
       process.exit(0)
     }
+    const { runDoctorCommand } = await import('./ui/doctor');
     await runDoctorCommand();
     return;
   } else if (subcommand === 'auth') {
     // Handle auth subcommands
     try {
+      const { handleAuthCommand } = await import('./commands/auth');
       await handleAuthCommand(args.slice(1));
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -107,6 +93,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
   } else if (subcommand === 'connect') {
     // Handle connect subcommands
     try {
+      const { handleConnectCommand } = await import('./commands/connect');
       await handleConnectCommand(args.slice(1));
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -118,6 +105,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
     return;
   } else if (subcommand === 'browser') {
     try {
+      const { handleBrowserCommand } = await import('./commands/browser');
       await handleBrowserCommand(args.slice(1));
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -199,6 +187,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
     return;
   } else if (subcommand === 'server') {
     try {
+      const { handleServerCommand } = await import('./commands/server');
       await handleServerCommand(args.slice(1));
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -209,12 +198,16 @@ Conversation history is preserved on the server, but in-flight tool calls are in
     }
     return;
   } else if (subcommand === 'device') {
-    try { await handleDeviceCommand(args.slice(1)); }
+    try {
+      const { handleDeviceCommand } = await import('./commands/device');
+      await handleDeviceCommand(args.slice(1));
+    }
     catch (error) { console.error(error instanceof Error ? error.message : 'DEVICE_CONTROL_UNAVAILABLE'); process.exit(1); }
     return;
   } else if (subcommand === 'datakey') {
     // aplus §6-1 — dataKey-활성 전환 관리 (specs/e2ee-cli-datakey-activation)
     try {
+      const { handleDataKeyCommand } = await import('./commands/datakey');
       await handleDataKeyCommand(args.slice(1));
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -231,6 +224,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
     // `happy hooks pre-tool-use` — invoked by Claude Code via .claude/settings.json
     const hookName = args[1];
     if (hookName === 'pre-tool-use') {
+      const { runPreToolUseCli } = await import('./hooks/runPreToolUseCli');
       const exit = await runPreToolUseCli({
         cwd: process.cwd(),
         stdin: process.stdin,
@@ -243,6 +237,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
     process.exit(1);
   } else if (subcommand === 'resume') {
     try {
+      const { handleResumeCommand } = await import('@/resume/handleResumeCommand');
       await handleResumeCommand(args.slice(1));
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -255,6 +250,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
   } else if (subcommand === 'codex') {
     // Handle codex command
     try {
+      const { handleCodexCommand } = await import('./commands/codexCommand');
       await handleCodexCommand(args.slice(1));
       // Do not force exit here; allow instrumentation to show lingering handles
     } catch (error) {
@@ -551,6 +547,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
     // Keep for backward compatibility - redirect to auth logout
     console.log(chalk.yellow('Note: "happy logout" is deprecated. Use "happy auth logout" instead.\n'));
     try {
+      const { handleAuthCommand } = await import('./commands/auth');
       await handleAuthCommand(['logout']);
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -677,6 +674,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       }
       process.exit(0);
     } else if (daemonSubcommand === 'preflight') {
+      const { preflightDaemonControlServer } = await import('./daemon/controlServer')
       await preflightDaemonControlServer()
       process.exit(0)
     } else if (daemonSubcommand === 'start-sync') {
@@ -695,6 +693,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       if (daemonEnv.HAPPY_APLUS_STUDIO_ORIGIN) {
         process.env.HAPPY_APLUS_STUDIO_ORIGIN = daemonEnv.HAPPY_APLUS_STUDIO_ORIGIN
       }
+      const { startDaemon } = await import('./daemon/run')
       await startDaemon()
       process.exit(0)
     } else if (daemonSubcommand === 'stop') {
@@ -707,6 +706,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       if (outcome === 'handed-to-daemon') console.log('The daemon will stop by itself once its running work has finished')
       process.exit(0)
     } else if (daemonSubcommand === 'status') {
+      const { runDoctorDaemon } = await import('./ui/doctor');
       await runDoctorDaemon()
       process.exit(0)
     } else if (daemonSubcommand === 'logs') {
@@ -720,6 +720,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       process.exit(0)
     } else if (daemonSubcommand === 'install') {
       try {
+        const { install } = await import('./daemon/install');
         await install()
       } catch (error) {
         console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -727,6 +728,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
       }
     } else if (daemonSubcommand === 'uninstall') {
       try {
+        const { uninstall } = await import('./daemon/uninstall');
         await uninstall()
       } catch (error) {
         console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -909,6 +911,7 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
       // Run claude --help and display its output
       // Use execFileSync directly with claude CLI for runtime-agnostic compatibility
       try {
+        const { claudeCliPath } = await import('./claude/claudeLocal')
         const claudeHelp = execFileSync(claudeCliPath, ['--help'], { encoding: 'utf8', windowsHide: true })
         console.log(claudeHelp)
       } catch (e) {
@@ -960,12 +963,14 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
         if (managed.envelope.agent === 'codex') {
           // Codex takes one object: the principal and the start options are
           // fields on it, not two arguments.
+          const { runCodex } = await import('@/codex/runCodex');
           await runCodex({
             principal: { kind: 'managed', startup: managed },
             ...(options.startedBy ? { startedBy: options.startedBy } : {}),
             ...(options.permissionMode ? { permissionMode: options.permissionMode } : {}),
           });
         } else {
+          const { runClaude } = await import('@/claude/runClaude');
           await runClaude({ kind: 'managed', startup: managed }, options);
         }
       } catch (error) {
@@ -983,6 +988,7 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
 
     // Start the CLI
     try {
+      const { runClaude } = await import('@/claude/runClaude');
       await runClaude({ kind: 'account', credentials }, standaloneLaunch ? { ...options, standaloneLaunch } : options);
     } catch (error) {
       console.error(chalk.red('Error:'), error instanceof Error ? error.message : 'Unknown error')
@@ -992,7 +998,7 @@ ${chalk.bold.cyan('Claude Code Options (from `claude --help`):')}
       process.exit(1)
     }
   }
-})();
+}
 
 
 /**

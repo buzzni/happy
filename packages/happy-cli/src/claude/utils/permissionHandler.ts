@@ -17,7 +17,7 @@ import {
     verifyChannelPermissionClaim,
     type ChannelPermissionBinding,
 } from '@/channel/channelPermissionBinding';
-import { logger } from "@/lib";
+import { logger } from "@/ui/logger";
 import { PermissionResult } from "../sdk/types";
 import { Session } from "../session";
 import { EnhancedMode, PermissionMode } from "../loop";

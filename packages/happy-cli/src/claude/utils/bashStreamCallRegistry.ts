@@ -16,6 +16,8 @@
  * Claude executes tool calls sequentially within a turn.
  */
 
+export const BASH_STREAM_AGENT_TOOL_NAME = 'mcp__happy__bash_stream';
+
 let activeCallId: string | null = null;
 
 export function setActiveBashStreamCall(callId: string): void {

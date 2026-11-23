@@ -57,6 +57,14 @@ export function toolPolicyFilePath(happyHomeDir: string): string {
     return join(happyHomeDir, TOOL_POLICY_FILE_NAME);
 }
 
+/** The hook may reference these paths before this worker receives session authority. */
+export function sessionToolPolicyHookFiles(happyHomeDir: string, pid = process.pid) {
+    return {
+        secretFile: join(happyHomeDir, 'tmp', 'hooks', `policy-secret-${pid}`),
+        policyFile: toolPolicyFilePath(happyHomeDir),
+    };
+}
+
 export function skillLocksFilePath(happyHomeDir: string): string {
     return join(happyHomeDir, SKILL_LOCKS_FILE_NAME);
 }

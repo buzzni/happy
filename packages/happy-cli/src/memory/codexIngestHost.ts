@@ -6,6 +6,7 @@ import { pathToFileURL } from 'node:url';
 import { resolveServiceEntry } from './cmlLessonHost';
 import { loadExternalEsModule } from './externalModuleLoader';
 import { RECALL_OWNER_ENV } from './recallOwnerMarker';
+import { isCodexEventMemoryEnabled } from './memoryScope';
 import type { SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { sanitizeChildEnv } from '@/utils/childEnv';
 
@@ -14,7 +15,7 @@ const INGEST_BUDGET_MS = 15_000;
 const OUTPUT_LIMIT_BYTES = 16 * 1024;
 const MAX_PENDING_THREADS = 16;
 
-export type CodexIngestReason = 'imported' | 'empty' | 'unsupported' | 'cancelled' | 'timeout'
+export type CodexIngestReason = 'imported' | 'empty' | 'unsupported' | 'cancelled' | 'timeout' | 'disabled'
     | 'spawn_failed' | 'ingest_failed' | 'invalid_output' | 'output_limit' | 'queue_full';
 export interface CodexIngestResult {
     reason: CodexIngestReason;
@@ -97,6 +98,7 @@ export async function prepareCodexIngestHost(input: {
     // Never create a project event store from a personal Chat workspace path.
     if (!input.projectPath) return null;
     if (!input.accountOwned || !input.sandboxEnabled || input.sandboxPolicyMode !== 'owner-choice') return null;
+    if (!await isCodexEventMemoryEnabled(input.env)) return null;
     const deps = { ...productionDeps, ...input.deps };
     const projectPath = input.projectPath;
     const env: NodeJS.ProcessEnv = { ...sanitizeChildEnv(input.env, { boundary: 'in-session' }), [RECALL_OWNER_ENV]: 'host-worker' };
@@ -204,7 +206,8 @@ export async function prepareCodexIngestHost(input: {
         while (!closed && pending.size) {
             const [key, job] = pending.entries().next().value as [string, Pending];
             pending.delete(key);
-            const result = await runWorker(job.request);
+            const enabled = await isCodexEventMemoryEnabled(input.env);
+            const result = !enabled ? emptyResult('disabled') : closed ? emptyResult('cancelled') : await runWorker(job.request);
             for (const resolve of job.resolve) resolve(result);
         }
     };

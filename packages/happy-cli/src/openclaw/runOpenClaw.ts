@@ -21,7 +21,7 @@ import { logger } from '@/ui/logger';
 import { MessageQueue2 } from '@/utils/MessageQueue2';
 import { createDeferredContinuationContextConsumer } from '@/utils/deferredContinuationContext';
 import { Credentials, readSettings } from '@/persistence';
-import { initialMachineMetadata } from '@/daemon/run';
+import { initialMachineMetadata } from '@/daemon/initialMachineMetadata';
 import { createSessionMetadata } from '@/utils/createSessionMetadata';
 import { takeSessionSourceFromEnv } from '@/utils/sessionSource';
 import { setupOfflineReconnection } from '@/utils/setupOfflineReconnection';

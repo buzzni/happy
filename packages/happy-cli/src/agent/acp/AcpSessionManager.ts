@@ -2,10 +2,10 @@ import { createId } from '@paralleldrive/cuid2';
 import { createEnvelope, type CreateEnvelopeOptions, type SessionEnvelope } from '@slopus/happy-wire';
 import type { AgentMessage } from '@/agent/core';
 import {
+  BASH_STREAM_AGENT_TOOL_NAME,
   setActiveBashStreamCall,
   clearActiveBashStreamCall,
 } from '@/claude/utils/bashStreamCallRegistry';
-import { BASH_STREAM_AGENT_TOOL_NAME } from '@/claude/utils/startHappyServer';
 
 function turnOptions(turnId: string | null, time: number): CreateEnvelopeOptions {
   return turnId ? { turn: turnId, time } : { time };

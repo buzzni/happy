@@ -7,6 +7,7 @@ import { pathToFileURL } from 'node:url';
 import { resolveServiceEntry } from './cmlLessonHost';
 import { loadExternalEsModule } from './externalModuleLoader';
 import { RECALL_OWNER_ENV } from './recallOwnerMarker';
+import { isCodexEventMemoryEnabled } from './memoryScope';
 import type { SandboxPolicyMode } from '@/sandbox/sandboxPolicy';
 import { sanitizeChildEnv } from '@/utils/childEnv';
 
@@ -27,7 +28,7 @@ async function probeRecallRuntime(entry: string, env: NodeJS.ProcessEnv): Promis
     } catch { return false; }
 }
 
-export type RecallHostReason = 'context_returned' | 'empty' | 'unsupported' | 'timeout' | 'cancelled'
+export type RecallHostReason = 'context_returned' | 'empty' | 'unsupported' | 'timeout' | 'cancelled' | 'disabled'
     | 'spawn_failed' | 'hook_failed' | 'invalid_output' | 'output_limit' | 'hook_diagnostic';
 export interface RecallHostResult { reason: RecallHostReason; context: string; startupIncluded?: true }
 type HookKind = 'SessionStart' | 'UserPromptSubmit';
@@ -67,6 +68,7 @@ export async function prepareCodexRecallHost(input: {
     if (!input.projectPath) return null;
     // Mandatory/shared machines need actor-bound brokerage, not account-process authority alone.
     if (!input.accountOwned || !input.sandboxEnabled || input.sandboxPolicyMode !== 'owner-choice') return null;
+    if (!await isCodexEventMemoryEnabled(input.env)) return null;
     const deps = { ...productionDeps, ...input.deps };
     const projectPath = input.projectPath;
     // Capture once, before checkpoint cwd transitions; never read model environment overrides.
@@ -161,6 +163,7 @@ export async function prepareCodexRecallHost(input: {
     return {
         async recall({ threadId, prompt, resumed, signal }) {
             if (signal.aborted) return { reason: 'cancelled', context: '' };
+            if (!await isCodexEventMemoryEnabled(input.env)) return { reason: 'disabled', context: '' };
             let warmFailure: RecallHostReason | null = warmFailureState?.threadId === threadId ? warmFailureState.reason : null;
             if (warmState?.threadId !== threadId && !(warmFailureState?.threadId === threadId && now() < warmFailureState.retryAt)) {
                 const warm = await runHook('SessionStart', {
@@ -177,10 +180,12 @@ export async function prepareCodexRecallHost(input: {
                 }
                 if (warm.reason === 'cancelled') return warm;
             }
+            if (!await isCodexEventMemoryEnabled(input.env)) return { reason: 'disabled', context: '' };
             const queried = await runHook('UserPromptSubmit', {
                 session_id: threadId, cwd: projectPath, hook_event_name: 'UserPromptSubmit', prompt,
             }, signal);
             if (queried.reason !== 'empty' && queried.reason !== 'context_returned') return { reason: queried.reason, context: '' };
+            if (!await isCodexEventMemoryEnabled(input.env)) return { reason: 'disabled', context: '' };
             if (queried.reason === 'empty' && warmFailure) return { reason: warmFailure, context: '' };
             const warmContext = warmState?.threadId === threadId && !warmState.submitted ? warmState.context : '';
             // Preserve startup context when prompt policy intentionally skips recall.

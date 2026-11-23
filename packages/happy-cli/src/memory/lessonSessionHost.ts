@@ -26,6 +26,7 @@ import { isAutomationExecutionSessionId, type SessionEnvelope } from '@slopus/ha
 import { logger } from '@/ui/logger';
 import { refreshMcpCallerGrantIfExpiring } from '@/aplus/refreshMcpCallerGrant';
 import { readLessonOwner } from './lessonOwnerMarker';
+import { MEMORY_DAEMON_HOME_ENV } from './memoryScope';
 import { readCheckpointSpawnContext } from '@/checkpoint/checkpointSpawnContext';
 
 import { createLessonHostSupervisor } from './lessonHostSupervisor';
@@ -44,6 +45,7 @@ import { LessonReviewBudget } from './lessonReviewBudget';
 import {
     createLessonReviewOutcomeStore,
     createLessonSettingsStore,
+    isProjectLessonHostEnabled,
     lessonReviewLedgerPath,
     lessonReviewOutcomePath,
     lessonSettingsPath,
@@ -56,7 +58,7 @@ const processStartedAt = new Date(Date.now() - process.uptime() * 1_000).toISOSt
 type BootstrapOutcome = 'start' | 'missing_account' | 'missing_machine' | 'missing_origin'
     | 'missing_project' | 'missing_state_root' | 'owner_not_host' | 'public_key_unavailable'
     | 'invalid_public_key' | 'snapshot_grant_unavailable' | 'runtime_unavailable'
-    | 'grant_rejected' | 'runtime_incomplete' | 'caller_unavailable' | 'ready' | 'timeout' | 'exception' | 'late_closed';
+    | 'grant_rejected' | 'runtime_incomplete' | 'caller_unavailable' | 'settings_disabled' | 'ready' | 'timeout' | 'exception' | 'late_closed';
 function reportBootstrap(outcome: BootstrapOutcome, phase: 'bootstrap' | 'readiness' = 'bootstrap'): null {
     logger.debug(`[lesson-host] phase=${phase} outcome=${outcome}`, {
         cliVersion: packageJson.version, processStartedAt,
@@ -124,7 +126,7 @@ export interface LessonSessionHost {
  * tell whether it shares the daemon's root. Read-only here; a provider that
  * disagrees with it does not get to pick.
  */
-export const LESSON_DAEMON_HOME_ENV = 'HAPPY_LESSON_DAEMON_HOME';
+export const LESSON_DAEMON_HOME_ENV = MEMORY_DAEMON_HOME_ENV;
 
 /**
  * The state root this session's lesson settings and ledger come from.
@@ -395,6 +397,7 @@ async function bootstrapLessonSessionHost(input: {
     if (readLessonOwner(env) !== 'host') {
         return reportBootstrap('owner_not_host');
     }
+    if (!await isProjectLessonHostEnabled(stateRoot, projectId)) return reportBootstrap('settings_disabled');
 
     const publicKey = await fetchLessonGrantPublicKey({
         studioBaseUrl: origin, token: input.accountToken, machineId: input.machineId,

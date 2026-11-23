@@ -54,7 +54,7 @@ vi.mock('@/daemon/controlClient', () => ({
     notifyDaemonSessionStarted: mockNotifyDaemonSessionStarted,
 }));
 
-vi.mock('@/daemon/run', () => ({
+vi.mock('@/daemon/initialMachineMetadata', () => ({
     initialMachineMetadata: {},
 }));
 

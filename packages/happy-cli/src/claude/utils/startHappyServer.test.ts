@@ -155,6 +155,17 @@ describe('Happy MCP transport authentication', () => {
         await withPlatform('win32', {}, expectTcpBearerOnly);
     });
 
+    it('keeps the Windows Codex bearer in the explicit stdio bridge environment', async () => {
+        await withPlatform('win32', { useStdioBridge: true }, async server => {
+            expect(Object.hasOwn(process.env, 'SAYCODE_MCP_BEARER')).toBe(false);
+            expect(server.mcpConfig.type).toBe('stdio');
+            expect(server.mcpConfig.env === server.bridgeEnv).toBe(true);
+            expect((await mcpFetch(server)(server.url, { method: 'POST', headers: {
+                'Content-Type': 'application/json', Accept: 'application/json, text/event-stream',
+            }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list', params: {} }) })).status).toBe(200);
+        });
+    });
+
     it('answers the Windows loopback listener with plain JSON, not an SSE stream endpoint security can hold back', async () => {
         await withPlatform('win32', {}, async server => {
             const bearer = JSON.parse(server.bridgeEnv.HAPPY_HTTP_MCP_HEADERS).Authorization as string;
