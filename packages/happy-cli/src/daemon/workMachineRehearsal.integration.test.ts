@@ -438,8 +438,14 @@ class Rehearsal {
     }
     /** Requests whose current input carries this message: its turn (possibly batched with others) and Happy's off-turn calls. */
     modelCalls(text: string) { return this.modelRequests.filter(request => request.inputMarkers.includes(text)); }
-    /** The customer resumes a conversation on the machine's current daemon (a write RPC: the first execution permit). */
+    /** The customer resumes a conversation on the machine's current daemon. */
     async resume(machineId: string, sessionId: string): Promise<string> {
+        const result = await this.machineRpc(machineId, 'resume-happy-session', { sessionId }) as { type: string; sessionId: string; errorMessage?: string };
+        if (result.type !== 'success') throw new Error(`Resume rejected: ${result.errorMessage}`);
+        return result.sessionId;
+    }
+    /** A daemon RPC from the customer's client, bound and sealed with the machine key as the web client does. */
+    async machineRpc(machineId: string, method: string, params: Record<string, unknown>): Promise<unknown> {
         const rpcKey = (await this.machine(machineId)).key;
         const socket = io(this.serverUrl, { path: '/v1/updates', transports: ['websocket'], reconnection: false,
             auth: { token: this.browserToken, clientType: 'user-scoped' } });
@@ -449,16 +455,14 @@ class Rehearsal {
                 socket.once('connect', () => { clearTimeout(timer); done(); });
                 socket.once('connect_error', error => { clearTimeout(timer); fail(error); });
             });
-            const method = 'resume-happy-session', nonce = randomBytes(16).toString('base64');
-            const bound = bindRpcRequest({ method, scope: machineId, params: { sessionId }, issuedAt: Date.now(), nonce });
+            const nonce = randomBytes(16).toString('base64');
+            const bound = bindRpcRequest({ method, scope: machineId, params, issuedAt: Date.now(), nonce });
             const response = await socket.timeout(60_000).emitWithAck('rpc-call', { method: `${machineId}:${method}`,
                 params: Buffer.from(encrypt(rpcKey, 'dataKey', bound)).toString('base64') });
-            if (!response.ok) throw new Error(`Resume RPC failed: ${response.error}`);
+            if (!response.ok) throw new Error(`${method} RPC failed: ${response.error}`);
             const opened = readBoundRpcResponse(decrypt(rpcKey, 'dataKey', Buffer.from(response.result, 'base64')), nonce);
-            if (!opened.ok) throw new Error(`Resume RPC binding failed: ${opened.code}`);
-            const result = opened.result as { type: string; sessionId: string; errorMessage?: string };
-            if (result.type !== 'success') throw new Error(`Resume rejected: ${result.errorMessage}`);
-            return result.sessionId;
+            if (!opened.ok) throw new Error(`${method} RPC binding failed: ${opened.code}`);
+            return opened.result;
         } finally { socket.disconnect(); }
     }
 
@@ -744,6 +748,19 @@ describe.skipIf(!rehearsal)('work machine migration rehearsal (real server, two 
             const { source, machineId, sourceDeviceId, conversations } = from;
             const moved = await migrate(r, from);
             expect(await r.executionState(machineId)).toMatchObject({ deviceId: moved.report.deviceId, generation: 2, firstExecution: false });
+
+            // The operator checks the target before deciding (dev E2E 2nd round, defect 5): its daemon starts, the
+            // customer's client lists the workspace and the idle reaper stops a conversation. None of it closes the way back.
+            r.phase = 'target-check';
+            await r.workMachine(moved.target, ['bind', machineId, r.accountId, '2']);
+            await r.startDaemon(moved.target);
+            await r.waitConnected(moved.target);
+            await r.customer();
+            await r.machineRpc(machineId, 'listWorkspaceDirectory', { workspaceRoot: r.project, path: r.project });
+            await r.machineRpc(machineId, 'stop-session', { sessionId: conversations[0].sessionId, source: 'idle-reaper', mode: 'if-idle' });
+            expect(await r.executionState(machineId)).toMatchObject({ deviceId: moved.report.deviceId, generation: 2, firstExecution: false });
+            await r.stopDaemon(moved.target);
+            expect(r.modelRequests.filter(({ phase }) => phase === 'target-check')).toEqual([]);
 
             // Back to the source PC's view of the paths.
             await moveHostCopies(moved.manifest.paths, '', '.target-host');

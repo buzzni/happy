@@ -183,6 +183,54 @@ describe('work machine execution authority', () => {
         }
     });
 
+    // dev E2E 2nd round, defect 5: what reaches a freshly started daemon and its conversations before
+    // anyone sends a message must not close the way back, yet still stops at drain and freeze.
+    it('lets housekeeping RPCs reach a freshly started daemon and its conversations without recording first execution', async () => {
+        const now = Date.now();
+        const emitted: string[] = [];
+        const emit = { timeout: () => ({ emitWithAck: async (_event: string, request: { method: string }) => { emitted.push(request.method); return {}; } }) };
+        const daemon = { data: { workMachineExecution: { ...original, purpose: 'daemon', expiresAt: now + 60_000 } }, ...emit };
+        const conversation = { data: { workMachineExecution: { ...original, sessionId: 'protected-session', purpose: 'session', expiresAt: now + 60_000 } }, ...emit };
+        const invoke = async (scope: string, method: string) => (await executeDaemonRpcLocally({
+            io: { sockets: { sockets: new Map<string, unknown>([['daemon', daemon], ['conversation', conversation]]) } } as never,
+            request: { requestId: crypto.randomUUID(), targetSocketId: scope === machineId ? 'daemon' : 'conversation',
+                method: `${scope}:${method}`, params: {}, timeoutMs: 1000 },
+            onResult: () => {}, deps: { allowed: (async () => true) as never, now: () => now },
+        })).refused;
+        const firstExecution = async () => (await db.workMachineExecution.findUniqueOrThrow({ where: { machineId } })).firstExecutionAt;
+        const workspaceReads = ['listWorkspaceDirectory', 'readWorkspaceFile', 'readWorkspaceFileChunk',
+            'listWorkspaceDownloadDirectory', 'closeWorkspaceDownloadDirectory',
+            // The fixed-shape status answers of the daemon's metadata methods (happy-cli machineMetadataMethods.ts).
+            'workspace-path-stat', 'workspace-git-info', 'preview-liveness', 'listening-ports',
+            'container-runtime-status', 'gh-auth-status', 'machine-info'];
+
+        // Opening a conversation again, an idle stop and workspace reads run no turn.
+        for (const method of ['resume-happy-session', 'stop-session', ...workspaceReads]) {
+            expect(await invoke(machineId, method), method).toBe(false);
+        }
+        expect(await invoke('protected-session', 'killSession')).toBe(false);
+        expect(await firstExecution()).toBeNull();
+        // A shell command may change anything; the server cannot tell a status poll from any other one.
+        expect(await invoke(machineId, 'bash')).toBe(false);
+        expect(await firstExecution()).not.toBeNull();
+
+        await db.workMachineExecution.update({ where: { machineId }, data: { firstExecutionAt: null, drainingAt: new Date() } });
+        try {
+            // Draining stops new work, including bringing a conversation back up; stopping and reading go on.
+            expect(await invoke(machineId, 'resume-happy-session')).toBe(true);
+            for (const method of ['stop-session', ...workspaceReads]) expect(await invoke(machineId, method), method).toBe(false);
+            expect(await invoke('protected-session', 'killSession')).toBe(false);
+            expect(await firstExecution()).toBeNull();
+            await freezeWorkMachineExecution(db, original);
+            for (const method of ['resume-happy-session', 'stop-session', 'listWorkspaceDirectory']) {
+                expect(await invoke(machineId, method), method).toBe(true);
+            }
+            expect(await invoke('protected-session', 'killSession')).toBe(true);
+        } finally {
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null } });
+        }
+    });
+
     it('lets a draining conversation answer and abort its turn but refuses new turn work', async () => {
         const now = Date.now();
         const emitted: string[] = [];
@@ -769,6 +817,11 @@ describe('work machine execution authority', () => {
             const permit = async (token: string) => (await app.inject({
                 method: 'POST', url: `/v1/sessions/${sessionId}/work-machine-permit`, headers: { authorization: `Bearer ${token}` },
             })).statusCode;
+            // A session process starting without a turn of its own (resume, recovery) asks this way.
+            const startPermit = async (token: string) => (await app.inject({
+                method: 'POST', url: `/v1/sessions/${sessionId}/work-machine-permit`, headers: { authorization: `Bearer ${token}` },
+                payload: { start: true },
+            })).statusCode;
             const write = async (token: string, localId: string) => (await app.inject({
                 method: 'POST', url: `/v3/sessions/${sessionId}/messages`, headers: { authorization: `Bearer ${token}` },
                 payload: { messages: [{ content: 'encrypted-body', localId }] },
@@ -808,6 +861,7 @@ describe('work machine execution authority', () => {
             const sourceToken = await sessionToken(source.id, 1);
             expect((await control('drain', at(1))).json()).toEqual(drained);
             expect(await permit(sourceToken)).toBe(403);
+            expect(await startPermit(sourceToken)).toBe(403);
             expect(await write(sourceToken, 'in-turn-reply')).toBe(200);
             const requestId = crypto.randomUUID();
             expect(await authority.admitWorkMachineMcpCall(db, { accountId, machineId: migrating, ...at(1) }, requestId)).toBe(true);
@@ -876,6 +930,10 @@ describe('work machine execution authority', () => {
                 openMcpCalls: [], openAutomationRuns: [],
             });
             expect(await permit(sourceToken)).toBe(403);
+
+            // The replacement's conversations come back up (dev E2E 2nd round, defect 5) without closing the way back.
+            expect(await startPermit(await sessionToken(target.id, 2))).toBe(204);
+            expect((await state()).firstExecution).toBe(false);
 
             // Roll back before the replacement runs anything.
             const originalKey = envelope(5);

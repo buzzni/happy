@@ -569,7 +569,7 @@ describe('runClaude remote JSONL scanner', () => {
             const delivered = harness.loopOptions.messageQueue.queue.at(-1).message;
 
             now.mockReturnValue(arrivedAt + 42 * 60_000);
-            harness.loopOptions.onUserInputDelivered(delivered);
+            harness.loopOptions.onUserInputDelivered([delivered]);
             harness.scannerOptions.onMessage({ type: 'user', message: { content: delivered } });
             expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
         } finally {
@@ -593,7 +593,7 @@ describe('runClaude remote JSONL scanner', () => {
             await userMessageHandler({ content: { text: 'a later question' }, meta: {} });
 
             now.mockReturnValue(arrivedAt + 42 * 60_000);
-            harness.loopOptions.onUserInputDelivered(delivered);
+            harness.loopOptions.onUserInputDelivered([delivered]);
             harness.scannerOptions.onMessage({ type: 'user', message: { content: delivered } });
             expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
         } finally {
@@ -611,12 +611,34 @@ describe('runClaude remote JSONL scanner', () => {
             await userMessageHandler({ content: { text: 'run it again' }, meta: {} });
             const delivered = harness.loopOptions.messageQueue.queue.at(-1).message;
             expect(delivered.startsWith('run it again')).toBe(true);
-            harness.loopOptions.onUserInputDelivered(delivered);
+            harness.loopOptions.onUserInputDelivered([delivered]);
             const copy = { type: 'user', message: { content: delivered } };
             harness.scannerOptions.onMessage(copy);
             expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
             harness.scannerOptions.onMessage(copy);
             expect(harness.sessionClient.sendClaudeSessionMessage).toHaveBeenCalledWith(copy);
+        } finally {
+            await harness.finish();
+        }
+    });
+
+    it('does not forward app prompts the queue joined into one turn', async () => {
+        // Two messages queued behind a running turn run as one ("A\nB"); the JSONL holds that joined text, which matched
+        // neither arrival record, so the scanner showed the input a second time.
+        const harness = await startRemoteRunClaudeHarness();
+        try {
+            const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+            await userMessageHandler({ content: { text: 'first queued' }, meta: {} });
+            await userMessageHandler({ content: { text: 'second queued' }, meta: {} });
+            const batch = await harness.loopOptions.messageQueue.waitForMessagesAndGetAsString();
+            expect(batch.items).toHaveLength(2);
+            harness.loopOptions.onUserInputDelivered(batch.items.map((item: { message: string }) => item.message));
+            harness.scannerOptions.onMessage({ type: 'user', message: { content: batch.message } });
+            expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
+            // Each part was consumed with the turn: the same text typed in a terminal later still shows.
+            const terminalPrompt = { type: 'user', message: { content: batch.items[0].message } };
+            harness.scannerOptions.onMessage(terminalPrompt);
+            expect(harness.sessionClient.sendClaudeSessionMessage).toHaveBeenCalledWith(terminalPrompt);
         } finally {
             await harness.finish();
         }
@@ -628,7 +650,7 @@ describe('runClaude remote JSONL scanner', () => {
         const harness = await startRemoteRunClaudeHarness();
         try {
             const continuation = { type: 'user', message: { content: 'The previous request stopped; continue from where you stopped.' } };
-            harness.loopOptions.onUserInputDelivered(continuation.message.content);
+            harness.loopOptions.onUserInputDelivered([continuation.message.content]);
             harness.scannerOptions.onMessage(continuation);
             expect(harness.sessionClient.sendClaudeSessionMessage).toHaveBeenCalledWith(continuation);
         } finally {

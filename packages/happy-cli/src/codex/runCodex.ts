@@ -448,7 +448,8 @@ export async function runCodex(opts: {
             : !threadId || opts.resumeThreadId !== threadId) {
             throw new Error('WORK_MACHINE_CODEX_THREAD_UNAVAILABLE');
         }
-        await api.permitWorkMachineSessionExecution();
+        // Without a prompt to run now, the first turn asks for its own permit (ApiSessionClient).
+        await api.permitWorkMachineSessionExecution(preparedInitialPrompt.prompt === null ? { start: true } : {});
     }
 
     let response: ApiSession | null;

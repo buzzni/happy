@@ -8,7 +8,8 @@
  *   selection and credential scan without stopping anything, sealing or uploading.
  * - import: on the target, verifies the manifest signature and every part, restores into staging,
  *   places the data at the same absolute paths without overwriting anything, writes the session
- *   recovery records, rotates the machine data key and reports the execution-replace proof.
+ *   recovery records with their clean-stop records, rotates the machine data key and reports the
+ *   execution-replace proof.
  * - restore-proof: on the original source, rotates its data key and signs the restore scope.
  *
  * State lives in `HAPPY_HOME/work-machine-transfer/<jobId>/` (0700): the recipient key, the sealed
@@ -32,6 +33,7 @@ import { encodeBase64, wrapDataEncryptionKey } from '@/api/encryption';
 import { parseCredentials, replacePrivateFile } from '@/persistence';
 import { loadOrCreateDeviceKeys, type DeviceKeys } from './deviceKeys';
 import { readWorkMachineExecutionBinding, workMachineSigningIdentity } from './workMachineCredential';
+import { workMachineSessionStopPath, writeWorkMachineSessionStop } from './workMachineSessionStop';
 import { extractWorkMachineArchive, packWorkMachineArchive, selectWorkMachineTransfer } from './workMachineTransferArchive';
 import {
     digestRange, openWorkMachineTransfer, workMachineIdentifier, type WorkMachineDeviceProof, type WorkMachinePart,
@@ -425,6 +427,23 @@ async function downloadArchive(client: ReturnType<typeof openWorkMachineTransfer
     return { sealed, receipt };
 }
 
+/**
+ * An imported session has not run here yet, so it stands exactly where the source stopped it: the
+ * signed cursor and provider conversation, between turns. Without this record the next export from
+ * this machine would refuse every session not run since the import. A process started here removes
+ * it and leaves its own on exit, as on the source.
+ */
+function writeImportedSessionStops(home: string, manifest: Manifest): void {
+    const stoppedAt = Date.now();
+    for (const session of manifest.sessions) {
+        writeWorkMachineSessionStop(workMachineSessionStopPath(home, session.sessionId), {
+            v: 1, sessionId: session.sessionId, cleanStop: true, stoppedAt, lastProcessedSeq: session.lastProcessedSeq,
+            turnInFlight: false, inputSkipped: false,
+            ...(session.provider === 'claude' ? { claudeSessionId: session.nativeId } : { codexThreadId: session.nativeId }),
+        });
+    }
+}
+
 export async function importWorkMachine(input: TransferEndpoint & {
     claudeConfigDir: string;
     codexHome: string;
@@ -477,6 +496,7 @@ export async function importWorkMachine(input: TransferEndpoint & {
                 placed.add(path);
                 await replacePrivateFile(placingPath, JSON.stringify({ manifestSha256: sha256, placed: [...placed] }));
             }
+            writeImportedSessionStops(input.home, manifest);
             const store = await readSessionStore(input.home);
             await replacePrivateFile(join(input.home, 'sessions.json'), JSON.stringify({ ...store, sessions: { ...store.sessions, ...records } }));
         } finally {

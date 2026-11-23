@@ -32,6 +32,7 @@ class FakeStudio {
         () => { res.writeHead(500); res.end(); },
     ));
     origin = '';
+    jobId = jobId;
     plan: Plan | null = null;
     objects = new Map<string, Buffer>();
     puts = new Map<number, number>();
@@ -81,7 +82,7 @@ class FakeStudio {
         const route = /^\/api\/work-machine-migrations\/([^/]+)\/transfer\/(.+)$/.exec(url.pathname);
         const auth = req.headers.authorization;
         const role = auth === `Bearer ${sourceToken}` ? 'source' : auth === `Bearer ${targetToken}` ? 'target' : null;
-        if (!route || route[1] !== jobId || !role) return { status: 403 };
+        if (!route || route[1] !== this.jobId || !role) return { status: 403 };
         const json = (value: unknown) => ({ status: 200, body: JSON.stringify(value), headers: { 'content-type': 'application/json' } });
         const body = raw.length ? JSON.parse(raw.toString('utf8')) : null;
         const [, , action] = route;
@@ -249,6 +250,41 @@ describe('work machine export and import over the Studio transfer API', () => {
         expect(studio.restored).toEqual(restored);
     });
 
+    // dev E2E 2nd round, defect 2: a conversation imported but not yet run on B must not block B's own export.
+    it('lets the target export again right after the import, signing the cursors the source signed', async () => {
+        const fixture = await machinesFixture(root, studio);
+        await exportWorkMachine(fixture.exportInput);
+        await fixture.vacateSource();
+        const imported = await importWorkMachine(fixture.importInput);
+
+        // Switched to B (generation + 1); the next migration goes from B to another PC.
+        await saveWorkMachineExecutionBinding(fixture.targetHome, {
+            accountId, machineId, generation: generation + 1, deviceId: imported.deviceId, serverOrigin: 'https://happy.invalid',
+        });
+        const nextHome = join(root, 'next-happy');
+        await mkdir(nextHome, { mode: 0o700 });
+        const nextJob = 'job-2';
+        const approval = await createWorkMachineTargetApproval({
+            home: nextHome, machineId, jobId: nextJob, accountId, generation: generation + 1, sourceDeviceId: imported.deviceId,
+            expiresAt: Date.now() + 600_000, maxBytes: 64 * 1024 ** 2,
+        });
+        studio.jobId = nextJob;
+        studio.manifest = null;
+        studio.objects.clear();
+        studio.plan = { ...studio.plan, jobId: nextJob, generation: generation + 1, approval };
+
+        await exportWorkMachine({ ...fixture.exportInput, home: fixture.targetHome, jobId: nextJob });
+
+        const manifest = JSON.parse(Buffer.from(studio.manifest!.manifestB64, 'base64url').toString('utf8'));
+        expect(manifest).toMatchObject({
+            jobId: nextJob, sourceDeviceId: imported.deviceId, generation: generation + 1,
+            sessions: [
+                { sessionId: 'claude-session', provider: 'claude', nativeId: claudeId, lastProcessedSeq: 7 },
+                { sessionId: 'codex-session', provider: 'codex', nativeId: codexId, lastProcessedSeq: 9 },
+            ],
+        });
+    });
+
     it('checks the export during drain without stop records, uploads or a saved seal', async () => {
         const fixture = await machinesFixture(root, studio);
         await rm(join(fixture.sourceHome, 'work-machine-sessions'), { recursive: true });
@@ -341,6 +377,7 @@ describe('work machine export and import over the Studio transfer API', () => {
         await expect(importWorkMachine(fixture.importInput)).rejects.toThrow(/does not match the signed manifest|will not restore/);
         await expect(lstat(fixture.project)).rejects.toMatchObject({ code: 'ENOENT' });
         await expect(lstat(join(fixture.targetHome, 'sessions.json'))).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(lstat(join(fixture.targetHome, 'work-machine-sessions'))).rejects.toMatchObject({ code: 'ENOENT' });
         expect(studio.restored).toBeNull();
     });
 
@@ -376,6 +413,7 @@ describe('work machine export and import over the Studio transfer API', () => {
         await mkdir(fixture.project, { recursive: true });
         await expect(importWorkMachine(fixture.importInput)).rejects.toThrow(fixture.project);
         await expect(lstat(fixture.claudeRecord)).rejects.toMatchObject({ code: 'ENOENT' });
+        await expect(lstat(join(fixture.targetHome, 'work-machine-sessions'))).rejects.toMatchObject({ code: 'ENOENT' });
         await expect(lstat(join(fixture.targetHome, 'sessions.json'))).rejects.toMatchObject({ code: 'ENOENT' });
         expect(studio.restored).toBeNull();
     });
