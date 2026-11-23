@@ -10,6 +10,11 @@ describe('readOwnedRegistration', () => {
         expect(await read({ machineId: 'machine', machineIdConfirmedByServer: true })).toEqual({ machineId: 'machine', credentials, epoch: '42' });
     });
 
+    it('does not require machineIdConfirmedByServer, which nothing writes', async () => {
+        // Requiring it failed every owned prepare with preparation-failed (2026-11-23, company PC on .434).
+        expect(await read({ machineId: 'machine' })).toEqual({ machineId: 'machine', credentials, epoch: '42' });
+    });
+
     it.each([
         ['another machine id in settings', { machineId: 'other', machineIdConfirmedByServer: true }, credentials],
         ['no credentials on disk', { machineId: 'machine', machineIdConfirmedByServer: true }, null],
