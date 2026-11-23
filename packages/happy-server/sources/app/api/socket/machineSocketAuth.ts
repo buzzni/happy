@@ -89,6 +89,19 @@ interface MachineSocketEvent {
     now: number;
 }
 
+/**
+ * socket.io runs a socket's middleware for each packet independently and dispatches the packet as
+ * soon as its own `next` is called, so an async check that answers late lets the packets behind it
+ * overtake it. This keeps the checks concurrent but releases their verdicts in arrival order.
+ */
+export function inArrivalOrder<Packet>(middleware: (packet: Packet, next: (error?: Error) => void) => void) {
+    let tail = Promise.resolve();
+    return (packet: Packet, next: (error?: Error) => void) => {
+        const verdict = new Promise<Error | undefined>(resolve => middleware(packet, resolve));
+        tail = tail.then(async () => next(await verdict));
+    };
+}
+
 export async function workMachineSocketMayAct(db: WorkMachineLookup, input: MachineSocketEvent): Promise<boolean> {
     const { accountId, socketMachineId, socketSessionId, workMachineBrowser, claims, event, payload, now } = input;
     const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : null;

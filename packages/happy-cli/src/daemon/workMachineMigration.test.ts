@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { createHash, createPublicKey, randomBytes, verify } from 'node:crypto';
-import { lstat, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -378,6 +378,29 @@ describe('work machine export and import over the Studio transfer API', () => {
         await expect(lstat(fixture.claudeRecord)).rejects.toMatchObject({ code: 'ENOENT' });
         await expect(lstat(join(fixture.targetHome, 'sessions.json'))).rejects.toMatchObject({ code: 'ENOENT' });
         expect(studio.restored).toBeNull();
+    });
+
+    it('finishes an import that failed after placing some paths when it is run again', async () => {
+        const fixture = await machinesFixture(root, studio);
+        await exportWorkMachine(fixture.exportInput);
+        await fixture.vacateSource();
+        // The Claude record is placed first; the Codex record's directory refuses the second move.
+        const codexDirectory = join(fixture.codexRecord, '..');
+        await chmod(codexDirectory, 0o555);
+        try {
+            await expect(importWorkMachine(fixture.importInput)).rejects.toMatchObject({ code: 'EACCES' });
+        } finally {
+            await chmod(codexDirectory, 0o755);
+        }
+        expect((await lstat(fixture.claudeRecord)).isFile()).toBe(true);
+        expect(studio.restored).toBeNull();
+
+        await importWorkMachine(fixture.importInput);
+
+        expect((await lstat(fixture.codexRecord)).isFile()).toBe(true);
+        expect(await readFile(join(fixture.project, 'draft.txt'), 'utf8')).toBe('untracked\n');
+        expect(JSON.parse(await readFile(join(fixture.targetHome, 'sessions.json'), 'utf8')).sessions).toEqual(fixture.sessions);
+        expect(studio.restored).not.toBeNull();
     });
 
     // Medium 13: `happy auth login` on a fresh target PC writes a machine id of its own.
