@@ -67,7 +67,7 @@ import { machineServerLane } from './rpc/serverLane';
 import { machineDelegationLane } from './rpc/delegationLane';
 import { AGENT_DELEGATION_CAPABILITY, delegationLaneAdmission, registerAgentDelegationRpc, type AgentDelegationHost } from '@/daemon/agentDelegationMethods';
 import { createMachineMetadataHandlers, probeLocalHttp, runFileWithoutShell } from '@/daemon/machineMetadataMethods';
-import { createWorkspaceGitStatusHandler, WORKSPACE_GIT_STATUS_METHOD } from '@/daemon/workspaceGitStatus';
+import { createWorkspaceCurrentPrHandler, createWorkspaceGitStatusHandler, WORKSPACE_CURRENT_PR_METHOD, WORKSPACE_GIT_STATUS_METHOD } from '@/daemon/workspaceGitStatus';
 import { createMachineAiUsageHandler, MACHINE_AI_USAGE_METHOD } from '@/daemon/machineAiUsage';
 import { AGENT_LOGIN_STATUS_METHOD, CODEX_CLI_STATUS_METHOD, createAgentLoginStatusHandler, createCodexCliStatusHandler } from '@/daemon/agentCliProbes';
 import { FIXED_READ_RPCS_CAPABILITY } from '@/daemon/fixedReadRpcsCapability';
@@ -1195,13 +1195,15 @@ export class ApiMachineClient {
         // them as reads (aplus-dev-studio specs/work-machine-migration). Customer lane:
         // git status names files.
         const approvedRoots = this.approvedRoots;
-        this.rpcHandlerManager.registerHandler(WORKSPACE_GIT_STATUS_METHOD, createWorkspaceGitStatusHandler({
+        const workspaceGitDeps = {
             allowedRoot,
             approvedRoots: () => approvedRoots?.() ?? [],
             isGuardedPath: isStrictlyGuardedPath,
             runFile: runFileWithoutShell,
             now: Date.now,
-        }));
+        };
+        this.rpcHandlerManager.registerHandler(WORKSPACE_GIT_STATUS_METHOD, createWorkspaceGitStatusHandler(workspaceGitDeps));
+        this.rpcHandlerManager.registerHandler(WORKSPACE_CURRENT_PR_METHOD, createWorkspaceCurrentPrHandler(workspaceGitDeps));
         this.rpcHandlerManager.registerHandler(MACHINE_AI_USAGE_METHOD, createMachineAiUsageHandler({
             runFile: runFileWithoutShell,
             nodePath: process.execPath,

@@ -2184,7 +2184,7 @@ describe('ApiMachineClient socket reconnection', () => {
             portRegistry: {} as any, aiCredentialRuntime: {} as any,
         });
         const registered = (client as any).rpcHandlerManager.registerHandler.mock.calls.map(([name]: [string]) => name);
-        expect(registered).toEqual(expect.arrayContaining(['workspace-git-status', 'machine-ai-usage', 'agent-login-status', 'codex-cli-status']));
+        expect(registered).toEqual(expect.arrayContaining(['workspace-git-status', 'workspace-current-pr', 'machine-ai-usage', 'agent-login-status', 'codex-cli-status']));
         client.connect();
 
         socketHandlers.connect![0]!();
