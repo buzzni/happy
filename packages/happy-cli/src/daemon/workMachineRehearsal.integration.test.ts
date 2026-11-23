@@ -749,6 +749,19 @@ describe.skipIf(!rehearsal)('work machine migration rehearsal (real server, two 
             const moved = await migrate(r, from);
             expect(await r.executionState(machineId)).toMatchObject({ deviceId: moved.report.deviceId, generation: 2, firstExecution: false });
 
+            // The operator checks the target before deciding (dev E2E 2nd round, defect 5): its daemon starts, the
+            // customer's client lists the workspace and the idle reaper stops a conversation. None of it closes the way back.
+            r.phase = 'target-check';
+            await r.workMachine(moved.target, ['bind', machineId, r.accountId, '2']);
+            await r.startDaemon(moved.target);
+            await r.waitConnected(moved.target);
+            await r.customer();
+            await r.machineRpc(machineId, 'listWorkspaceDirectory', { workspaceRoot: r.project, path: r.project });
+            await r.machineRpc(machineId, 'stop-session', { sessionId: conversations[0].sessionId, source: 'idle-reaper', mode: 'if-idle' });
+            expect(await r.executionState(machineId)).toMatchObject({ deviceId: moved.report.deviceId, generation: 2, firstExecution: false });
+            await r.stopDaemon(moved.target);
+            expect(r.modelRequests.filter(({ phase }) => phase === 'target-check')).toEqual([]);
+
             // Back to the source PC's view of the paths.
             await moveHostCopies(moved.manifest.paths, '', '.target-host');
             await moveHostCopies(moved.manifest.paths, '.source-host', '');
