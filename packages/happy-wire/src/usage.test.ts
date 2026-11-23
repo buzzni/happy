@@ -149,3 +149,30 @@ describe('wire compatibility guard', () => {
     });
 
 });
+
+// aplus specs/org-member-ai-plan-usage P1 — mirrors packages/web-ui/server/aiUsageContract.ts.
+describe('planTier', () => {
+    it('is optional — an event without it parses unchanged', () => {
+        const parsed = ProviderUsageEventV1Schema.parse(providerEvent);
+        expect(parsed.planTier).toBeUndefined();
+    });
+
+    it('carries the run login plan tier on both event shapes', () => {
+        expect(ProviderUsageEventV1Schema.parse({ ...providerEvent, planTier: 'claude:max_20x' }).planTier)
+            .toBe('claude:max_20x');
+        expect(AiUsageEventV1Schema.parse({ ...providerEvent, happyAccountId: 'acct', planTier: 'chatgpt:plus' }).planTier)
+            .toBe('chatgpt:plus');
+    });
+
+    it('accepts a tier this build does not know — the ledger validates the shape', () => {
+        expect(ProviderUsageEventV1Schema.safeParse({ ...providerEvent, planTier: 'chatgpt:a_future_plan' }).success)
+            .toBe(true);
+        expect(ProviderUsageEventV1Schema.safeParse({ ...providerEvent, planTier: null }).success).toBe(true);
+    });
+
+    it('rejects a non-string or an over-long value', () => {
+        expect(ProviderUsageEventV1Schema.safeParse({ ...providerEvent, planTier: 1 }).success).toBe(false);
+        expect(ProviderUsageEventV1Schema.safeParse({ ...providerEvent, planTier: `claude:${'x'.repeat(60)}` }).success)
+            .toBe(false);
+    });
+});

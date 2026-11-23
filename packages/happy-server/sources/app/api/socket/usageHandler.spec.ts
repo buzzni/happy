@@ -106,6 +106,19 @@ describe('provider-usage-report socket handler', () => {
         expect(events.emitEphemeral).not.toHaveBeenCalled();
     });
 
+    it('keeps the run login plan tier in the stored event it forwards (aplus specs/org-member-ai-plan-usage P1)', async () => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        usageHandler('account-1', socket as never);
+        const callback = vi.fn();
+
+        await handlers.get('provider-usage-report')!({ ...providerEvent, planTier: 'claude:max_20x' }, callback);
+
+        expect(storage.providerUsageEventUpsert.mock.calls[0]?.[0].create.data)
+            .toEqual({ ...providerEvent, planTier: 'claude:max_20x', happyAccountId: 'account-1' });
+        expect(callback).toHaveBeenCalledWith({ success: true, eventId: 'event-1' });
+    });
+
     it('relays canonical Codex usage with stable identity and unknown cost', async () => {
         const handlers = new Map<string, Function>();
         const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };

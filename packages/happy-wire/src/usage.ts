@@ -66,6 +66,17 @@ const providerUsageEventShape = {
     cost: UsageCostV1Schema.nullable(),
     quality: z.enum(['exact', 'estimated']),
     aiAuth: AiAuthReportV1Schema.nullish(),
+    /**
+     * The plan tier of the login the run spent (`claude:max_20x`, `chatgpt:plus`),
+     * as the official CLI reported it. Loose on purpose, like `appliedSource`: the
+     * ledger validates the `<family>:<tier>` shape and downgrades anything else to
+     * NULL, so a tier this schema predates never costs the event its tokens.
+     *
+     * Additive and optional (`schemaVersion` stays 1). Mirrors `planTier` in
+     * `packages/web-ui/server/aiUsageContract.ts` in aplus-dev-studio, which must
+     * accept it **before** a CLI sends it — the receivers are strict.
+     */
+    planTier: z.string().trim().max(64).nullish(),
 } as const;
 
 export const ProviderUsageEventV1Schema = z.object(providerUsageEventShape).strict();
