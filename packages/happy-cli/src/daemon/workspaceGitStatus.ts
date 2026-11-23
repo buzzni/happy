@@ -83,57 +83,79 @@ function parsePorcelain(output: string): GitFile[] {
 
 const lines = (output: string) => output.trim().split('\n').filter(Boolean);
 
+type WorkspaceGit = {
+    cwd: string;
+    /** One git call; throws GitStatusFailure when git is missing or does not finish. */
+    run: (args: string[]) => Promise<Awaited<ReturnType<MetadataDeps['runFile']>>>;
+    /** stdout of a call that must succeed. */
+    git: (args: string[]) => Promise<string>;
+    /** Trimmed stdout, or null when the call fails. */
+    optional: (args: string[]) => Promise<string | null>;
+};
+
+/**
+ * The workspace directory through the workspace file boundary, and fixed git calls in it.
+ * Throws GitStatusFailure for a path it refuses.
+ */
+async function openWorkspaceGit(deps: WorkspaceGitStatusDeps, workspaceRoot: string, path: string): Promise<WorkspaceGit> {
+    if (deps.isGuardedPath(workspaceRoot) || deps.isGuardedPath(path)) {
+        throw new GitStatusFailure('WORKSPACE_PATH_DENIED', 'Workspace path is in the happy home directory');
+    }
+    let cwd: string;
+    try {
+        const anchor = approvedAnchor(workspaceRoot, deps.allowedRoot, deps.approvedRoots());
+        const snapshot = await captureWorkspacePath(anchor, workspaceRoot, path);
+        if (!snapshot.info.isDirectory()) throw new GitStatusFailure('TARGET_MISSING', 'Workspace path is not a directory');
+        cwd = snapshot.path;
+    } catch (error) {
+        if (error instanceof GitStatusFailure) throw error;
+        if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') throw new GitStatusFailure('TARGET_MISSING', 'Workspace path does not exist');
+        throw new GitStatusFailure('WORKSPACE_PATH_DENIED', 'Workspace path is outside the project or in the happy home directory');
+    }
+
+    const env = gitEnv();
+    const deadline = Date.now() + DEADLINE_MS;
+    const run: WorkspaceGit['run'] = async (args) => {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) throw new GitStatusFailure('GIT_TIMEOUT', 'Git status exceeded its time limit');
+        let result: Awaited<ReturnType<MetadataDeps['runFile']>>;
+        try {
+            // A status read must not start the repository's fsmonitor daemon.
+            result = await deps.runFile('git', ['-c', 'core.fsmonitor=false', '--literal-pathspecs', ...args], { cwd, env, timeoutMs: remaining });
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') throw new GitStatusFailure('GIT_UNAVAILABLE', 'git is not installed');
+            throw new GitStatusFailure('GIT_FAILED', error instanceof Error ? error.message : 'git failed');
+        }
+        if (result.code === null) throw new GitStatusFailure('GIT_TIMEOUT', 'Git status exceeded its time limit');
+        return result;
+    };
+    return {
+        cwd,
+        run,
+        git: async (args) => {
+            const result = await run(args);
+            if (result.code !== 0) throw new GitStatusFailure('GIT_FAILED', (result.stderr || result.stdout || 'git failed').trim());
+            return result.stdout;
+        },
+        optional: async (args) => {
+            const result = await run(args);
+            return result.code === 0 ? result.stdout.trim() : null;
+        },
+    };
+}
+
 export function createWorkspaceGitStatusHandler(deps: WorkspaceGitStatusDeps): (params: unknown) => Promise<Answer> {
     return async (params) => {
         const input = statusParams(params);
         if (!input) return failure('INVALID_PARAMS', 'workspaceRoot and path are required; base must be a branch name');
-        if (deps.isGuardedPath(input.workspaceRoot) || deps.isGuardedPath(input.path)) {
-            return failure('WORKSPACE_PATH_DENIED', 'Workspace path is in the happy home directory');
-        }
-        let cwd: string;
         try {
-            const anchor = approvedAnchor(input.workspaceRoot, deps.allowedRoot, deps.approvedRoots());
-            const snapshot = await captureWorkspacePath(anchor, input.workspaceRoot, input.path);
-            if (!snapshot.info.isDirectory()) return failure('TARGET_MISSING', 'Workspace path is not a directory');
-            cwd = snapshot.path;
-        } catch (error) {
-            if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') return failure('TARGET_MISSING', 'Workspace path does not exist');
-            return failure('WORKSPACE_PATH_DENIED', 'Workspace path is outside the project or in the happy home directory');
-        }
-
-        const env = gitEnv();
-        const deadline = Date.now() + DEADLINE_MS;
-        const run = async (args: string[]) => {
-            const remaining = deadline - Date.now();
-            if (remaining <= 0) throw new GitStatusFailure('GIT_TIMEOUT', 'Git status exceeded its time limit');
-            let result: Awaited<ReturnType<MetadataDeps['runFile']>>;
-            try {
-                // A status read must not start the repository's fsmonitor daemon.
-                result = await deps.runFile('git', ['-c', 'core.fsmonitor=false', '--literal-pathspecs', ...args], { cwd, env, timeoutMs: remaining });
-            } catch (error) {
-                if ((error as NodeJS.ErrnoException | null)?.code === 'ENOENT') throw new GitStatusFailure('GIT_UNAVAILABLE', 'git is not installed');
-                throw new GitStatusFailure('GIT_FAILED', error instanceof Error ? error.message : 'git failed');
-            }
-            if (result.code === null) throw new GitStatusFailure('GIT_TIMEOUT', 'Git status exceeded its time limit');
-            return result;
-        };
-        const git = async (args: string[]) => {
-            const result = await run(args);
-            if (result.code !== 0) throw new GitStatusFailure('GIT_FAILED', (result.stderr || result.stdout || 'git failed').trim());
-            return result.stdout;
-        };
-        const optional = async (args: string[]) => {
-            const result = await run(args);
-            return result.code === 0 ? result.stdout.trim() : null;
-        };
-        const counts = async (ref: string) => {
-            const value = await optional(['rev-list', '--left-right', '--count', `HEAD...${ref}`]);
-            if (value === null) return null;
-            const [ahead, behind] = value.split(/\s+/).map(Number);
-            return { ahead, behind };
-        };
-
-        try {
+            const { cwd, run, git, optional } = await openWorkspaceGit(deps, input.workspaceRoot, input.path);
+            const counts = async (ref: string) => {
+                const value = await optional(['rev-list', '--left-right', '--count', `HEAD...${ref}`]);
+                if (value === null) return null;
+                const [ahead, behind] = value.split(/\s+/).map(Number);
+                return { ahead, behind };
+            };
             const inside = await run(['rev-parse', '--is-inside-work-tree']);
             if (inside.code !== 0 && !inside.stderr.includes('not a git repository')) {
                 throw new GitStatusFailure('GIT_FAILED', inside.stderr.trim() || 'git failed');
