@@ -3,6 +3,7 @@ import { PassThrough } from 'node:stream';
 import type { ChildProcess } from 'node:child_process';
 import nacl from 'tweetnacl';
 import { createAgentCallerLaunches, readOwnerContactTrust } from './agentCallerLaunches';
+import { createOwnedContactIdentity } from './ownedSpawnRuntime';
 import type { TrackedSession } from './types';
 import { buildSpawnRequestEnvironment, buildResumedSessionSpawnEnvironment, captureSaycodeAgentEnvironment } from './sessionEnv';
 
@@ -272,6 +273,51 @@ describe('owned child launch bindings (T1c-b2 H3)', () => {
         const base = { identity: async () => null, trackedByPid: () => undefined, live: () => true };
         expect(createAgentCallerLaunches({ ...base, enabled: false, trust: () => trust }).available()).toBe(false);
         expect(createAgentCallerLaunches({ ...base, enabled: true, trust: () => null }).available()).toBe(false);
+    });
+});
+describe('daemon owner-contact identity wiring', () => {
+    it('confirms the registration with the server once, so a later server failure never revokes a live binding', async () => {
+        let state = { machineId: 'machine', epoch: 'e1', credentials: { token: 'synthetic-machine-bearer',
+            encryption: { type: 'legacy' as const, secret: new Uint8Array(32) } } };
+        let serverUp = true, requests = 0;
+        const fetcher = async (url: string | URL | Request) => {
+            requests++;
+            if (!serverUp) return new Response('unavailable', { status: 503 });
+            return String(url).endsWith('/v1/account/profile') ? Response.json({ id: 'account' })
+                : Response.json({ machine: { id: 'machine', accountId: 'account' } });
+        };
+        const session = { startedBy: 'daemon', pid: 42, directory: '/project', happySessionId: 'source' } as TrackedSession;
+        const launches = createAgentCallerLaunches({ enabled: true, trust: () => trust, realpath: path => path,
+            identity: createOwnedContactIdentity('https://happy.test', async () => state, fetcher as typeof fetch),
+            trackedByPid: pid => pid === session.pid ? session : undefined, live: () => true });
+        const { capability } = await spawnHost(launches, 42);
+        const issued = await launches.issue({ sessionId: 'source', runtimeId: 'actual-runtime', hostPid: 42, callerPublicKey: key(), capability });
+        expect(issued.caller).toMatchObject({ machineId: 'machine', happyAccountId: 'account' });
+        expect(requests).toBe(2);
+        const ask = () => launches.current({ sessionId: 'source', callerBindingId: issued.caller.callerBindingId });
+        serverUp = false;
+        expect(await ask()).toEqual({ current: true });
+        serverUp = true;
+        expect(await ask()).toEqual({ current: true });
+        expect(requests).toBe(2);
+        // The local registration is still re-read every time: a replaced credential needs its own confirmation.
+        state = { ...state, credentials: { ...state.credentials, token: 'replaced' } };
+        serverUp = false;
+        expect(await ask()).toEqual({ current: false });
+        expect(requests).toBe(4);
+    });
+    it('remembers only a confirmed registration', async () => {
+        const state = { machineId: 'machine', epoch: 'e1', credentials: { token: 'synthetic-machine-bearer',
+            encryption: { type: 'legacy' as const, secret: new Uint8Array(32) } } };
+        let status = 503;
+        const fetcher = async (url: string | URL | Request) => status !== 200 ? new Response('', { status })
+            : String(url).endsWith('/v1/account/profile') ? Response.json({ id: 'account' }) : Response.json({ machine: { id: 'machine', accountId: 'account' } });
+        const identity = createOwnedContactIdentity('https://happy.test', async () => state, fetcher as typeof fetch);
+        expect(await identity()).toBeNull();
+        status = 404;
+        expect(await identity()).toBeNull();
+        status = 200;
+        expect(await identity()).toEqual({ machineId: 'machine', happyAccountId: 'account', epoch: 'e1' });
     });
 });
 describe('owner-contact trust configuration', () => {

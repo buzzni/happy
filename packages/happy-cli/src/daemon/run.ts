@@ -7,7 +7,7 @@ import { createBrowserSessionReconnect } from './browserSessionReconnect';
 import { readBrowserTaskPidStartTime } from './browserTaskSessionOwner';
 import { createBrowserNativeDeviceProof, type BrowserNativeDeviceSigner } from './browserNativeDeviceProof';
 import { createManualPersonalSpawn, MANUAL_PERSONAL_ENV } from './manualPersonalClaude';
-import { createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship } from './ownedSpawnRuntime';
+import { createOwnedContactIdentity, createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship } from './ownedSpawnRuntime';
 import { ownershipHappyOrigin, ownershipTrustEnv } from './sessionOwnershipTrust';
 import { createAgentCallerLaunches, OWNER_CONTACT_SWITCH, readOwnerContactTrust, type OwnedLaunchLineage } from './agentCallerLaunches';
 import { drainWorktreeOperations } from './worktreeOps';
@@ -6065,26 +6065,17 @@ export async function startDaemon(): Promise<void> {
 
     const ownedRegistration = async () => {
       const [currentCredentials, settings] = await Promise.all([readCredentials(), readSettings()]);
-      if (!currentCredentials || settings.machineId !== machineId || !settings.machineIdConfirmedByServer) throw new Error('identity-changed');
+      if (!currentCredentials || settings.machineId !== machineId) throw new Error('identity-changed');
       // Never replace the running daemon's registration with a descriptor's claims.
       if (JSON.stringify(currentCredentials) !== JSON.stringify(credentials)) throw new Error('identity-changed');
       return { machineId, credentials: currentCredentials, epoch: String(process.pid) };
     };
     const liveLaunch = (tracked: TrackedSession) => tracked.pid > 0 && isPidAlive(tracked.pid);
     // Default OFF: the route refuses and agent-caller-binding answers only owned-journal sources.
-    // A token's account never changes, so only a confirmed answer is remembered; registration is re-read every time.
-    const accountByToken = new Map<string, string>();
     // D5: a released daemon verifies A+ ownership documents with the pinned public trust unless the environment names its own.
     const ownershipOrigin = ownershipHappyOrigin(configuration.serverUrl), ownershipEnv = ownershipTrustEnv(process.env, ownershipOrigin);
     callerLaunches = createAgentCallerLaunches({ enabled: process.env[OWNER_CONTACT_SWITCH] === '1',
-      identity: async () => {
-        try {
-          const state = await ownedRegistration(), token = state.credentials.token;
-          const happyAccountId = accountByToken.get(token) ?? await authenticatedAccountId(token);
-          accountByToken.set(token, happyAccountId);
-          return { machineId: state.machineId, happyAccountId, epoch: state.epoch };
-        } catch { return null; }
-      },
+      identity: createOwnedContactIdentity(ownershipOrigin, ownedRegistration),
       trust: () => readOwnerContactTrust({ HAPPY_APLUS_STUDIO_ORIGIN: process.env.HAPPY_APLUS_STUDIO_ORIGIN, ...ownershipEnv }, ownershipOrigin), trackedByPid: pid => pidToTrackedSession.get(pid), live: liveLaunch });
     const ownedSpawn = createOwnedSpawnRuntime({ home: configuration.happyHomeDir, happyOrigin: ownershipOrigin, env: ownershipEnv,
       registration: ownedRegistration,

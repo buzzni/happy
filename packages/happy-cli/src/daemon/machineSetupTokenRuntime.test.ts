@@ -423,6 +423,9 @@ it.each(['expired-ticket', 'expired-device-proof', 'expired-ticket-signed', 'ser
       rotation: async () => rotation, tracked: () => undefined, live: () => false, persist: async () => ({ status: 'committed' }), start,
       fetch: async (url) => {
         if (String(url).endsWith('/v1/account/profile')) return Response.json({ id: machineOwner });
+        if (String(url) === `${happyOrigin}/v1/machines/${encodeURIComponent(machineId)}`) {
+          return Response.json({ machine: { id: machineId, accountId: machineOwner } });
+        }
         expect(String(url)).toBe(happyOrigin + '/v1/sessions'); posts++;
         return Response.json({}, { status: 403 });
       },
