@@ -2336,10 +2336,24 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             recordAppPrompt(text);
             session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }));
         },
-        onUserInputDelivered: (text) => {
-            const at = queuedAppPrompts.indexOf(text);
-            if (at < 0) return;
-            queuedAppPrompts.splice(at, 1);
+        onUserInputDelivered: (texts) => {
+            // Only a batch of the app's own prompts: a continuation the launcher queued reaches the transcript itself.
+            const remaining = [...queuedAppPrompts];
+            for (const part of texts) {
+                const at = remaining.indexOf(part);
+                if (at < 0) return;
+                remaining.splice(at, 1);
+            }
+            queuedAppPrompts.splice(0, queuedAppPrompts.length, ...remaining);
+            // Inputs queued together run as one turn, and Claude writes them joined as MessageQueue2 joins them.
+            // That copy matches no part's arrival record, so the parts' records give way to one for the whole.
+            const text = texts.join('\n');
+            if (texts.length > 1) {
+                for (const part of texts) {
+                    const record = recentAppPrompts.findIndex(entry => entry.text === part);
+                    if (record >= 0) recentAppPrompts.splice(record, 1);
+                }
+            }
             // The arrival record answers while it is in its window; only a lapsed or dropped one is made again.
             const lapsed = recentAppPrompts.findIndex(entry => entry.text === text && entry.addedAt < Date.now() - recentAppPromptsMaxAgeMs);
             if (lapsed >= 0) recentAppPrompts.splice(lapsed, 1);
