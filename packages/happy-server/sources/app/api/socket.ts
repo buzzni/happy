@@ -332,6 +332,9 @@ export function startSocket(app: Fastify, managedControl: ManagedControlRuntime 
             // 지웠기 때문이다. `socket.data` 는 복구 때 그대로 돌아온다.
             socket.data[BROWSER_SYNC_EXPIRES_AT] = browserSync.expiresAt;
             socket.data.workMachineBrowser = browserSync.workMachineIngress === true;
+            // Studio's server-lane RPC pool reaches a work machine with this
+            // credential too; like its account-bearer socket, it only sends.
+            if (transportOnlyFromHandshake(socket.handshake.auth)) socket.data.transportOnly = true;
             next();
             return;
         }
