@@ -18,10 +18,13 @@ function grant(input: {
     now?: number;
     exp?: number;
     nonce?: string;
+    version?: number;
+    workMachine?: unknown;
 } = {}): string {
     const now = input.now ?? 1_000;
     const payload = Buffer.from(JSON.stringify({
-        version: 1,
+        version: input.version ?? 1,
+        ...(input.workMachine === undefined ? {} : { workMachine: input.workMachine }),
         userId: 'U-1',
         machineId: input.machineId ?? 'M-1',
         projectId: input.projectId === undefined ? 'P-1' : input.projectId,
@@ -242,6 +245,63 @@ describe('McpCallerGrantEnvelopeConsumer', () => {
         expect(consumer.consume(first, PROJECT_CONTEXT).ok).toBe(true);
         expect(consumer.consume(second, PROJECT_CONTEXT)).toEqual({ ok: false, reason: 'capacity' });
         expect(consumer.consume(first, PROJECT_CONTEXT)).toEqual({ ok: false, reason: 'replayed' });
+    });
+});
+
+describe('McpCallerGrantEnvelopeConsumer work-machine (v2) grants', () => {
+    const scope = { accountId: 'A-1', machineId: 'M-1', deviceId: 'D-1', generation: 3 };
+    const consumerFor = (workMachine: typeof scope | null) => {
+        const keyPair = tweetnacl.box.keyPair();
+        const consumer = new McpCallerGrantEnvelopeConsumer({
+            machineId: 'M-1', secretKey: keyPair.secretKey, now: () => 2_000, workMachine,
+        });
+        return { consumer, seal: (token: string) => envelope(token, keyPair.publicKey) };
+    };
+
+    it('accepts a v2 grant whose work-machine scope matches the daemon execution binding', () => {
+        const { consumer, seal } = consumerFor(scope);
+        const token = grant({ version: 2, workMachine: scope });
+
+        expect(consumer.consume(seal(token), PROJECT_CONTEXT)).toEqual({ ok: true, grant: token });
+    });
+
+    it.each([
+        ['account', { ...scope, accountId: 'A-2' }],
+        ['device', { ...scope, deviceId: 'D-2' }],
+        ['generation', { ...scope, generation: 2 }],
+    ])('refuses a v2 grant whose %s differs from the daemon execution binding', (_field, workMachine) => {
+        const { consumer, seal } = consumerFor(scope);
+
+        expect(consumer.consume(seal(grant({ version: 2, workMachine })), PROJECT_CONTEXT))
+            .toEqual({ ok: false, reason: 'wrong-work-machine' });
+    });
+
+    it('refuses a v2 grant on a daemon that runs without an execution binding', () => {
+        const { consumer, seal } = consumerFor(null);
+
+        expect(consumer.consume(seal(grant({ version: 2, workMachine: scope })), PROJECT_CONTEXT))
+            .toEqual({ ok: false, reason: 'wrong-work-machine' });
+    });
+
+    it.each([
+        ['missing scope', undefined],
+        ['scope for another machine', { ...scope, machineId: 'M-2' }],
+        ['extra scope field', { ...scope, extra: true }],
+        ['non-integer generation', { ...scope, generation: 1.5 }],
+        ['malformed identifier', { ...scope, deviceId: 'D 1' }],
+    ])('refuses a v2 grant with a %s as invalid', (_case, workMachine) => {
+        const { consumer, seal } = consumerFor(scope);
+
+        expect(consumer.consume(seal(grant({ version: 2, workMachine })), PROJECT_CONTEXT))
+            .toEqual({ ok: false, reason: 'invalid-grant' });
+    });
+
+    it('keeps accepting v1 grants and refuses unknown versions', () => {
+        const { consumer, seal } = consumerFor(null);
+
+        expect(consumer.consume(seal(grant()), PROJECT_CONTEXT).ok).toBe(true);
+        expect(consumer.consume(seal(grant({ version: 3, workMachine: scope, nonce: 'N-3' })), PROJECT_CONTEXT))
+            .toEqual({ ok: false, reason: 'invalid-grant' });
     });
 });
 

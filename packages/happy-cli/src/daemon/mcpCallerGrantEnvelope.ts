@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import tweetnacl from 'tweetnacl';
+import { z } from 'zod';
 import { readTrustedStudioOrigin } from './setupTokenBindingProof';
 
 const EPHEMERAL_PUBLIC_KEY_BYTES = tweetnacl.box.publicKeyLength;
@@ -14,6 +15,7 @@ type ConsumeFailureReason =
     | 'invalid-envelope'
     | 'invalid-grant'
     | 'wrong-machine'
+    | 'wrong-work-machine'
     | 'wrong-project'
     | 'expired'
     | 'replayed'
@@ -23,11 +25,25 @@ export type McpCallerGrantEnvelopeResult =
     | { ok: true; grant: string }
     | { ok: false; reason: ConsumeFailureReason };
 
+/**
+ * The execution scope Studio signs into a v2 (work machine) caller grant — the same shape as the
+ * Studio's `workMachineExecutionScopeSchema`. The daemon's own execution binding provides the
+ * value it must equal.
+ */
+const workMachineScopeSchema = z.object({
+    accountId: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/),
+    machineId: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/),
+    deviceId: z.string().regex(/^[A-Za-z0-9_-]{1,200}$/),
+    generation: z.number().int().min(1).max(2_147_483_647),
+}).strict();
+export type McpCallerGrantWorkMachineScope = z.infer<typeof workMachineScopeSchema>;
+
 type ParsedGrant = {
     machineId: string;
     projectId: string | null;
     iat: number;
     exp: number;
+    workMachine: McpCallerGrantWorkMachineScope | null;
 };
 
 /**
@@ -131,7 +147,12 @@ function parseGrant(value: string): ParsedGrant | null {
     if (parts.length !== 2 || !parts[0] || !parts[1]) return null;
     try {
         const payload = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')) as Record<string, unknown>;
-        if (payload.version !== 1) return null;
+        let workMachine: McpCallerGrantWorkMachineScope | null = null;
+        if (payload.version === 2) {
+            const scope = workMachineScopeSchema.safeParse(payload.workMachine);
+            if (!scope.success || scope.data.machineId !== payload.machineId) return null;
+            workMachine = scope.data;
+        } else if (payload.version !== 1) return null;
         if (typeof payload.userId !== 'string' || !payload.userId) return null;
         if (typeof payload.machineId !== 'string' || !payload.machineId) return null;
         if (payload.projectId !== null && (typeof payload.projectId !== 'string' || !payload.projectId)) return null;
@@ -143,10 +164,22 @@ function parseGrant(value: string): ParsedGrant | null {
             projectId: payload.projectId,
             iat: payload.iat,
             exp: payload.exp,
+            workMachine,
         };
     } catch {
         return null;
     }
+}
+
+function sameWorkMachineScope(
+    granted: McpCallerGrantWorkMachineScope,
+    current: McpCallerGrantWorkMachineScope | null,
+): boolean {
+    return current !== null
+        && granted.accountId === current.accountId
+        && granted.machineId === current.machineId
+        && granted.deviceId === current.deviceId
+        && granted.generation === current.generation;
 }
 
 /**
@@ -163,6 +196,12 @@ export class McpCallerGrantEnvelopeConsumer {
     constructor(private readonly options: {
         machineId: string;
         secretKey: Uint8Array;
+        /**
+         * The daemon's work machine execution binding, or null when it does not run as one. A v2
+         * grant is accepted only when its signed scope names exactly this account, device and
+         * generation.
+         */
+        workMachine?: McpCallerGrantWorkMachineScope | null;
         now?: () => number;
         maxEntries?: number;
     }) {
@@ -189,6 +228,9 @@ export class McpCallerGrantEnvelopeConsumer {
         const parsed = parseGrant(grant);
         if (!parsed) return { ok: false, reason: 'invalid-grant' };
         if (parsed.machineId !== this.options.machineId) return { ok: false, reason: 'wrong-machine' };
+        if (parsed.workMachine && !sameWorkMachineScope(parsed.workMachine, this.options.workMachine ?? null)) {
+            return { ok: false, reason: 'wrong-work-machine' };
+        }
         if (parsed.projectId !== context.projectId) {
             return { ok: false, reason: 'wrong-project' };
         }

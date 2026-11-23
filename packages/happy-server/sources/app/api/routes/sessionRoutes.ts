@@ -549,6 +549,7 @@ export function sessionRoutes(app: Fastify) {
                 tag, metadata, agentState: request.body.agentState, dataEncryptionKey,
             });
             if (result === 'denied') return refused();
+            if (result === 'draining') return reply.code(409).send({ error: 'Work machine is draining', reason: 'work-machine-draining' });
             if (result === 'conflict') return reply.code(409).send({ error: 'Session tag conflict' });
             const { session } = result;
             return reply.send({ session: {

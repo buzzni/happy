@@ -151,3 +151,37 @@ export async function workMachineSocketMayAct(db: WorkMachineLookup, input: Mach
         && (!protectedMachine || protectedMachine.frozenAt === null)
         && (!protectedSession || protectedSession.workMachineExecution?.frozenAt === null);
 }
+
+/**
+ * The per-packet work machine check every socket runs, released in arrival order. `context` is the
+ * socket's identity, fixed at connection; a refused packet never reaches its handler.
+ *
+ * socket.io reports a refused packet only on the server side, so a refused `rpc-call` would leave
+ * its caller waiting out its whole ack timeout for an answer that never comes. The caller is told
+ * why instead: an account-bearer socket needs a work machine credential, anything else is not
+ * authorized right now, and a failed lookup is said to be one.
+ */
+export function workMachinePacketGuard(
+    db: WorkMachineLookup,
+    context: Omit<MachineSocketEvent, 'event' | 'payload' | 'now'>,
+    onLookupFailed: () => void,
+) {
+    const refuseRpc = (packet: unknown[], error: string) => {
+        const ack = packet[packet.length - 1];
+        if (packet[0] === 'rpc-call' && typeof ack === 'function') ack({ ok: false, error });
+    };
+    const refusal = context.claims || context.workMachineBrowser
+        ? 'work-machine-execution-not-authorized' : 'work-machine-credential-required';
+    return inArrivalOrder((packet: unknown[], next: (error?: Error) => void) => {
+        const [event, payload] = packet;
+        void workMachineSocketMayAct(db, { ...context, event: event as string, payload, now: Date.now() }).then((allowed) => {
+            if (allowed) { next(); return; }
+            refuseRpc(packet, refusal);
+            next(new Error('Work machine execution is not authorized'));
+        }, (error: unknown) => {
+            onLookupFailed();
+            refuseRpc(packet, 'work-machine-execution-lookup-failed');
+            next(error instanceof Error ? error : new Error('Work machine execution lookup failed'));
+        });
+    });
+}

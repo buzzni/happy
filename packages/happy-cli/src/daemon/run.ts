@@ -1277,6 +1277,13 @@ export async function startDaemon(): Promise<void> {
     const mcpCallerGrantConsumer = new McpCallerGrantEnvelopeConsumer({
       machineId,
       secretKey: mcpCallerGrantKeyPair.secretKey,
+      // A protected work machine's Studio grants are v2 and name this binding.
+      workMachine: executionBinding && {
+        accountId: executionBinding.accountId,
+        machineId: executionBinding.machineId,
+        deviceId: executionBinding.deviceId,
+        generation: executionBinding.generation,
+      },
     });
     // aplus specs/org-agent-plan §6.3-2: the Studio seals plan grants to the same published key.
     const agentPlanGrantConsumer = new AgentPlanGrantEnvelopeConsumer({

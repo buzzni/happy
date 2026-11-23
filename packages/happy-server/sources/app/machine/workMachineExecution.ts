@@ -252,14 +252,18 @@ export async function redeemWorkMachineRenewal(
             where: { id: device.sessionId, accountId: device.accountId, workMachineId: device.machineId },
             select: { id: true },
         })) return false;
+        // Timestamp columns hold UTC (Prisma writes them so) without a zone. Raw
+        // SQL converts explicitly: left to the session time zone, a non-UTC
+        // database purges unexpired proofs early (a replay window) and stores
+        // expiries shifted by its offset.
         await tx.$executeRaw`
             DELETE FROM "WorkMachineRenewalProof"
-            WHERE "machineId" = ${device.machineId} AND "expiresAt" <= clock_timestamp()
+            WHERE "machineId" = ${device.machineId} AND "expiresAt" <= (clock_timestamp() AT TIME ZONE 'UTC')
         `;
         const redeemed = await tx.$executeRaw`
             INSERT INTO "WorkMachineRenewalProof" ("machineId", "nonce", "expiresAt")
-            SELECT ${device.machineId}, ${proof.nonce}, ${proof.expiresAt}
-            WHERE ${proof.expiresAt} > clock_timestamp()
+            SELECT ${device.machineId}, ${proof.nonce}, (${proof.expiresAt}::timestamptz AT TIME ZONE 'UTC')
+            WHERE ${proof.expiresAt}::timestamptz > clock_timestamp()
             ON CONFLICT DO NOTHING
         `;
         return redeemed === 1;
@@ -409,7 +413,8 @@ export async function permitWorkMachineExecution(
     if (existing.length === 1) return true;
     const changed = await db.$queryRaw<{ machineId: string }[]>`
         UPDATE "WorkMachineExecution"
-        SET "firstExecutionAt" = COALESCE("firstExecutionAt", ${permittedAt})
+        -- UTC like every Prisma-written timestamp, whatever the session time zone.
+        SET "firstExecutionAt" = COALESCE("firstExecutionAt", ${permittedAt}::timestamptz AT TIME ZONE 'UTC')
         WHERE "machineId" = ${grant.machineId} AND "accountId" = ${grant.accountId}
           AND "deviceId" = ${grant.deviceId} AND "generation" = ${grant.generation}
           AND "frozenAt" IS NULL AND (${allowDraining} OR "drainingAt" IS NULL)
