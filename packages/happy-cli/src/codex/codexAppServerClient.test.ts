@@ -7521,3 +7521,54 @@ it('forwards raw browser MCP completion for immediate quota recovery', async () 
  expect(events.map(event=>event.type)).toEqual(['mcp_tool_call_begin','mcp_tool_call_end']);
  expect(mapCodexMcpMessageToSessionEnvelopes(events[1],{currentTurnId:'t'}).envelopes[0]?.ev).toMatchObject({browserQuotaKind:'spaces'});
 });
+
+describe('ChatGPT plan observation (aplus specs/org-member-ai-plan-usage H3)', () => {
+    beforeEach(() => {
+        mockSpawn.mockReset();
+        mockPrepareCodexMultiAuthProxy.mockResolvedValue(null);
+        mockExecSync.mockReturnValue('codex-cli 0.140.0');
+    });
+
+    async function connected() {
+        const { CodexAppServerClient } = await import('./codexAppServerClient');
+        const requests: string[] = [];
+        const proc = createMockProcess({ onRequest: (msg) => { if (msg.method) requests.push(msg.method); } });
+        mockSpawn.mockReturnValueOnce(proc);
+        const client = new CodexAppServerClient();
+        await client.connect();
+        const notify = async (method: string, params: unknown) => {
+            pushJsonLine(proc.stdout, { method, params });
+            await new Promise((resolve) => setTimeout(resolve, 10));
+        };
+        return { client, notify, requests };
+    }
+
+    it('reads the plan from the notifications Codex already sends — no extra request', async () => {
+        const { client, notify, requests } = await connected();
+        expect(client.aiPlanTier).toBeNull();
+
+        await notify('account/rateLimits/updated', { rateLimits: { planType: 'pro', primary: null, secondary: null } });
+        expect(client.aiPlanTier).toBe('chatgpt:pro');
+
+        await notify('account/updated', { authMode: 'chatgpt', planType: 'plus' });
+        expect(client.aiPlanTier).toBe('chatgpt:plus');
+        expect(requests).toEqual(['initialize', 'initialized']);
+        await client.disconnect();
+    });
+
+    it('forgets the plan when the login turns into an API key', async () => {
+        const { client, notify } = await connected();
+        await notify('account/updated', { authMode: 'chatgpt', planType: 'pro' });
+        await notify('account/updated', { authMode: 'apikey', planType: null });
+        expect(client.aiPlanTier).toBeNull();
+        await client.disconnect();
+    });
+
+    it('reports nothing through an account rotation proxy — the proxy picks the payer', async () => {
+        mockPrepareCodexMultiAuthProxy.mockResolvedValue({ args: ['-c', 'proxy'], env: {}, cleanup: vi.fn() });
+        const { client, notify } = await connected();
+        await notify('account/rateLimits/updated', { rateLimits: { planType: 'pro' } });
+        expect(client.aiPlanTier).toBeNull();
+        await client.disconnect();
+    });
+});

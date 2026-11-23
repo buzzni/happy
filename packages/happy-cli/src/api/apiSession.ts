@@ -54,6 +54,7 @@ import type { ProviderUsageStore } from '@/usage/providerUsageSpool';
 import { ClaudeRuntimeAccountPublisher } from '@/claude/claudeRuntimeAccount';
 import { ClaudeContextUsageTracker, type ClaudeContextUsageSignal, type ClaudeControlRequest } from '@/claude/claudeContextUsage';
 import { createClaudeTurnUsageEvent, createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
+import type { AiPlanTierSource } from '@/usage/aiPlanTier';
 import type { ObservedAiAuthSource } from '@/claude/aiAuthObservation';
 import { createTurnSequence, registerCleanBackgroundProcessesHandler, sessionBackgroundProcesses } from '@/utils/sessionBackgroundProcesses';
 
@@ -641,6 +642,7 @@ export class ApiSessionClient extends EventEmitter {
     private assistantTurns = 0;
     private providerTokens = 0;
     private providerUsageEventIds = new Set<string>();
+    private aiPlanTierSource: AiPlanTierSource | null = null;
     private readonly claudeTurnUsage = new ClaudeTurnUsageTracker();
     private readonly claudeStreamedUsage = new ClaudeStreamedUsage();
     private readonly providerUsageDelivery: ProviderUsageDelivery;
@@ -2498,8 +2500,18 @@ export class ApiSessionClient extends EventEmitter {
         this.socket.emit('usage-report', usageReport);
     }
 
+    /**
+     * aplus specs/org-member-ai-plan-usage — the running agent's plan observation
+     * (src/usage/aiPlanTier.ts). The runner sets it while a run is live and clears it
+     * when the run ends; events sent without one stay exactly as an older CLI sends them.
+     */
+    setAiPlanTierSource(source: AiPlanTierSource | null) {
+        this.aiPlanTierSource = source;
+    }
+
     sendProviderUsageEvent(event: ProviderUsageEventV1) {
-        const parsed = ProviderUsageEventV1Schema.parse(event);
+        const planTier = event.planTier ?? this.aiPlanTierSource?.current(event.provider) ?? null;
+        const parsed = ProviderUsageEventV1Schema.parse(planTier ? { ...event, planTier } : event);
         this.providerUsageDelivery.send(parsed);
         if (!this.providerUsageEventIds.has(parsed.sourceEventId)) {
             this.providerUsageEventIds.add(parsed.sourceEventId);

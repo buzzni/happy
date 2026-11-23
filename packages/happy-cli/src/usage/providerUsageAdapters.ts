@@ -137,6 +137,8 @@ export function createCodexUsageEvent(input: {
     model?: string | null;
     usage: CodexUsage;
     env?: UsageEventEnvironment;
+    /** The app-server's reported login plan (`CodexAppServerClient.aiPlanTier`); omitted when unknown. */
+    planTier?: string | null;
 }): ProviderUsageEventV1 {
     const exclusiveInput = input.usage.inputTokens
         - input.usage.cachedInputTokens
@@ -164,5 +166,6 @@ export function createCodexUsageEvent(input: {
         cost: null,
         quality: 'exact',
         aiAuth: aiAuthReport(input.env ?? process.env),
+        ...(input.planTier ? { planTier: input.planTier } : {}),
     });
 }
