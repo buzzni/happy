@@ -1277,11 +1277,16 @@ describe('work machine execution authority', () => {
             expect((await create(await daemon(original, 'ordinary-machine'), 'device-ordinary')).statusCode).toBe(403);
             expect((await create(await daemon({ ...original, deviceId: 'other-pc' }), 'device-other')).statusCode).toBe(403);
 
-            for (const [state, data] of [['draining', { drainingAt: new Date() }], ['frozen', { frozenAt: new Date() }]] as const) {
-                await db.workMachineExecution.update({ where: { machineId }, data });
-                expect((await create(current, `device-${state}`)).statusCode).toBe(403);
-                expect((await create(current, 'device-new-1')).statusCode).toBe(403);
+            // A drain is named, so the daemon can tell the user new work is paused for a migration.
+            await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: new Date() } });
+            for (const tag of ['device-draining', 'device-new-1']) {
+                const drained = await create(current, tag);
+                expect(drained.statusCode).toBe(409);
+                expect(drained.json()).toEqual({ error: 'Work machine is draining', reason: 'work-machine-draining' });
             }
+            await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
+            expect((await create(current, 'device-frozen')).statusCode).toBe(403);
+            expect((await create(current, 'device-new-1')).statusCode).toBe(403);
             await db.workMachineExecution.update({ where: { machineId }, data: { drainingAt: null, frozenAt: null } });
             await db.workMachineExecution.update({ where: { machineId }, data: { frozenAt: new Date() } });
             expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);

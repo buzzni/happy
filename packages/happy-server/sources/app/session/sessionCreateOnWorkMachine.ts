@@ -25,16 +25,22 @@ export interface WorkMachineSessionCreateBody {
  * to the previous device. Repeating
  * the request returns the conversation it created; a tag held by any other
  * conversation is a conflict rather than an adoption.
+ *
+ * A refusal because the generation drains is reported as `draining`, apart
+ * from every other refusal: the daemon then tells the user that new work is
+ * paused while the machine is migrated, not that the server is unreachable.
  */
 export async function sessionCreateOnWorkMachine(
     grant: WorkMachineDeviceGrant,
     body: WorkMachineSessionCreateBody,
-): Promise<{ session: Session } | 'denied' | 'conflict'> {
+): Promise<{ session: Session } | 'denied' | 'draining' | 'conflict'> {
     const { accountId, machineId } = grant;
     for (let attempt = 0; ; attempt++) {
         try {
             return await inTx(async tx => {
-                if (!await lockWorkMachineExecution(tx, grant, { newWork: true })) return 'denied' as const;
+                if (!await lockWorkMachineExecution(tx, grant, { newWork: true })) {
+                    return await lockWorkMachineExecution(tx, grant) ? 'draining' as const : 'denied' as const;
+                }
                 const existing = await tx.session.findUnique({ where: { accountId_tag: { accountId, tag: body.tag } } });
                 if (existing) return existing.workMachineId === machineId ? { session: existing } : 'conflict' as const;
                 if (!await permitWorkMachineExecution(tx, grant, new Date())) return 'denied' as const;
