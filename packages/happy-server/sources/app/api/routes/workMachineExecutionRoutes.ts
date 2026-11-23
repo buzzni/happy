@@ -8,8 +8,8 @@ import type { Fastify } from '@/app/api/types';
 import {
     admitWorkMachineMcpCall, authorizeWorkMachineExecution, authorizeWorkMachineSession, drainWorkMachineExecution,
     enrollWorkMachineExecution, finishWorkMachineMcpCall, freezeDrainedWorkMachineExecution, handoffWorkMachineExecution,
-    listOpenWorkMachineAutomationRuns, permitWorkMachineExecution, reconcileWorkMachineMcpCall, redeemWorkMachineRenewal,
-    resumeWorkMachineExecution, type WorkMachineHandoff,
+    listOpenWorkMachineAutomationRuns, lockWorkMachineExecution, permitWorkMachineExecution, reconcileWorkMachineMcpCall,
+    redeemWorkMachineRenewal, resumeWorkMachineExecution, type WorkMachineHandoff,
 } from '@/app/machine/workMachineExecution';
 import { decodeMachineDataKeyEnvelope, MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH } from '@/app/machine/machineDataKeyEnvelope';
 import { buildUpdateMachineUpdate, eventRouter } from '@/app/events/eventRouter';
@@ -109,7 +109,12 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
     });
 
     app.post('/v1/sessions/:sessionId/work-machine-permit', {
-        schema: { params: z.object({ sessionId: identifier }) },
+        schema: {
+            params: z.object({ sessionId: identifier }),
+            // `start`: the session process is starting without a turn of its own (resume, recovery). It is
+            // checked like new work but records no first execution; its first turn asks again without it.
+            body: z.object({ start: z.literal(true).optional() }).strict().nullish(),
+        },
         bodyLimit: 1_024,
     }, async (request, reply) => {
         const bearer = request.headers.authorization?.match(/^Bearer (wmx_\S+)$/)?.[1];
@@ -122,6 +127,7 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
             // Check the session before recording first execution. The permit
             // checks the live generation again under the authority row lock.
             if (!await authorizeWorkMachineSession(tx, claims)) return false;
+            if (request.body?.start) return lockWorkMachineExecution(tx, claims, { newWork: true });
             return permitWorkMachineExecution(tx, claims, new Date());
         });
         if (!allowed) return reply.code(403).send({ error: 'Work machine execution not authorized' });

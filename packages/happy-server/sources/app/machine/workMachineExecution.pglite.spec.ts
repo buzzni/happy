@@ -814,6 +814,11 @@ describe('work machine execution authority', () => {
             const permit = async (token: string) => (await app.inject({
                 method: 'POST', url: `/v1/sessions/${sessionId}/work-machine-permit`, headers: { authorization: `Bearer ${token}` },
             })).statusCode;
+            // A session process starting without a turn of its own (resume, recovery) asks this way.
+            const startPermit = async (token: string) => (await app.inject({
+                method: 'POST', url: `/v1/sessions/${sessionId}/work-machine-permit`, headers: { authorization: `Bearer ${token}` },
+                payload: { start: true },
+            })).statusCode;
             const write = async (token: string, localId: string) => (await app.inject({
                 method: 'POST', url: `/v3/sessions/${sessionId}/messages`, headers: { authorization: `Bearer ${token}` },
                 payload: { messages: [{ content: 'encrypted-body', localId }] },
@@ -853,6 +858,7 @@ describe('work machine execution authority', () => {
             const sourceToken = await sessionToken(source.id, 1);
             expect((await control('drain', at(1))).json()).toEqual(drained);
             expect(await permit(sourceToken)).toBe(403);
+            expect(await startPermit(sourceToken)).toBe(403);
             expect(await write(sourceToken, 'in-turn-reply')).toBe(200);
             const requestId = crypto.randomUUID();
             expect(await authority.admitWorkMachineMcpCall(db, { accountId, machineId: migrating, ...at(1) }, requestId)).toBe(true);
@@ -921,6 +927,10 @@ describe('work machine execution authority', () => {
                 openMcpCalls: [], openAutomationRuns: [],
             });
             expect(await permit(sourceToken)).toBe(403);
+
+            // The replacement's conversations come back up (dev E2E 2nd round, defect 5) without closing the way back.
+            expect(await startPermit(await sessionToken(target.id, 2))).toBe(204);
+            expect((await state()).firstExecution).toBe(false);
 
             // Roll back before the replacement runs anything.
             const originalKey = envelope(5);
