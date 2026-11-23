@@ -311,6 +311,8 @@ export const MachineMetadataSchema = z.object({
   writeFileAttempt: z.object({ version: z.literal(1) }).optional(),
   /** This daemon serves `listFilesPage` (aplus-dev-studio specs/remote-file-list-pages). */
   listFilesPage: z.object({ version: z.literal(1) }).optional(),
+  /** This daemon serves `workspace-git-status` and `machine-ai-usage` (aplus-dev-studio specs/work-machine-migration). */
+  fixedReadRpcs: z.object({ version: z.literal(1) }).optional(),
   /**
    * Availability hint for newly launched Claude sessions. Detached sessions can outlive daemon
    * upgrades: clients must check the target session's runtimeCapabilities.permissionGrants before

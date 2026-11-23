@@ -19,6 +19,7 @@ import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRu
 import { MOAI_MANAGED_TOOL } from '@/modules/common/moaiMachineRunProfiles';
 import { WRITE_FILE_ATTEMPT_CAPABILITY } from '@/modules/common/writeFileAttempts';
 import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
+import { FIXED_READ_RPCS_CAPABILITY } from '@/daemon/fixedReadRpcsCapability';
 import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher';
 import { ApiSessionClient } from './apiSession';
 import { McpCallerGrantEnvelopeConsumer } from '@/daemon/mcpCallerGrantEnvelope';
@@ -2162,6 +2163,36 @@ describe('ApiMachineClient socket reconnection', () => {
         client.shutdown();
     });
 
+    // aplus-dev-studio specs/work-machine-migration — Studio reads git status and AI usage with these
+    // fixed reads instead of `bash` only on a daemon that says it serves them.
+    it('serves and advertises the fixed git status and AI usage reads', async () => {
+        vi.useFakeTimers();
+        mockSocket.emitWithAck.mockImplementation(async (event: string, data: any) => {
+            if (event === 'machine-update-metadata') {
+                return { result: 'success', version: 1, metadata: data.metadata };
+            }
+            if (event === 'machine-update-state') {
+                return { result: 'success', version: 1, daemonState: data.daemonState };
+            }
+            return { result: 'success' };
+        });
+        const machine = makeMachine();
+        expect(machine.metadata?.fixedReadRpcs).toBeUndefined();
+        const client = new ApiMachineClient('fake-token', machine);
+        client.setRPCHandlers({
+            spawnSession: vi.fn(), stopSession: vi.fn(), requestShutdown: vi.fn(),
+            portRegistry: {} as any, aiCredentialRuntime: {} as any,
+        });
+        const registered = (client as any).rpcHandlerManager.registerHandler.mock.calls.map(([name]: [string]) => name);
+        expect(registered).toEqual(expect.arrayContaining(['workspace-git-status', 'machine-ai-usage']));
+        client.connect();
+
+        socketHandlers.connect![0]!();
+        await vi.waitFor(() => expect(machine.metadata?.fixedReadRpcs).toEqual(FIXED_READ_RPCS_CAPABILITY));
+
+        client.shutdown();
+    });
+
     // The upgraded daemon is only an availability hint: a surviving session still needs its own marker.
     it('advertises machine availability without upgrading a surviving old session capability', async () => {
         vi.useFakeTimers();
@@ -2448,6 +2479,7 @@ describe('ApiMachineClient socket reconnection', () => {
             aiAuthSelection: AI_AUTH_SELECTION_CAPABILITY,
             writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
             listFilesPage: LIST_FILES_PAGE_CAPABILITY,
+            fixedReadRpcs: FIXED_READ_RPCS_CAPABILITY,
         };
         const client = new ApiMachineClient('fake-token', machine);
         client.setRPCHandlers({
@@ -2464,6 +2496,7 @@ describe('ApiMachineClient socket reconnection', () => {
             // Managed runtimes do not serve `writeFile`, so nothing there answers an attempt.
             expect(machine.metadata?.writeFileAttempt).toBeUndefined();
             expect(machine.metadata?.listFilesPage).toBeUndefined();
+            expect(machine.metadata?.fixedReadRpcs).toBeUndefined();
         });
         client.shutdown();
     });
