@@ -205,7 +205,7 @@ describe('work machine execution authority', () => {
             'container-runtime-status', 'gh-auth-status', 'machine-info',
             // Fixed reads Studio uses instead of `bash` for git status, AI usage and agent CLI status
             // (happy-cli workspaceGitStatus.ts, machineAiUsage.ts, agentCliProbes.ts).
-            'workspace-git-status', 'machine-ai-usage', 'agent-login-status', 'codex-cli-status'];
+            'workspace-git-status', 'workspace-current-pr', 'machine-ai-usage', 'agent-login-status', 'codex-cli-status'];
 
         // Opening a conversation again, an idle stop and workspace reads run no turn.
         for (const method of ['resume-happy-session', 'stop-session', ...workspaceReads]) {

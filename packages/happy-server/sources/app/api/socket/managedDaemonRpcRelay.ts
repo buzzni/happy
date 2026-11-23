@@ -86,8 +86,8 @@ const workMachineRpcTiers = new Map<string, 'read' | 'turn-stop' | 'turn-answer'
     ['workspace-path-stat', 'read'], ['workspace-git-info', 'read'], ['preview-liveness', 'read'],
     ['listening-ports', 'read'], ['container-runtime-status', 'read'], ['gh-auth-status', 'read'], ['machine-info', 'read'],
     // What Studio reads on page open and by timer, with fixed git calls and fixed scripts instead of `bash`:
-    // git status, AI usage, agent CLI login and Codex models.
-    ['workspace-git-status', 'read'], ['machine-ai-usage', 'read'], ['agent-login-status', 'read'], ['codex-cli-status', 'read'],
+    // git status and the branch's pull request, AI usage, agent CLI login and Codex models.
+    ['workspace-git-status', 'read'], ['workspace-current-pr', 'read'], ['machine-ai-usage', 'read'], ['agent-login-status', 'read'], ['codex-cli-status', 'read'],
     // Status the web client polls; a poll after a switch must not close the way back.
     ['daemon-session-state', 'read'], ['mcp-status', 'read'], ['getDirectoryTree', 'read'], ['ripgrep', 'read'],
     ['get-port', 'read'], ['claude-list-rewind-points', 'read'], ['codex-list-rewind-points', 'read'],
