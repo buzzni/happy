@@ -17,8 +17,9 @@ import { ownedSpawnRecordSchema } from './ownedSpawn';
 import { ownershipTrustEnv } from './sessionOwnershipTrust';
 const homes: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
-async function fixture(options: { parent?: string; spawn?: Record<string, unknown> } = {}) {
+async function fixture(options: { parent?: string; spawn?: Record<string, unknown>; startExtra?: Record<string, unknown> } = {}) {
     const home = await mkdtemp(join(tmpdir(), 'owned-runtime-')); homes.push(home);
+    const startExtra = options.startExtra;
     const keys = nacl.sign.keyPair(), now = Date.now();
     const signed = { version: 1, issuer: 'https://studio.test', audience: 'https://happy.test', keyId: await rotationSha256(keys.publicKey), issuedAt: now, expiresAt: now + 60_000 };
     const spawn = options.spawn ?? { directory: '/project', agent: 'codex' };
@@ -54,7 +55,7 @@ async function fixture(options: { parent?: string; spawn?: Record<string, unknow
             expect(JSON.stringify(options)).not.toContain('signature'); expect(JSON.stringify(options)).not.toContain('synthetic-machine-bearer');
             tracked = { pid: 123, happySessionId: 'session', startedBy: 'daemon', directory: '/project' };
             await onStart?.();
-            return { type: 'success', sessionId: 'session' };
+            return { type: 'success', sessionId: 'session', ...startExtra } as never;
         },
         ...extra,
     });
@@ -124,6 +125,19 @@ it('transports the signed snapshot through encrypted machine RPC and answers a m
     expect(fresh.caller.callerBindingId).not.toBe(reply.caller.callerBindingId);
     expect(f.counts()).toEqual({ posts: 1, starts: 1 });
 });
+it('reports the related-project directory result of the start, as the legacy spawn RPC does', async () => {
+    // Desktop refuses a start without it when directories were requested ("Malformed additional directories result").
+    const report = { version: 1, accepted: ['/related/a'], skipped: { missing: 1 } };
+    const f = await fixture({ spawn: { directory: '/project', agent: 'codex', additionalDirectories: ['/related/a', '/related/b'] },
+        startExtra: { additionalDirectories: report } }), runtime = f.build();
+    const p = await runtime.prepare({ intent: f.intent, spawn: f.spawn });
+    await runtime.commit({ creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof(p) });
+    const started = await runtime.start({ creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' });
+    expect(started).toMatchObject({ state: 'started', additionalDirectories: report });
+    // Status after a daemon restart reads the same report from the journal.
+    expect(await f.build().status({ creationRequestId: 'creation' })).toMatchObject({ state: 'started', additionalDirectories: report });
+});
+
 it('answers non-journal sources only from daemon-vouched launch bindings (T1c-b2 H2)', async () => {
     const f = await fixture(), nonce = 'main-verifier-nonce';
     await expect(f.build().callerBinding({ sessionId: 'terminal-source', nonce })).rejects.toThrow('caller-unavailable');
