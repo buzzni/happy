@@ -4,6 +4,9 @@
  * Lightweight CLI bootstrap. Agent commands must be dispatched before loading
  * the Happy runtime because provider modules have import-time side effects.
  */
+// First: on Windows the daemon and sessions have no console, so every console program they start
+// must get a hidden one (docs/windows-child-processes.md).
+import './utils/windowsHiddenConsoleInstall'
 import { captureStandaloneLaunchBootstrap } from './daemon/standaloneLaunchProtocol'
 import { handleAgentCommand } from './commands/agentCommand'
 import { loadBrowserTaskEnv } from './daemon/browserTaskEnv'
