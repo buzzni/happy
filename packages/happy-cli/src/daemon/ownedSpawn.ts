@@ -43,14 +43,15 @@ export interface OwnedSpawnDependencies {
     /** Read-only recovery, including expired proof. Never creates a new tag or re-encrypts. */
     discover(record: OwnedSpawnRecord): Promise<OwnedCreated | null>;
     prepareStart?(record: OwnedSpawnRecord): Promise<void>;
-    start(record: OwnedSpawnRecord): Promise<StartedProvider>;
+    /** reported: the provider's related-project directory result, kept before the binding is proven so a start
+     * confirmed later through status still answers with it. */
+    start(record: OwnedSpawnRecord, reported: (additionalDirectories: unknown) => Promise<void>): Promise<StartedProvider>;
     observeStart(record: OwnedSpawnRecord): Promise<StartedProvider | null>;
     /** null: the child host holds its own key and its binding arrives with the started provider (T1c-b2 H3). */
     caller(record: OwnedSpawnRecord): Promise<z.infer<typeof OwnershipCallerBindingSchema> | null>;
 }
 /** caller: the binding of the started runtime, held by the child host (host custody) or the daemon. */
-type StartedProvider = { providerRuntimeId: string; caller: z.infer<typeof OwnershipCallerBindingSchema>;
-    additionalDirectories?: z.infer<typeof additionalDirectoriesReportSchema> };
+type StartedProvider = { providerRuntimeId: string; caller: z.infer<typeof OwnershipCallerBindingSchema> };
 export class OwnedSpawnRejected extends Error { constructor(readonly reason = 'creation-rejected') { super('owned-spawn-rejected'); } }
 /** Only trusted daemon code that knows dispatch never occurred may throw this. */
 export class OwnedStartRefused extends Error {
@@ -100,7 +101,6 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
         if (!caller.success || caller.data.sessionId !== r.created?.sessionId || caller.data.machineId !== r.intent.machineId
             || caller.data.happyAccountId !== r.intent.sessionAccountId || caller.data.runtimeId !== found.providerRuntimeId) refusal('caller-mismatch');
         r.caller = caller.data; r.providerRuntimeId = found.providerRuntimeId; r.state = 'started';
-        if (found.additionalDirectories) r.additionalDirectories = additionalDirectoriesReportSchema.parse(found.additionalDirectories);
     }
     async function recover(r: OwnedSpawnRecord) {
         if (r.state === 'failed') await deps.failed?.(r);
@@ -211,7 +211,9 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
                 }
                 r.state = 'starting'; await deps.journal.write(r);
                 try {
-                    adopt(r, await deps.start(r));
+                    adopt(r, await deps.start(r, async report => {
+                        r.additionalDirectories = additionalDirectoriesReportSchema.parse(report); await deps.journal.write(r);
+                    }));
                     await deps.journal.write(r);
                 } catch (error) {
                     if (error instanceof OwnedStartRefused) {
