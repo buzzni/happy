@@ -1,9 +1,18 @@
 import { Fastify } from "../types";
+import type { FastifyReply, FastifyRequest } from "fastify";
 import { log, debug } from "@/utils/log";
 import { auth } from "@/app/auth/auth";
+import { db } from "@/storage/db";
+import { authorizeWorkMachineExecution, authorizeWorkMachineSession } from "@/app/machine/workMachineExecution";
 import type { Principal, SessionScopedTokenIssuer } from "@/app/auth/sessionScopedToken";
 import { authorizeManagedSessionRequest } from "@/app/managed/managedSessionAccess";
 import { resolveBrowserSyncRestPrincipal } from "./browserSyncRestAuth";
+
+export async function verifyWorkMachineDaemonBearer(request: FastifyRequest) {
+    const token = request.headers.authorization?.match(/^Bearer (wmx_\S+)$/)?.[1];
+    const grant = token && await auth.workMachineExecutionIssuer?.verify(token, 'daemon', Date.now());
+    return grant && grant.purpose === 'daemon' ? grant : null;
+}
 
 export function enableAuthentication(app: Fastify) {
     app.decorate('authenticate', async function (request: any, reply: any) {
@@ -63,7 +72,10 @@ export function enableAuthentication(app: Fastify) {
 
             debug({ module: 'auth-decorator' }, `Auth success (browser sync) - user: ${browserSync.userId}`);
             request.userId = browserSync.userId;
-            request.principal = { kind: 'browser-sync', accountId: browserSync.userId };
+            request.principal = {
+                kind: 'browser-sync', accountId: browserSync.userId,
+                ...(browserSync.workMachineIngress ? { workMachineIngress: true } : {}),
+            };
         } catch (error) {
             return reply.code(401).send({ error: 'Authentication failed' });
         }
@@ -124,7 +136,10 @@ export function enableSessionScopeAuthentication(
                 now: Date.now(),
             });
             if (browserSync) {
-                principal = { kind: 'browser-sync', accountId: browserSync.userId };
+                principal = {
+                    kind: 'browser-sync', accountId: browserSync.userId,
+                    ...(browserSync.workMachineIngress ? { workMachineIngress: true } : {}),
+                };
             }
         }
         if (!principal) {
@@ -258,4 +273,60 @@ export function requireSessionScopeAuth(app: Fastify): unknown {
         );
     }
     return decorator;
+}
+
+/** Opt in only on routes that support a bound work machine session. */
+export function requireWorkMachineSessionScopeAuth(
+    app: Fastify,
+    requestedSession: (request: FastifyRequest) => string | undefined =
+        request => (request.params as { sessionId: string }).sessionId,
+) {
+    const ordinary = requireSessionScopeAuth(app) as typeof app.authenticate;
+    return async (request: FastifyRequest, reply: FastifyReply) => {
+        const token = request.headers.authorization?.match(/^Bearer (\S+)$/)?.[1];
+        const claim = token && await auth.workMachineExecutionIssuer?.verify(token, 'session', Date.now());
+        if (!claim || claim.purpose !== 'session') return ordinary(request, reply);
+        if (claim.sessionId !== requestedSession(request) || !await authorizeWorkMachineSession(db, claim)) {
+            return reply.code(403).send({ error: 'Work machine session credential required' });
+        }
+        request.userId = claim.accountId;
+        request.workMachineSessionGrant = claim;
+    };
+}
+
+/**
+ * A daemon worker route under `/v1/machines/:machineId`. A work machine daemon
+ * credential must name that machine and stands in for the account; any other
+ * bearer goes through `authenticate` as before. Whether the machine may be
+ * served with that bearer is decided per call by `lockWorkMachineWorker`.
+ */
+export function requireWorkMachineWorkerAuth(app: Fastify) {
+    return async (request: FastifyRequest, reply: FastifyReply) => {
+        const grant = await verifyWorkMachineDaemonBearer(request);
+        if (!grant) return app.authenticate(request, reply);
+        if (grant.machineId !== (request.params as { machineId?: string }).machineId) {
+            return reply.code(403).send({ error: 'MACHINE_DENIED' });
+        }
+        request.userId = grant.accountId;
+        request.workMachineDaemonGrant = grant;
+    };
+}
+
+/**
+ * A read Studio makes on a daemon's behalf with the daemon's own bearer
+ * (session owner, automation run context). A work machine daemon credential
+ * must name the machine the request is about and be its current device and
+ * generation; drain still allows these reads, a frozen machine does not.
+ * Any other bearer goes through `authenticate` as before.
+ */
+export function requireWorkMachineDaemonReadAuth(app: Fastify, requestedMachine: (request: FastifyRequest) => string | undefined) {
+    return async (request: FastifyRequest, reply: FastifyReply) => {
+        const grant = await verifyWorkMachineDaemonBearer(request);
+        if (!grant) return app.authenticate(request, reply);
+        if (grant.machineId !== requestedMachine(request) || !await authorizeWorkMachineExecution(db, grant)) {
+            return reply.code(403).send({ error: 'Work machine device authorization required' });
+        }
+        request.userId = grant.accountId;
+        request.workMachineDaemonGrant = grant;
+    };
 }

@@ -415,7 +415,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
             lastCommittedBatch = batch;
             steeredSinceCommit = false;
             // Claude writes it to its transcript now, however long it waited in the queue.
-            session.onUserInputDelivered?.(batch.message);
+            session.onUserInputDelivered?.(batch.items?.length ? batch.items.map(item => item.message) : [batch.message]);
             messageQueue.enqueue(pendingRequestItem(batch.channelRequestId ?? null, {
                 inputs: batch.inputs ?? [], inputCount: batch.inputCount, continuation,
             }));

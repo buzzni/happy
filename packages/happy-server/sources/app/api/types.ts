@@ -69,6 +69,7 @@ declare module 'fastify' {
          * a managed principal; everywhere else `authenticate` rejects one.
          */
         principal?: Principal;
+        workMachineSessionGrant?: Extract<WorkMachineExecutionClaims, { purpose: 'session' }>;
         /**
          * The grant row this request was authorised by, when a managed bearer
          * made it.
@@ -80,6 +81,7 @@ declare module 'fastify' {
          * owner's envelope may never stand in for.
          */
         managedGrant?: LiveGrant;
+        workMachineDaemonGrant?: Extract<WorkMachineExecutionClaims, { purpose: 'daemon' }>;
         startTime?: number;
         /** onRequest 시점의 "마지막 스크레이프 이후 최대 루프 지연"(ms) — 요청 중 갱신 여부 판정용. */
         loopLagMaxAtStartMs?: number;
@@ -100,3 +102,4 @@ declare module 'fastify' {
         authenticateSessionScope: any;
     }
 }
+import type { WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';

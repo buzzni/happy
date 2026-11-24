@@ -12,7 +12,9 @@ import {
     startAutomationRun,
     syncAutomations,
 } from '@/app/automation/automationExecutionService';
-import { inTx } from '@/storage/inTx';
+import { inTx, type Tx } from '@/storage/inTx';
+import { lockWorkMachineWorker, permitWorkMachineExecution, type WorkMachineDeviceGrant } from '@/app/machine/workMachineExecution';
+import type { WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
 import { warn } from '@/utils/log';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
 import { emitAutomationUpdate, emitProjectAutomationUpdate } from '@/app/automation/automationUpdate';
@@ -96,7 +98,48 @@ async function answer(
     }
 }
 
-export function automationSocketHandler(accountId: string, machineId: string, socket: Socket): void {
+/**
+ * `device` is the daemon credential the machine socket authenticated with, if
+ * any. A machine under work-machine authority runs automation only through
+ * it: every call locks the live generation in its own transaction. Claims are
+ * new work and stop at drain, leaving the slot untouched; a claim that goes
+ * through records the generation's first execution. The rest (sync, key,
+ * start, heartbeat, delivery and the result report of a run already claimed)
+ * continues until the freeze. Without a device credential the machine must
+ * still be outside work-machine authority, as before.
+ */
+export function automationSocketHandler(
+    accountId: string,
+    machineId: string,
+    socket: Socket,
+    device: Extract<WorkMachineExecutionClaims, { purpose: 'daemon' }> | null = null,
+): void {
+    const grant: WorkMachineDeviceGrant | null = device && device.accountId === accountId && device.machineId === machineId ? device : null;
+    function workerTransaction<T extends Parameters<Callback>[0]>(
+        operation: (tx: Tx) => Promise<T>,
+        { newWork = false, startsWork = false } = {},
+    ) {
+        return inTx(async tx => {
+            const allowed = await lockWorkMachineWorker(tx, { accountId, machineId }, device, { newWork: newWork || startsWork });
+            if (!allowed) {
+                return { ok: false as const, error: 'forbidden' };
+            }
+            const result = await operation(tx);
+            // A claim that went through is work this generation runs: it
+            // records the first execution, which closes the way back.
+            if (startsWork && device && result.ok && !await permitWorkMachineExecution(tx, device, new Date())) {
+                throw new Error('work-machine-permit-lost');
+            }
+            return result;
+        });
+    }
+    /** A device attaches a run only to a conversation of its own work machine. */
+    async function ownSession(tx: Tx, sessionId: string | null) {
+        return !grant || sessionId === null || !!await tx.session.findFirst({
+            where: { id: sessionId, accountId, workMachineId: machineId }, select: { id: true },
+        });
+    }
+
     const on = (event: string, handler: (data: any, callback: Callback) => Promise<void>) => (socket as any).on(
         event,
         async (data: any, callback: Callback) => {
@@ -108,7 +151,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         },
     );
 
-    on('automation-key-register', async (data, callback) => answer(callback, () => inTx((tx) => registerAutomationMachineKey(tx, accountId, machineId, {
+    on('automation-key-register', async (data, callback) => answer(callback, () => workerTransaction((tx) => registerAutomationMachineKey(tx, accountId, machineId, {
         expectedKeyVersion: integer(data?.expectedKeyVersion, 0, Number.MAX_SAFE_INTEGER),
         publicKey: bytes(data?.publicKey, 32, 32),
         contextIsolationVersion: data?.contextIsolationVersion === undefined ? 0
@@ -131,7 +174,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
     on('automation-sync', async (data, callback) => answer(callback, () => {
         const afterSeq = BigInt(requiredString(data?.afterSeq));
         if (afterSeq < 0n) throw new Error('invalid-input');
-        return inTx((tx) => syncAutomations(tx, accountId, machineId, {
+        return workerTransaction((tx) => syncAutomations(tx, accountId, machineId, {
             afterSeq,
             limit: integer(data?.limit, 1, 500),
             ...(data?.payloadVersions !== undefined ? { payloadVersions: Array.isArray(data.payloadVersions) && data.payloadVersions.length <= 4 && data.payloadVersions.every((version: unknown) => version === 1 || version === 4 || version === 5 || version === 6) ? data.payloadVersions : (() => { throw new Error('invalid-input'); })() } : {}),
@@ -144,7 +187,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             automationId: requiredString(item?.automationId),
             revision: integer(item?.revision, 1, Number.MAX_SAFE_INTEGER),
         }));
-        return inTx((tx) => ackAutomationSync(tx, accountId, machineId, items));
+        return workerTransaction((tx) => ackAutomationSync(tx, accountId, machineId, items));
     }, async (value) => {
         // specs/automation-request-surge — an acknowledgement that advanced nothing
         // announces nothing, and one that did announces only its own projects.
@@ -154,13 +197,13 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         ));
     }));
 
-    on('automation-claim', async (data, callback) => answer(callback, () => inTx((tx) => claimAutomationRun(tx, accountId, machineId, {
+    on('automation-claim', async (data, callback) => answer(callback, () => workerTransaction((tx) => claimAutomationRun(tx, accountId, machineId, {
         automationId: requiredString(data?.automationId),
         generation: integer(data?.generation, 1, Number.MAX_SAFE_INTEGER),
         scheduledFor: new Date(integer(data?.scheduledFor, 0, Number.MAX_SAFE_INTEGER)),
         // specs/scheduled-missed-run-policy R11 — only an explicit true widens the window; anything else is a plain claim.
         ...(data?.catchUp === true ? { catchUp: true } : {}),
-    })), (value) => {
+    }), { startsWork: true }), (value) => {
         const { projectId } = value as { projectId: string };
         return emitProjectAutomationUpdate(projectId, {
             projectId,
@@ -183,7 +226,8 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         };
         // A storage failure is not a refusal: the daemon keeps its schedule and reports the gap again (R5),
         // where a malformed request (invalid-input above) or a refusal lets it move on without a record.
-        return inTx((tx) => recordMissedAutomationRuns(tx, accountId, machineId, input))
+        // Recording a slot as missed decides its fate, so it waits with the claims.
+        return workerTransaction((tx) => recordMissedAutomationRuns(tx, accountId, machineId, input), { newWork: true })
             .catch((error) => {
                 warn({ err: error }, 'automation socket: missed-run record failed to store');
                 return { ok: false as const, error: 'record-failed' };
@@ -198,7 +242,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
         }, accountId);
     }));
 
-    on('automation-run-start', async (data, callback) => answer(callback, () => inTx((tx) => startAutomationRun(tx, accountId, machineId, {
+    on('automation-run-start', async (data, callback) => answer(callback, () => workerTransaction((tx) => startAutomationRun(tx, accountId, machineId, {
         runId: requiredString(data?.runId), claimToken: requiredString(data?.claimToken),
     })), (value) => {
         const { projectId } = value as { projectId: string };
@@ -212,12 +256,14 @@ export function automationSocketHandler(accountId: string, machineId: string, so
     on('automation-run-heartbeat', async (data, callback) => answer(callback, async () => {
         const parsed = automationRunHeartbeatRequestSchema.safeParse(data);
         if (!parsed.success) return { ok: false, error: 'invalid-heartbeat' };
-        return inTx((tx) => heartbeatAutomationRun(tx, accountId, machineId, parsed.data));
+        return workerTransaction((tx) => heartbeatAutomationRun(tx, accountId, machineId, parsed.data));
     }));
 
     on('automation-conversation-deliver', async (data, callback) => answer(callback, () => {
         const input = automationConversationDeliverRequestSchema.parse(data);
-        return inTx((tx) => deliverAutomationConversationMessage(tx, accountId, machineId, input));
+        return workerTransaction(async (tx) => await ownSession(tx, input.sessionId)
+            ? deliverAutomationConversationMessage(tx, accountId, machineId, input)
+            : { ok: false as const, error: 'target-mismatch' });
     }, async (value) => {
         const { message } = value as { message: { id: string; sessionId: string; seq: number; localId: string | null; content: { c: string }; createdAt: Date; updatedAt: Date } };
         await emitSessionFollowupMessageUpdate({ userId: accountId, ...message, contentCiphertext: message.content.c });
@@ -238,13 +284,16 @@ export function automationSocketHandler(accountId: string, machineId: string, so
             : typeof data?.degradedCode === 'string' && /^[A-Z][A-Z0-9_]{0,63}$/.test(data.degradedCode)
                 ? data.degradedCode
                 : (() => { throw new Error('invalid-input'); })();
-        return inTx((tx) => reportAutomationRun(tx, accountId, machineId, {
+        const sessionId = data?.sessionId === null ? null : requiredString(data?.sessionId);
+        return workerTransaction(async (tx) => !await ownSession(tx, sessionId)
+            ? { ok: false as const, error: 'target-mismatch' }
+            : reportAutomationRun(tx, accountId, machineId, {
             runId: requiredString(data?.runId),
             claimToken: requiredString(data?.claimToken),
             reportId: requiredString(data?.reportId),
             status,
             outcome,
-            sessionId: data?.sessionId === null ? null : requiredString(data?.sessionId),
+            sessionId,
             detailCiphertext: data?.detailCiphertext === null ? null : bytes(data?.detailCiphertext, 128 * 1024),
             failureCode,
             degradedCode,
@@ -279,7 +328,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
 
     on('session-followup-sync', async (data, callback) => answer(callback, () => {
         const input = sessionFollowupSyncRequestSchema.parse(data);
-        return inTx((tx) => syncSessionFollowups(tx, accountId, machineId, {
+        return workerTransaction((tx) => syncSessionFollowups(tx, accountId, machineId, {
             afterSeq: BigInt(input.afterSeq),
             limit: input.limit,
         }));
@@ -287,16 +336,16 @@ export function automationSocketHandler(accountId: string, machineId: string, so
 
     on('session-followup-claim', async (data, callback) => answer(callback, () => {
         const input = sessionFollowupClaimRequestSchema.parse(data);
-        return inTx((tx) => claimSessionFollowup(tx, accountId, machineId, {
+        return workerTransaction((tx) => claimSessionFollowup(tx, accountId, machineId, {
             followupId: input.followupId,
             generation: input.generation,
             step: input.step,
-        }));
+        }), { startsWork: true });
     }));
 
     on('session-followup-evaluate', async (data, callback) => answer(callback, () => {
         const input = sessionFollowupEvaluationRequestSchema.parse(data);
-        return inTx((tx) => reportSessionFollowupEvaluation(tx, accountId, machineId, {
+        return workerTransaction((tx) => reportSessionFollowupEvaluation(tx, accountId, machineId, {
             followupId: input.followupId,
             generation: input.generation,
             step: input.step,
@@ -318,7 +367,7 @@ export function automationSocketHandler(accountId: string, machineId: string, so
 
     on('session-followup-deliver', async (data, callback) => answer(callback, () => {
         const input = sessionFollowupDeliverRequestSchema.parse(data);
-        return inTx((tx) => deliverSessionFollowupMessage(tx, accountId, machineId, {
+        return workerTransaction((tx) => deliverSessionFollowupMessage(tx, accountId, machineId, {
             followupId: input.followupId,
             generation: input.generation,
             step: input.step,

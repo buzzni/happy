@@ -13,6 +13,7 @@
 import { logger } from '@/ui/logger'
 import { OrgRequirementsStatusSchema, ORG_REQUIREMENTS_VERSION_HEADER, type McpRuntimeServerStatus } from '@slopus/happy-wire'
 import type { OrgRequirementsFetchOutcome } from '@/orgRequirements/snapshot'
+import { workMachineMcpHeaders, type WorkMachineMcpProof } from './workMachineMcpProof'
 
 type McpHttpServerEntry = {
     type: 'http'
@@ -108,6 +109,7 @@ export type McpFetchContext = {
     configUrl?: string
     projectId?: string
     callerGrant?: string
+    workMachineExecution?: WorkMachineMcpProof
     expectedConnectors?: string[]
     /**
      * Organization requirements ride on this same response (aplus-dev-studio-desktop
@@ -255,19 +257,24 @@ async function fetchConfigSnapshot(
         ?? (process.env.HAPPY_APLUS_MCP_INITIAL_LIFECYCLE === 'spawn' ? 'spawn' : undefined)
 
     for (let attempt = 0; attempt < 2; attempt++) {
+        const proof = context.workMachineExecution
+            && workMachineMcpHeaders(configUrl, context.workMachineExecution, context.sessionId)
+        if (proof === null) return snapshot({ ok: false, reason: 'http-error', error: 'Work machine execution proof is unavailable for this MCP configuration URL' })
         const ctl = new AbortController()
         const timer = setTimeout(() => ctl.abort(), TIMEOUT_MS)
         try {
             const res = await fetch(configUrl, {
                 method: 'GET',
+                ...(proof ? { redirect: 'error' } : {}),
                 headers: {
-                    'Authorization': `Bearer ${token}`,
+                    'Authorization': `Bearer ${proof?.['X-Aplus-Work-Machine-Execution'] ?? token}`,
                     'X-Aplus-Machine-Id': machineId,
                     ...(callerGrant ? { 'X-Aplus-Caller-Grant': callerGrant } : {}),
                     ...(expected.length > 0 ? { 'X-Aplus-Expected-Connectors': expected.join(',') } : {}),
                     ...(sessionId ? { 'X-Aplus-Session-Id': sessionId } : {}),
                     ...(lifecycle ? { 'X-Aplus-Mcp-Lifecycle': lifecycle } : {}),
                     ...(context.onRequirements ? { [ORG_REQUIREMENTS_VERSION_HEADER]: '1' } : {}),
+                    ...proof,
                 },
                 signal: ctl.signal,
             })

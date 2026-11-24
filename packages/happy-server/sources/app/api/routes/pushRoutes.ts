@@ -6,6 +6,8 @@ import { countPushOutcome, dispatchSessionEventPush, type PushOutcome } from "@/
 import { buildSessionEventEphemeral, eventRouter } from "@/app/events/eventRouter";
 import { persistTurnReadySessionEvent } from "@/app/events/persistSessionEvent";
 import { log } from "@/utils/log";
+import { requireWorkMachineSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
+import { workMachineWriteGuard } from "@/app/machine/workMachineExecution";
 
 const pushOutcomeSchema = z.object({
     status: z.enum(['sent', 'partial', 'suppressed', 'no_tokens', 'failed']),
@@ -99,6 +101,8 @@ export function pushRoutes(app: Fastify) {
     // Session-Event Push API
     // CLI/daemon clients call this instead of talking to Expo directly so the
     // server can apply presence-based suppression (active desktop/web/mobile).
+    // A protected conversation pushes only with its own session credential of
+    // the live generation; the account bearer is refused there.
     app.post('/v1/sessions/:sessionId/push-event', {
         schema: {
             params: z.object({
@@ -115,12 +119,15 @@ export function pushRoutes(app: Fastify) {
                     success: z.literal(true),
                     push: pushOutcomeSchema
                 }),
+                403: z.object({
+                    error: z.literal('Work machine session credential required')
+                }),
                 404: z.object({
                     error: z.literal('Session not found')
                 })
             }
         },
-        preHandler: app.authenticate
+        preHandler: requireWorkMachineSessionScopeAuth(app)
     }, async (request, reply) => {
         const userId = request.userId;
         const { sessionId } = request.params;
@@ -128,10 +135,14 @@ export function pushRoutes(app: Fastify) {
 
         const session = await db.session.findFirst({
             where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId },
-            select: { id: true, piiProtection: true }
+            select: { id: true, piiProtection: true, workMachineId: true }
         });
         if (!session) {
             return reply.code(404).send({ error: 'Session not found' });
+        }
+        const claim = request.workMachineSessionGrant;
+        if (session.workMachineId && !claim) {
+            return reply.code(403).send({ error: 'Work machine session credential required' });
         }
 
         if (kind === 'done') {
@@ -151,7 +162,7 @@ export function pushRoutes(app: Fastify) {
             }
             // 기록 실패가 기존 알림 경로를 막지 않게 한다 — web-ui 완료 알림만 늦어진다.
             try {
-                await persistTurnReadySessionEvent(sessionId);
+                await persistTurnReadySessionEvent(sessionId, claim && workMachineWriteGuard(claim));
             } catch (error) {
                 log({ module: 'push', level: 'warn' }, `turn-ready event not recorded for session ${sessionId}: ${error}`);
             }

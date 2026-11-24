@@ -10,6 +10,7 @@ import { inTx, afterTx } from '@/storage/inTx';
 import { eventRouter, buildNewSessionUpdate } from '@/app/events/eventRouter';
 import { randomKeyNaked } from '@/utils/randomKeyNaked';
 import { createExecutionBoundSession, verifySessionExecutionCreate } from '@/app/session/sessionExecutionBinding';
+import { lockLegacyWorkMachineExecution } from '@/app/machine/workMachineExecution';
 
 export class OwnershipError extends Error {
     constructor(readonly statusCode: 400 | 403 | 409 | 503, message: string) { super(message); }
@@ -42,6 +43,7 @@ export function verifyOwnershipAssertion<T extends { type: string; issuer: strin
 async function bind(tx: Prisma.TransactionClient, sessionId: string, created: boolean,
     proof: SessionOwnershipProof, proofDigest: string) {
     if (!ownershipFresh(proof)) refuse();
+    if (!await lockLegacyWorkMachineExecution(tx, proof.machineAccountId, proof.machineId)) refuse();
     const machine = await tx.machine.findUnique({ where: { id: proof.machineId } });
     if (!machine || machine.accountId !== proof.machineAccountId) refuse();
     if (proof.parentHubSessionId) {

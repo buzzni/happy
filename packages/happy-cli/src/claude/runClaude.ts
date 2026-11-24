@@ -18,6 +18,8 @@ import { readSetupTokenCapacityActor } from './setupTokenUserCapacity';
 import { describeClaudeLaunchFailure } from './utils/launchFailureMessage';
 
 import { ApiClient } from '@/api/api';
+import { openWorkMachineSessionCredentials } from '@/daemon/workMachineCredential';
+import { startsNewWorkMachineConversation } from '@/daemon/workMachineNewSession';
 import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidenceOption } from '@/utils/inputEvidenceSettings';
 import { logger } from '@/ui/logger';
 import { loop } from '@/claude/loop';
@@ -86,6 +88,7 @@ import { mergeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { encodeBase64 } from '@/api/encryption';
 import type { Session as ApiSession, UserMessage } from '@/api/types';
 import { getProjectPath } from './utils/path';
+import { claudeCheckSession } from './utils/claudeCheckSession';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
@@ -339,7 +342,12 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // A managed client cannot create a session, register a machine, or reach
     // the account push endpoints — the refusals live in the client itself
     // rather than in every caller.
-    const api = principal.kind === 'managed'
+    const reconnectSession = consumeReconnectSessionEnvironment(process.env);
+    const reconnectSessionId = reconnectSession?.id;
+    const workMachine = principal.kind === 'account' && await openWorkMachineSessionCredentials(
+        configuration.happyHomeDir, configuration.serverUrl, reconnectSessionId,
+    );
+    const api = workMachine ? ApiClient.workMachineSession(workMachine) : principal.kind === 'managed'
         ? ApiClient.managed(principal.startup.attachment)
         : await ApiClient.create(principal.credentials);
 
@@ -384,7 +392,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
 
     // Create machine if it doesn't exist. A managed child has no machine of
     // its own: the runtime it runs inside is the registered thing.
-    if (!managedStartup) {
+    if (!managedStartup && !workMachine) {
         await api.getOrCreateMachine({
             machineId: requireAccountMachineId(machineId),
             metadata: initialMachineMetadata
@@ -422,8 +430,6 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // Resume-in-place must use the latest server document as its metadata
     // base. A fresh local document paired with the latest server version can
     // otherwise pass CAS while deleting the existing summary/title.
-    const reconnectSession = consumeReconnectSessionEnvironment(process.env);
-    const reconnectSessionId = reconnectSession?.id;
     for (const id of [process.env.HAPPY_FORK_CLAUDE_SESSION_ID, reconnectSession?.metadata?.claudeSessionId]) {
         if (!id) continue;
         const marker = readPlanMarker(id);
@@ -437,14 +443,26 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     const metadata = inputEvidenceMetadata(mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata), inputEvidenceEnabled);
     const allowAutomationReconnectPrompt = process.env.HAPPY_AUTOMATION_RESUME_PROMPT === '1';
     delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
+    const freshLaunch = consumeReconnectFreshLaunch(process.env);
     const preparedInitialPrompt = prepareClaudeInitialPrompt({
         env: process.env,
         reconnectSessionId,
         automationRunOnceRequested,
         allowAutomationReconnectPrompt,
-        freshLaunch: consumeReconnectFreshLaunch(process.env),
+        freshLaunch,
     });
     const exitAfterFirstTurn = preparedInitialPrompt.exitAfterFirstTurn;
+
+    if (workMachine) {
+        const nativeId = reconnectSession?.metadata?.claudeSessionId;
+        // A conversation the daemon just created has no transcript yet; every other one resumes its own.
+        if (!startsNewWorkMachineConversation(freshLaunch, nativeId) && (!nativeId || !/^[a-f0-9-]{36}$/i.test(nativeId)
+            || !claudeCheckSession(nativeId, workingDirectory, options.claudeEnvVars?.CLAUDE_CONFIG_DIR))) {
+            throw new Error('WORK_MACHINE_CLAUDE_TRANSCRIPT_UNAVAILABLE');
+        }
+        // Without a prompt to run now, the first turn asks for its own permit (ApiSessionClient).
+        await api.permitWorkMachineSessionExecution(preparedInitialPrompt.prompt === null ? { start: true } : {});
+    }
 
     let response: ApiSession | null;
     if (managedStartup) {
@@ -585,7 +603,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     }
     const checkpointEvents = sandboxConfig?.checkpointProtection
         ? createCheckpointEventPublisher({
-            token: requireAccountToken(accountToken),
+            // A protected conversation posts with its own session credential; the server refuses the account token there.
+            token: api.workMachineMcpProof()?.token ?? requireAccountToken(accountToken),
             sessionId: response.id,
             encryption: {
                 encryptionKey: response.encryptionKey,
@@ -1813,7 +1832,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             workspaceTitleObserved = true;
             void runtimeGate.admit(() => offTurnTitle.settled(), 'writer').catch(() => logger.warn('[workspace-context] Title writer unconfirmed'));
         }
-        if (!coveredTitle) {
+        // An app session (aplus agent-app-api T5) has no chat to title: the nudge would reach the end user's answer.
+        if (!coveredTitle && !appProfile) {
             const withTitle = appendTitleInstruction(pushText);
             if (withTitle !== pushText) {
                 pushText = withTitle;
@@ -1936,7 +1956,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             : {}),
         sink: {
             sessionId: session.sessionId,
-            hasTitle: () => session.hasTitle(),
+            // An app session has no chat to title, so its first prompt gets no title nudge either (aplus agent-app-api T5).
+            hasTitle: () => appProfile !== undefined || session.hasTitle(),
             sendClaudeSessionMessage: (record, localId) => session.sendClaudeSessionMessage(record, localId),
             recordAppPrompt,
             pushPrompt: (text) => {
@@ -2122,10 +2143,11 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
     // 'happy' MCP 옆에 머지한다. 실패는 silent (graceful degrade).
     // Account-only: the aplus MCP config belongs to a user, and a managed run
     // has none. Skipped rather than attempted with a scoped bearer.
+    const workMachineExecution = workMachine ? api.workMachineMcpProof() : undefined;
     const initialAplusMcpSnapshot = accountToken === null ? null : await fetchAplusMcpConfigSnapshot(
         accountToken,
         requireAccountMachineId(machineId),
-        { sessionId: session.sessionId, ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) },
+        { sessionId: session.sessionId, workMachineExecution, ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) },
     );
     /*
      * R10.1: before the first turn, with what the same answer said. The session's first mode is clipped
@@ -2202,6 +2224,7 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
         ? () => {}
         : startMcpCallerGrantRefreshTimer(() => refreshMcpCallerGrantIfExpiring(accountToken, grantMachineId, {
             sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined,
+            workMachineExecution,
         }));
     // 체인 상한(7일) 등으로 더는 교환할 수 없게 되면 한 번 알린다. 대화를 다시 시작하면 새 grant 를 받는다.
     const stopCallerGrantExpiryNotice = onMcpCallerGrantExpired(() => {
@@ -2315,10 +2338,24 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             recordAppPrompt(text);
             session.sendSessionProtocolMessage(createEnvelope('user', { t: 'text', text }));
         },
-        onUserInputDelivered: (text) => {
-            const at = queuedAppPrompts.indexOf(text);
-            if (at < 0) return;
-            queuedAppPrompts.splice(at, 1);
+        onUserInputDelivered: (texts) => {
+            // Only a batch of the app's own prompts: a continuation the launcher queued reaches the transcript itself.
+            const remaining = [...queuedAppPrompts];
+            for (const part of texts) {
+                const at = remaining.indexOf(part);
+                if (at < 0) return;
+                remaining.splice(at, 1);
+            }
+            queuedAppPrompts.splice(0, queuedAppPrompts.length, ...remaining);
+            // Inputs queued together run as one turn, and Claude writes them joined as MessageQueue2 joins them.
+            // That copy matches no part's arrival record, so the parts' records give way to one for the whole.
+            const text = texts.join('\n');
+            if (texts.length > 1) {
+                for (const part of texts) {
+                    const record = recentAppPrompts.findIndex(entry => entry.text === part);
+                    if (record >= 0) recentAppPrompts.splice(record, 1);
+                }
+            }
             // The arrival record answers while it is in its window; only a lapsed or dropped one is made again.
             const lapsed = recentAppPrompts.findIndex(entry => entry.text === text && entry.addedAt < Date.now() - recentAppPromptsMaxAgeMs);
             if (lapsed >= 0) recentAppPrompts.splice(lapsed, 1);
@@ -2335,9 +2372,9 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
                 // 세션이 403 으로 마지막 정상 설정에 갇히는 것을 막는다.
                 const token = requireAccountToken(accountToken);
                 const account = requireAccountMachineId(machineId);
-                const refresh = () => refreshMcpCallerGrantIfExpiring(token, account, { sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined });
+                const refresh = () => refreshMcpCallerGrantIfExpiring(token, account, { sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined, workMachineExecution });
                 await (measure ? measure('mcp-grant', refresh) : refresh());
-                const fetchConfig = () => fetchAplusMcpServersResult(token, account, { sessionId: session.sessionId, lifecycle: 'turn', ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) });
+                const fetchConfig = () => fetchAplusMcpServersResult(token, account, { sessionId: session.sessionId, lifecycle: 'turn', workMachineExecution, ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) });
                 const fetched = await (measure ? measure('mcp-fetch', fetchConfig) : fetchConfig());
                 return fetched.ok ? { ...fetched, servers: shadowSafe(fetched.servers) } : fetched;
             },

@@ -6,7 +6,8 @@ import { allocateSessionSeqBatch, allocateUserSeqBatch } from "@/storage/seq";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
 import { z } from "zod";
 import { type Fastify } from "../types";
-import { requireSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
+import { requireWorkMachineSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
+import { lockWorkMachineExecution } from "@/app/machine/workMachineExecution";
 
 // Pagination contract:
 //   - after_seq=N  → forward sync: messages with seq > N, ordered ASC.
@@ -70,8 +71,9 @@ export function v3SessionRoutes(app: Fastify) {
     // Reachable by a managed child for its own session. The ownership query
     // below is unchanged and still applies; the decorator adds the grant.
     app.get('/v3/session-observation', { preHandler: app.authenticate }, async (_request, reply) => reply.send(observationCapability()));
+    const authenticateMessage = requireWorkMachineSessionScopeAuth(app);
     app.get('/v3/sessions/:sessionId/messages', {
-        preHandler: requireSessionScopeAuth(app) as never,
+        preHandler: authenticateMessage,
         schema: {
             params: z.object({
                 sessionId: z.string()
@@ -135,7 +137,7 @@ export function v3SessionRoutes(app: Fastify) {
     });
 
     app.post('/v3/sessions/:sessionId/messages', {
-        preHandler: requireSessionScopeAuth(app) as never,
+        preHandler: authenticateMessage,
         schema: {
             params: z.object({
                 sessionId: z.string()
@@ -172,8 +174,20 @@ export function v3SessionRoutes(app: Fastify) {
         const txResult = await db.$transaction(async (tx) => {
             // Serialize before reading localIds: a concurrent retry must see the
             // first writer's committed rows before allocating its own sequence.
-            const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "Session" WHERE "id" = ${sessionId} AND "accountId" = ${userId} FOR UPDATE`;
-            if (!locked.length) return null;
+            const [locked] = await tx.$queryRaw<{ id: string; workMachineId: string | null }[]>`
+                SELECT "id", "workMachineId" FROM "Session"
+                WHERE "id" = ${sessionId} AND "accountId" = ${userId} FOR UPDATE
+            `;
+            if (!locked) return null;
+            const claim = request.workMachineSessionGrant;
+            const browser = request.principal?.kind === 'browser-sync' && request.principal.workMachineIngress === true;
+            if (claim) {
+                if (locked.workMachineId !== claim.machineId || claim.expiresAt <= Date.now() || !await lockWorkMachineExecution(tx, claim)) {
+                    return { forbidden: true } as const;
+                }
+            } else if (locked.workMachineId && !browser) {
+                return { forbidden: true } as const;
+            }
             const localIds = uniqueMessages.map((message) => message.localId);
             const existing = await tx.sessionMessage.findMany({
                 where: {
@@ -236,6 +250,7 @@ export function v3SessionRoutes(app: Fastify) {
         });
 
         if (!txResult) return reply.code(404).send({ error: 'Session not found' });
+        if ('forbidden' in txResult) return reply.code(403).send({ error: 'Work machine session credential required' });
 
         // Announce outside the transaction, and take the whole block of update
         // seqs in one `Account.seq` increment: every writer for this account

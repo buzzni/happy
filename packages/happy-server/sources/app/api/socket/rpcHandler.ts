@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { dispatchManagedRpc, managedRpcServer } from '@/app/api/socket/managed/managedDelivery';
 import { isManagedSessionId, splitRpcMethod } from '@/app/api/socket/managed/managedRpcTarget';
 import { dispatchDaemonRpc } from '@/app/api/socket/managedDaemonRpcRelay';
-import { newestMachineSocket } from '@/app/events/findMachineSockets';
+import { newestMachineSocket, workMachineSocketCandidates } from '@/app/events/findMachineSockets';
 
 // RPC routing uses Socket.IO rooms. A daemon registering method M for user U
 // joins room `rpc:U:M`. Callers look the daemon up cross-replica via
@@ -258,7 +258,7 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
             const parsed = splitRpcMethod(method);
             const session = parsed ? await db.session.findFirst({
                 where: { id: parsed.sessionId, accountId: userId },
-                select: { piiProtection: true },
+                select: { piiProtection: true, workMachineId: true },
             }) : null;
             const protectedSession = session?.piiProtection === true;
             if (protectedSession && socket.data?.piiProtectionVersion !== 1) {
@@ -316,6 +316,12 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
                 targets = waited.sockets;
                 anyLookupOk = anyLookupOk || waited.ok;
             }
+            if (parsed && targets.length > 0) {
+                targets = await workMachineSocketCandidates(
+                    db, userId, session?.workMachineId ?? parsed.sessionId, targets, Date.now(),
+                    session?.workMachineId ? parsed.sessionId : undefined,
+                );
+            }
 
             if (targets.length === 0) {
                 // 조회가 한 번도 성공하지 못했으면 daemon 이 없는지 **모른다**.
@@ -371,7 +377,7 @@ export function rpcHandler(userId: string, socket: Socket, io: Server) {
              * the replica that actually emits, immediately before it does, with
              * the socket id fixed and no re-selection anywhere.
              */
-            if (target.data?.managedDaemon) {
+            if (target.data?.managedDaemon || target.data?.workMachineExecution) {
                 const outcome = await dispatchDaemonRpc({
                     io,
                     request: {

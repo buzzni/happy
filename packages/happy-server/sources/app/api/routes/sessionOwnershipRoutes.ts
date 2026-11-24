@@ -3,7 +3,8 @@ import { Readable } from 'node:stream';
 import { parseCanonicalOrgSetupTokenJson, SessionOwnershipRelationRequestSchema, type SessionOwnershipRelationResponse } from '@slopus/happy-wire';
 import type { Fastify } from '@/app/api/types';
 import { db } from '@/storage/db';
-import { requireAccountPrincipal } from '@/app/api/utils/enableAuthentication';
+import { requireAccountPrincipal, verifyWorkMachineDaemonBearer } from '@/app/api/utils/enableAuthentication';
+import { authorizeWorkMachineExecution } from '@/app/machine/workMachineExecution';
 import { confirmOwnership, lookupOwnership, inspectOwnershipMachine, ownershipEnabled, OwnershipError } from '@/app/session/sessionOwnershipBinding';
 import { agentOwnershipRelationEnabled, createAgentOwnershipEligibility } from '@/app/session/agentOwnershipEligibility';
 import { createRateLimiter } from '@/app/auth/selfHostAuthPolicy';
@@ -45,13 +46,31 @@ export function sessionOwnershipRoutes(app: Fastify) {
     }
     // A machine's private runtime-home credential must agree with Happy's own row.
     app.post('/v1/session-ownership/machine-identity', {
-        preHandler: app.authenticate, schema: { body: z.object({ machineId: z.string().min(1).max(128) }).strict() },
+        preHandler: async (request, reply) => {
+            const grant = await verifyWorkMachineDaemonBearer(request);
+            if (!grant) return app.authenticate(request, reply);
+            const { machineId } = request.body as { machineId: string };
+            if (grant.machineId !== machineId || !await authorizeWorkMachineExecution(db, grant)) {
+                return reply.code(403).send({ error: 'Work machine device authorization required' });
+            }
+            request.userId = grant.accountId;
+            request.workMachineDaemonGrant = grant;
+        },
+        schema: { body: z.object({ machineId: z.string().min(1).max(128) }).strict() },
     }, async (request, reply) => {
-        if (request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
+        const grant = request.workMachineDaemonGrant;
+        if (!grant && request.principal?.kind !== 'account') return requireAccountPrincipal(request, reply);
         if (!ownershipEnabled()) return reply.code(503).send({ error: 'Ownership unavailable' });
-        const machine = await db.machine.findUnique({ where: { id: request.body.machineId } });
-        return reply.send({ machine: machine?.accountId === request.userId
-            ? { machineId: machine.id, accountId: machine.accountId } : null });
+        const machine = await db.machine.findFirst({
+            where: { id: request.body.machineId, accountId: request.userId },
+            include: { workMachineExecution: { select: { deviceId: true, generation: true, frozenAt: true } } },
+        });
+        const authority = machine?.workMachineExecution;
+        if ((authority || grant) && (!authority || !grant || authority.frozenAt
+            || grant.expiresAt <= Date.now() || grant.deviceId !== authority.deviceId || grant.generation !== authority.generation)) {
+            return reply.code(403).send({ error: 'Work machine device authorization required' });
+        }
+        return reply.header('Cache-Control', 'no-store').send({ machine: machine ? { machineId: machine.id, accountId: machine.accountId } : null });
     });
     // The agent broker's personal same-account check (Desktop reason-network identity-adapter-plan H-S).
     // Only Happy's own row decides; list visibility is not ownership. Another account's session and a

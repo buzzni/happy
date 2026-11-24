@@ -52,6 +52,7 @@ const {
         const where = args?.where ?? {};
         if (where.id !== undefined && machine.id !== where.id) return null;
         if (where.accountId !== undefined && machine.accountId !== where.accountId) return null;
+        if (where.workMachineExecution?.is === null && machine.workMachineExecution) return null;
         return machine;
     });
     const machineCreate = vi.fn(async (args: any) => {
@@ -91,6 +92,7 @@ const {
         if (!machine || machine.id !== args.where.id || machine.accountId !== args.where.accountId || !matchesExpected) {
             return { count: 0 };
         }
+        if (args.where.workMachineExecution?.is === null && machine.workMachineExecution) return { count: 0 };
         // Version guards (key rotation): every other scalar in where must match.
         for (const field of ['metadataVersion', 'daemonStateVersion'] as const) {
             if (args.where[field] !== undefined && machine[field] !== args.where[field]) return { count: 0 };
@@ -305,7 +307,7 @@ describe("machinesRoutes — POST /v1/machines dataEncryptionKey write-once back
         expect(res.statusCode).toBe(200);
         expect(machineUpdate).toHaveBeenCalledTimes(1);
         const updateArg = machineUpdate.mock.calls[0][0];
-        expect(updateArg.where).toEqual({ id: "machine-1" });
+        expect(updateArg.where).toEqual({ id: "machine-1", workMachineExecution: { is: null } });
         expect(Buffer.from(updateArg.data.dataEncryptionKey).toString("base64")).toBe(wrapped);
         expect(res.json().machine.dataEncryptionKey).toBe(wrapped);
     });
@@ -332,6 +334,39 @@ describe("machinesRoutes — POST /v1/machines dataEncryptionKey write-once back
         expect(machineUpdate).not.toHaveBeenCalled();
         expect(res.json().machine.dataEncryptionKey).toBeNull();
     });
+});
+
+it.each([
+    ['POST', '/v1/machines', () => ({ id: 'machine-1', metadata: 'encrypted', dataEncryptionKey: envelope(1) })],
+    ['PATCH', '/v1/machines/machine-1/data-encryption-key', () => ({
+        expectedDataEncryptionKey: envelope(1), replacementDataEncryptionKey: envelope(2),
+    })],
+    ['PUT', '/v1/machines/machine-1/data-key-attestation', () => ({
+        expectedDataEncryptionKey: envelope(1), attestation: null,
+    })],
+    ['DELETE', '/v1/machines/machine-1', undefined],
+] as const)('cannot access the legacy machine mutation %s %s after enrollment', async (method, url, payload) => {
+    const app = await createApp();
+    resetState();
+    machineUpdate.mockClear();
+    machineUpdateMany.mockClear();
+    machineDeleteSpy.mockClear();
+    state.existingMachine = {
+        id: 'machine-1',
+        accountId: 'user-1',
+        dataEncryptionKey: new Uint8Array(Buffer.from(envelope(1), 'base64')),
+        workMachineExecution: { generation: 2, deviceId: 'replacement-device' },
+    };
+    try {
+        const result = await app.inject({ method, url, headers: { 'x-user-id': 'user-1' }, payload: payload?.() });
+        expect(result.statusCode).toBe(409);
+        expect(result.json()).toEqual({ error: 'work-machine-device-required' });
+        expect(machineUpdate).not.toHaveBeenCalled();
+        expect(machineDeleteSpy).not.toHaveBeenCalled();
+        expect(state.existingMachine.dataEncryptionKey).toEqual(new Uint8Array(Buffer.from(envelope(1), 'base64')));
+    } finally {
+        await app.close();
+    }
 });
 
 describe("machinesRoutes — PATCH /v1/machines/:id/data-encryption-key CAS", () => {
@@ -935,6 +970,18 @@ describe("machinesRoutes — POST /v1/machines/:id/key-rotation (e2ee-machine-co
             daemonState: "new-state",
             ...payload,
         },
+    });
+
+    it("does not let the old account credential rotate a machine enrolled for replacement", async () => {
+        app = await createApp();
+        state.existingMachine = { ...escrowed(), workMachineExecution: { generation: 2, deviceId: "replacement" } };
+
+        const res = await rotate({});
+
+        expect(res.statusCode).toBe(409);
+        expect(res.json()).toEqual({ error: "work-machine-device-required" });
+        expect(machineUpdateMany).not.toHaveBeenCalled();
+        expect(Buffer.from(state.existingMachine.dataEncryptionKey).toString("base64")).toBe(envelope(10));
     });
 
     it("swaps both envelopes, clears the escrowed machine key and stores the re-encrypted state", async () => {

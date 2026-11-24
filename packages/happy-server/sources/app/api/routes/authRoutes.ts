@@ -1,9 +1,11 @@
 import { z } from "zod";
+import { createHash } from "node:crypto";
 import { type Fastify } from "../types";
 import * as privacyKit from "privacy-kit";
 import { db } from "@/storage/db";
 import { auth } from "@/app/auth/auth";
 import { requireAccountPrincipal } from "@/app/api/utils/enableAuthentication";
+import type { ControlAssertionVerifier } from "@/app/managed/managedControlAssertion";
 import { log } from "@/utils/log";
 import {
     AUTH_FIELD_MAX_LENGTH,
@@ -39,7 +41,11 @@ function decodeAuthField(value: string): ReturnType<typeof privacyKit.decodeBase
 const SIGN_PUBLIC_KEY_BYTES = 32;
 const SIGNATURE_BYTES = 64;
 
-export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy; now?: () => number } = {}) {
+export function authRoutes(app: Fastify, options: {
+    policy?: SelfHostAuthPolicy;
+    now?: () => number;
+    workMachineIngressVerifier?: ControlAssertionVerifier;
+} = {}) {
     // Read once at registration so a broken self-host config fails startup instead of serving open sign-up.
     const policy = options.policy ?? readSelfHostAuthPolicy(process.env);
     const now = options.now ?? Date.now;
@@ -439,9 +445,9 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
      * that bearer. What it gets back names the account and expires on its own,
      * so a browser that stops being reissued falls off the socket.
      *
-     * The bearer is the only proof required. A caller holding it can already do
-     * everything this credential allows and more, so a second proof here would
-     * protect nothing and would give the web app one more key to rotate.
+     * The account bearer can mint ordinary browser sync. Work machine ingress
+     * also requires a control assertion from a separately authenticated Studio
+     * browser session, so an older daemon's account bearer cannot mint it.
      *
      * It must be the *account* bearer, and that is enforced rather than merely
      * described: this credential now authenticates REST, so without the guard a
@@ -456,14 +462,32 @@ export function authRoutes(app: Fastify, options: { policy?: SelfHostAuthPolicy;
                     token: z.string(),
                     expiresAt: z.number(),
                 }),
+                403: z.union([
+                    z.object({ error: z.literal('Forbidden'), reason: z.literal('account-bearer-required') }),
+                    z.object({ error: z.literal('Invalid work machine ingress assertion') }),
+                ]),
                 503: z.object({
                     error: z.literal('Browser sync credential unavailable'),
                 }),
             },
         },
     }, async (request, reply) => {
-        const now = Date.now();
-        const minted = await auth.createBrowserSyncToken(request.userId, now);
+        const issuedAt = now();
+        const assertion = request.headers['x-happy-control-assertion'];
+        let workMachineIngress = false;
+        if (assertion !== undefined) {
+            const bearer = request.headers.authorization?.slice(7);
+            if (typeof assertion !== 'string' || !bearer || !options.workMachineIngressVerifier?.verify({
+                assertion,
+                operation: 'work-machine-browser-sync',
+                body: { accountTokenDigest: createHash('sha256').update(bearer).digest('hex') },
+                now: issuedAt,
+            }).ok) {
+                return reply.code(403).send({ error: 'Invalid work machine ingress assertion' });
+            }
+            workMachineIngress = true;
+        }
+        const minted = await auth.createBrowserSyncToken(request.userId, issuedAt, undefined, workMachineIngress);
         if (!minted) {
             // The issuer refused. Reporting success with no usable credential
             // would surface later as a socket that cannot connect, for reasons

@@ -1,7 +1,7 @@
 type MachineLookup = {
     machine: {
         findFirst(args: {
-            where: { accountId: string; id: string };
+            where: { accountId: string; id: string; workMachineExecution: { is: null } };
             select: { id: true };
         }): Promise<{ id: string } | null>;
     };
@@ -13,8 +13,175 @@ export async function machineSocketIdentityExists(
     machineId: string,
 ): Promise<boolean> {
     const machine = await db.machine.findFirst({
-        where: { accountId, id: machineId },
+        where: { accountId, id: machineId, workMachineExecution: { is: null } },
         select: { id: true },
     });
     return machine !== null;
+}
+import type { Prisma } from '@prisma/client';
+import type { createWorkMachineExecutionTokenIssuer, WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
+import { authorizeWorkMachineExecution, authorizeWorkMachineSession } from '@/app/machine/workMachineExecution';
+
+
+type WorkMachineLookup = Pick<Prisma.TransactionClient, 'workMachineExecution' | 'session' | '$queryRaw'>;
+type DaemonClaims = Extract<WorkMachineExecutionClaims, { purpose: 'daemon' }>;
+type SessionClaims = Extract<WorkMachineExecutionClaims, { purpose: 'session' }>;
+type WorkMachineTokens = Awaited<ReturnType<typeof createWorkMachineExecutionTokenIssuer>>;
+
+export async function authenticateWorkMachineSocket(
+    db: WorkMachineLookup,
+    issuer: WorkMachineTokens | null,
+    token: string,
+    machineId: string,
+    now: number,
+): Promise<DaemonClaims | null> {
+    const claims = await issuer?.verify(token, 'daemon', now);
+    if (!claims || claims.purpose !== 'daemon' || claims.machineId !== machineId) return null;
+    return await authorizeWorkMachineExecution(db, claims) ? claims : null;
+}
+
+export async function authenticateWorkMachineSessionSocket(
+    db: WorkMachineLookup,
+    issuer: WorkMachineTokens | null,
+    token: string,
+    sessionId: string,
+    now: number,
+): Promise<SessionClaims | null> {
+    const claims = await issuer?.verify(token, 'session', now);
+    if (!claims || claims.purpose !== 'session' || claims.sessionId !== sessionId) return null;
+    return await authorizeWorkMachineSession(db, claims) ? claims : null;
+}
+
+export async function legacySessionSocketAllowed(db: WorkMachineLookup, accountId: string, sessionId: string) {
+    const protectedSession = await db.session.findFirst({
+        where: { id: sessionId, accountId, workMachineId: { not: null } },
+        select: { id: true },
+    });
+    return protectedSession === null;
+}
+
+const daemonSocketEvents = new Set([
+    'ping', 'machine-alive', 'machine-update-metadata', 'machine-update-state', 'rpc-register', 'rpc-unregister',
+]);
+// Relay handlers bind frames to the terminal or preview opened by the daemon.
+const daemonRelayEvents = new Set([
+    'proxy-ws-data', 'proxy-ws-close', 'terminal-frame', 'terminal-snapshot', 'terminal-frame-gap', 'terminal-closed',
+]);
+// The automation handler locks the generation per call and decides drain itself.
+const daemonAutomationEvents = new Set([
+    'automation-key-register', 'automation-sync', 'automation-sync-ack', 'automation-claim', 'automation-missed-record',
+    'automation-run-start', 'automation-run-heartbeat', 'automation-conversation-deliver', 'automation-run-report',
+    'session-followup-sync', 'session-followup-claim', 'session-followup-evaluate', 'session-followup-deliver',
+]);
+const sessionSocketEvents = new Set([
+    'update-metadata', 'update-state', 'session-alive', 'session-stream', 'message', 'session-end', 'usage-report', 'provider-usage-report',
+]);
+const rpcTargetEvents = new Set(['rpc-register', 'rpc-unregister', 'rpc-call']);
+
+interface MachineSocketEvent {
+    accountId: string;
+    socketMachineId: string | undefined;
+    socketSessionId?: string;
+    workMachineBrowser?: boolean;
+    claims: WorkMachineExecutionClaims | null;
+    event: string;
+    payload: unknown;
+    now: number;
+}
+
+/**
+ * socket.io runs a socket's middleware for each packet independently and dispatches the packet as
+ * soon as its own `next` is called, so an async check that answers late lets the packets behind it
+ * overtake it. This keeps the checks concurrent but releases their verdicts in arrival order.
+ */
+export function inArrivalOrder<Packet>(middleware: (packet: Packet, next: (error?: Error) => void) => void) {
+    let tail = Promise.resolve();
+    return (packet: Packet, next: (error?: Error) => void) => {
+        const verdict = new Promise<Error | undefined>(resolve => middleware(packet, resolve));
+        tail = tail.then(async () => next(await verdict));
+    };
+}
+
+export async function workMachineSocketMayAct(db: WorkMachineLookup, input: MachineSocketEvent): Promise<boolean> {
+    const { accountId, socketMachineId, socketSessionId, workMachineBrowser, claims, event, payload, now } = input;
+    const data = payload && typeof payload === 'object' ? payload as Record<string, unknown> : null;
+    let target: string | undefined;
+    const isRpc = rpcTargetEvents.has(event);
+    const isSessionEvent = sessionSocketEvents.has(event);
+    if (isRpc) {
+        const method = data?.method;
+        const separator = typeof method === 'string' ? method.indexOf(':') : -1;
+        target = typeof method === 'string' && separator > 0 ? method.slice(0, separator) : undefined;
+    } else if (daemonSocketEvents.has(event) && typeof data?.machineId === 'string') {
+        target = data.machineId;
+    } else if (isSessionEvent) {
+        // Handlers read one key or the other (usage-report reads `sessionId`),
+        // so an event naming two conversations has no single target.
+        if (data?.sid != null && data?.sessionId != null && data.sid !== data.sessionId) return false;
+        const sid = data?.sid ?? data?.sessionId;
+        target = typeof sid === 'string' ? sid : undefined;
+    }
+
+    if (claims) {
+        if (claims.accountId !== accountId || claims.expiresAt <= now) return false;
+        if (claims.purpose === 'daemon') {
+            if (claims.machineId === socketMachineId && (daemonRelayEvents.has(event) || daemonAutomationEvents.has(event))) {
+                return authorizeWorkMachineExecution(db, claims);
+            }
+            if (claims.machineId !== socketMachineId || !daemonSocketEvents.has(event)) return false;
+            return (event === 'ping' || target === claims.machineId) && authorizeWorkMachineExecution(db, claims);
+        }
+        if (claims.sessionId !== socketSessionId) return false;
+        if (event === 'ping') return authorizeWorkMachineSession(db, claims);
+        if (event === 'rpc-call' || (!isRpc && !isSessionEvent) || target !== claims.sessionId) return false;
+        return authorizeWorkMachineSession(db, claims);
+    }
+
+    const machineIds = [...new Set([socketMachineId, isSessionEvent ? undefined : target].filter((id): id is string => !!id))];
+    const sessionIds = [...new Set([socketSessionId, isSessionEvent || isRpc ? target : undefined].filter((id): id is string => !!id))];
+    const protectedMachine = machineIds.length > 0 && await db.workMachineExecution.findFirst({
+        where: { accountId, machineId: { in: machineIds } }, select: { machineId: true, frozenAt: true },
+    });
+    const protectedSession = sessionIds.length > 0 && await db.session.findFirst({
+        where: { accountId, id: { in: sessionIds }, workMachineId: { not: null } },
+        select: { workMachineExecution: { select: { frozenAt: true } } },
+    });
+    if (!protectedMachine && !protectedSession) return true;
+    return workMachineBrowser === true && !socketMachineId && !socketSessionId && event === 'rpc-call'
+        && (!protectedMachine || protectedMachine.frozenAt === null)
+        && (!protectedSession || protectedSession.workMachineExecution?.frozenAt === null);
+}
+
+/**
+ * The per-packet work machine check every socket runs, released in arrival order. `context` is the
+ * socket's identity, fixed at connection; a refused packet never reaches its handler.
+ *
+ * socket.io reports a refused packet only on the server side, so a refused `rpc-call` would leave
+ * its caller waiting out its whole ack timeout for an answer that never comes. The caller is told
+ * why instead: an account-bearer socket needs a work machine credential, anything else is not
+ * authorized right now, and a failed lookup is said to be one.
+ */
+export function workMachinePacketGuard(
+    db: WorkMachineLookup,
+    context: Omit<MachineSocketEvent, 'event' | 'payload' | 'now'>,
+    onLookupFailed: () => void,
+) {
+    const refuseRpc = (packet: unknown[], error: string) => {
+        const ack = packet[packet.length - 1];
+        if (packet[0] === 'rpc-call' && typeof ack === 'function') ack({ ok: false, error });
+    };
+    const refusal = context.claims || context.workMachineBrowser
+        ? 'work-machine-execution-not-authorized' : 'work-machine-credential-required';
+    return inArrivalOrder((packet: unknown[], next: (error?: Error) => void) => {
+        const [event, payload] = packet;
+        void workMachineSocketMayAct(db, { ...context, event: event as string, payload, now: Date.now() }).then((allowed) => {
+            if (allowed) { next(); return; }
+            refuseRpc(packet, refusal);
+            next(new Error('Work machine execution is not authorized'));
+        }, (error: unknown) => {
+            onLookupFailed();
+            refuseRpc(packet, 'work-machine-execution-lookup-failed');
+            next(error instanceof Error ? error : new Error('Work machine execution lookup failed'));
+        });
+    });
 }

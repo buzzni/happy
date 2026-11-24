@@ -214,6 +214,8 @@ async function startRemoteRunClaudeHarness(opts: {
         })),
         sessionSyncClient: vi.fn(() => sessionClient),
         deactivateSession: vi.fn(async () => {}),
+        // An account-token conversation, as ApiClient answers outside a work machine.
+        workMachineMcpProof: vi.fn(() => undefined),
     };
     mockApiClientCreate.mockResolvedValue(api);
 
@@ -569,7 +571,7 @@ describe('runClaude remote JSONL scanner', () => {
             const delivered = harness.loopOptions.messageQueue.queue.at(-1).message;
 
             now.mockReturnValue(arrivedAt + 42 * 60_000);
-            harness.loopOptions.onUserInputDelivered(delivered);
+            harness.loopOptions.onUserInputDelivered([delivered]);
             harness.scannerOptions.onMessage({ type: 'user', message: { content: delivered } });
             expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
         } finally {
@@ -593,7 +595,7 @@ describe('runClaude remote JSONL scanner', () => {
             await userMessageHandler({ content: { text: 'a later question' }, meta: {} });
 
             now.mockReturnValue(arrivedAt + 42 * 60_000);
-            harness.loopOptions.onUserInputDelivered(delivered);
+            harness.loopOptions.onUserInputDelivered([delivered]);
             harness.scannerOptions.onMessage({ type: 'user', message: { content: delivered } });
             expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
         } finally {
@@ -611,12 +613,34 @@ describe('runClaude remote JSONL scanner', () => {
             await userMessageHandler({ content: { text: 'run it again' }, meta: {} });
             const delivered = harness.loopOptions.messageQueue.queue.at(-1).message;
             expect(delivered.startsWith('run it again')).toBe(true);
-            harness.loopOptions.onUserInputDelivered(delivered);
+            harness.loopOptions.onUserInputDelivered([delivered]);
             const copy = { type: 'user', message: { content: delivered } };
             harness.scannerOptions.onMessage(copy);
             expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
             harness.scannerOptions.onMessage(copy);
             expect(harness.sessionClient.sendClaudeSessionMessage).toHaveBeenCalledWith(copy);
+        } finally {
+            await harness.finish();
+        }
+    });
+
+    it('does not forward app prompts the queue joined into one turn', async () => {
+        // Two messages queued behind a running turn run as one ("A\nB"); the JSONL holds that joined text, which matched
+        // neither arrival record, so the scanner showed the input a second time.
+        const harness = await startRemoteRunClaudeHarness();
+        try {
+            const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+            await userMessageHandler({ content: { text: 'first queued' }, meta: {} });
+            await userMessageHandler({ content: { text: 'second queued' }, meta: {} });
+            const batch = await harness.loopOptions.messageQueue.waitForMessagesAndGetAsString();
+            expect(batch.items).toHaveLength(2);
+            harness.loopOptions.onUserInputDelivered(batch.items.map((item: { message: string }) => item.message));
+            harness.scannerOptions.onMessage({ type: 'user', message: { content: batch.message } });
+            expect(harness.sessionClient.sendClaudeSessionMessage).not.toHaveBeenCalled();
+            // Each part was consumed with the turn: the same text typed in a terminal later still shows.
+            const terminalPrompt = { type: 'user', message: { content: batch.items[0].message } };
+            harness.scannerOptions.onMessage(terminalPrompt);
+            expect(harness.sessionClient.sendClaudeSessionMessage).toHaveBeenCalledWith(terminalPrompt);
         } finally {
             await harness.finish();
         }
@@ -628,7 +652,7 @@ describe('runClaude remote JSONL scanner', () => {
         const harness = await startRemoteRunClaudeHarness();
         try {
             const continuation = { type: 'user', message: { content: 'The previous request stopped; continue from where you stopped.' } };
-            harness.loopOptions.onUserInputDelivered(continuation.message.content);
+            harness.loopOptions.onUserInputDelivered([continuation.message.content]);
             harness.scannerOptions.onMessage(continuation);
             expect(harness.sessionClient.sendClaudeSessionMessage).toHaveBeenCalledWith(continuation);
         } finally {
@@ -2223,6 +2247,28 @@ describe('runClaude remote JSONL scanner', () => {
         const userTurn = queued.find((entry: any) => entry.message.includes('use my own harness'));
         expect(userTurn.message).toContain(TITLE_INSTRUCTION);
         expect(userTurn.mode.saycodeSystemPromptEnabled).toBe(false);
+        await harness.finish();
+    });
+
+    // aplus-dev-studio specs/agent-app-api T5 — an app session answers a public end user and has no chat to title;
+    // the nudge is user-turn text, so the profile's system prompt does not cover it.
+    it('appends no change_title instruction to an app-profile session and hands the profile to the loop', async () => {
+        process.env.HAPPY_AUTOMATION_RUN_ONCE = '1';
+        process.env.HAPPY_INITIAL_PROMPT = '운동화 추천해줘';
+        process.env.HAPPY_INITIAL_APP_PROFILE = JSON.stringify({ version: 1, mcpServers: ['shopping'], systemPrompt: '너는 쇼핑 도우미다.' });
+        const harness = await startRemoteRunClaudeHarness();
+        expect(harness.loopOptions.appProfile).toEqual({ version: 1, mcpServers: ['shopping'], systemPrompt: '너는 쇼핑 도우미다.' });
+        harness.sessionClient.hasTitle.mockReturnValue(false);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({ content: { text: '러닝화 추천해줘' }, meta: {} });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued.length).toBeGreaterThan(0);
+        for (const entry of queued) expect(entry.message).not.toContain(TITLE_INSTRUCTION);
         await harness.finish();
     });
 

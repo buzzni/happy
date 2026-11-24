@@ -2,6 +2,10 @@ import { generateKeyPairSync, sign } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const connections = new Set<any>();
+const execution = vi.hoisted(() => ({
+    find: vi.fn<() => Promise<{ generation: number; deviceId: string; frozenAt: Date | null } | null>>(),
+    permit: vi.fn<() => Promise<Array<{ machineId: string }>>>(),
+}));
 
 /**
  * Frames are routed with `io.to(socketId).emit(...)` rather than by holding a
@@ -33,6 +37,7 @@ vi.mock('@/app/events/eventRouter', () => ({
                                     clientType: 'machine-scoped',
                                     machineId: c.machineId,
                                     connectedAt: c.connectedAt,
+                                    ...c.socket.data,
                                 },
                             }));
                     },
@@ -47,6 +52,7 @@ import { _resetTerminalSessionsForTest, getTerminalSession, removeTerminalSessio
 
 class FakeSocket {
     connected = true;
+    data?: Record<string, unknown>;
     /** Forwards this socket received via `timeout().emitWithAck()`. */
     forwards: Array<{ event: string; payload: any }> = [];
     /** false → the daemon never calls the ack (socket.io rejects on timeout). */
@@ -111,6 +117,51 @@ describe('terminalRelayHandler machine socket selection', () => {
         connections.clear();
         roomEmits.length = 0;
         _resetTerminalSessionsForTest();
+    });
+
+    it('rejects legacy and old-generation terminals and permits a fresh open on the current device only', async () => {
+        const source = new FakeSocket('source');
+        const target = new FakeSocket('target');
+        const customer = new FakeSocket('customer');
+        source.data = { clientType: 'machine-scoped', machineId: 'm1' };
+        customer.data = { workMachineBrowser: true };
+        registerMachineSocket('m1', source);
+        terminalRelayHandler('u1', customer as any);
+
+        const open = async (caller: FakeSocket) => {
+            const ack = vi.fn();
+            await caller.trigger('terminal-open', { machineId: 'm1', params: 'encrypted' }, ack);
+            return ack.mock.calls[0]?.[0];
+        };
+        const original = await open(customer);
+        expect(original.ok).toBe(true);
+        try {
+            const generation = 2;
+            execution.find.mockResolvedValue({ generation, deviceId: 'target-device', frozenAt: null });
+            execution.permit.mockResolvedValue([{ machineId: 'm1' }]);
+            const grant = { accountId: 'u1', machineId: 'm1', deviceId: 'target-device', generation, purpose: 'daemon', expiresAt: Date.now() + 60_000 };
+            target.data = { clientType: 'machine-scoped', machineId: 'm1', workMachineExecution: grant };
+            registerMachineSocket('m1', target);
+            const legacy = new FakeSocket('legacy');
+            terminalRelayHandler('u1', legacy as any);
+            expect((await open(legacy)).ok).toBe(false);
+            expect(target.forwards).toEqual([]);
+            expect(execution.permit).not.toHaveBeenCalled();
+
+            await customer.trigger('terminal-frame', { sessionId: original.sessionId, data: 'after handoff' });
+            expect(roomEmits).toEqual([]);
+            const current = await open(customer);
+            expect(current.ok).toBe(true);
+            expect(target.forwards.map(item => item.event)).toEqual(['terminal-open-fwd']);
+            expect(execution.permit).toHaveBeenCalledTimes(1);
+            await customer.trigger('terminal-frame', { sessionId: current.sessionId, data: 'active' });
+            expect(roomEmits).toEqual([{
+                room: 'target', event: 'terminal-frame-fwd', payload: { sessionId: current.sessionId, data: 'active' },
+            }]);
+        } finally {
+            execution.find.mockReset().mockResolvedValue(null);
+            execution.permit.mockReset();
+        }
     });
 
     it('lists and closes only sessions whose signing key is proved on the shared account', async () => {
@@ -1043,3 +1094,9 @@ describe('terminalRelayHandler ended terminal across replicas', () => {
         expect(redis.record(sessionId)).toBeNull();
     });
 });
+vi.mock('@/storage/db', () => ({
+    db: {
+        workMachineExecution: { findFirst: () => execution.find() ?? Promise.resolve(null) },
+        $queryRaw: () => execution.permit(),
+    },
+}));

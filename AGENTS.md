@@ -11,6 +11,13 @@ When the user says `sync to main` or `synt to main`, they mean:
 
 Do not force push for this workflow.
 
+## Windows Child Processes
+
+Before adding or reviewing any `spawn`/`execFile`/`exec`/`fork` that can run on Windows, read
+`docs/windows-child-processes.md`. In short: give console programs `windowsHide: true`, never start a
+console program with `detached: true` on Windows, and remember that `shell: true` and `.cmd` files run
+`cmd.exe`. The daemon and its sessions have no console, so any miss shows a window to the user.
+
 ## Happy CLI Local Install / Publish
 
 `packages/happy-cli` imports `@slopus/happy-wire` at runtime, while the source

@@ -86,12 +86,25 @@ export default defineConfig({
                 extends: true,
                 test: {
                     name: 'integration-write-scope',
-                    include: ['src/daemon/sessionWriteScope.integration.test.ts'],
+                    include: ['src/daemon/sessionWriteScope.integration.test.ts', 'src/daemon/workMachineNativeResume.integration.test.ts'],
                     setupFiles: ['./src/testing/unit.setup.ts'],
                     fileParallelism: false,
                     maxWorkers: 1,
                     testTimeout: 180_000,
                     hookTimeout: 60_000,
+                },
+            },
+            {
+                // aplus specs/work-machine-migration 5.5 — opt-in; scripts/work-machine-rehearsal-linux.sh runs it on Linux.
+                extends: true,
+                test: {
+                    name: 'integration-work-machine-rehearsal',
+                    include: ['src/daemon/workMachineRehearsal.integration.test.ts'],
+                    setupFiles: ['./src/testing/unit.setup.ts'],
+                    fileParallelism: false,
+                    maxWorkers: 1,
+                    testTimeout: 600_000,
+                    hookTimeout: 120_000,
                 },
             },
             {

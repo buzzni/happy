@@ -1,6 +1,7 @@
 import * as privacyKit from "privacy-kit";
 import { log } from "@/utils/log";
 import type { Principal, SessionScopedTokenIssuer } from "@/app/auth/sessionScopedToken";
+import { createWorkMachineExecutionTokenIssuer } from "@/app/auth/workMachineExecutionToken";
 import {
     BROWSER_SYNC_MAX_TTL_MS,
     createBrowserSyncTokenIssuer,
@@ -43,6 +44,10 @@ class AuthModule {
     get browserSyncIssuer(): BrowserSyncTokenIssuer | null {
         return this.browserSync;
     }
+    private workMachineExecution: Awaited<ReturnType<typeof createWorkMachineExecutionTokenIssuer>> | null = null;
+    get workMachineExecutionIssuer() {
+        return this.workMachineExecution;
+    }
     private tokens: AuthTokens | null = null;
     private cleanupTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -76,6 +81,7 @@ class AuthModule {
         });
 
 
+        this.workMachineExecution = await createWorkMachineExecutionTokenIssuer(process.env.HANDY_MASTER_SECRET!);
         this.tokens = { generator, verifier, githubVerifier, githubGenerator };
         this.browserSync = await createBrowserSyncTokenIssuer({
             seed: process.env.HANDY_MASTER_SECRET!,
@@ -237,12 +243,15 @@ class AuthModule {
         accountId: string,
         now: number,
         ttlMs: number = BROWSER_SYNC_MAX_TTL_MS,
+        workMachineIngress = false,
     ): Promise<{ token: string; expiresAt: number } | null> {
         if (!this.browserSync) {
             throw new Error('Auth module not initialized');
         }
         const expiresAt = now + ttlMs;
-        const minted = await this.browserSync.mint({ v: 1, accountId, expiresAt }, now);
+        const minted = await this.browserSync.mint({
+            v: 1, accountId, expiresAt, ...(workMachineIngress ? { workMachineIngress: true } : {}),
+        }, now);
         if (!minted.ok) {
             log({ module: 'auth', level: 'error' }, `Browser sync mint refused: ${minted.reason}`);
             return null;

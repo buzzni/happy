@@ -4,6 +4,9 @@
  * Lightweight CLI bootstrap. Agent commands must be dispatched before loading
  * the Happy runtime because provider modules have import-time side effects.
  */
+// First: on Windows the daemon and sessions have no console, so every console program they start
+// must get a hidden one (docs/windows-child-processes.md).
+import './utils/windowsHiddenConsoleInstall'
 import { captureStandaloneLaunchBootstrap } from './daemon/standaloneLaunchProtocol'
 import { handleAgentCommand } from './commands/agentCommand'
 import { loadBrowserTaskEnv } from './daemon/browserTaskEnv'
@@ -31,6 +34,13 @@ if (args[0] === 'browser-client') {
 } else if (args[0] === 'terminal-worker') {
   // aplus specs/terminal-survive-runner-restart: a detached PTY owner that outlives the daemon.
   void import('./daemon/terminalWorker/workerMain')
+} else if (args[0] === 'work-machine') {
+  void import('./commands/workMachineCommand').then(({ handleWorkMachineCommand }) =>
+    handleWorkMachineCommand(args.slice(1)),
+  ).catch(error => {
+    console.error(error instanceof Error ? error.message : 'Work machine command failed')
+    process.exitCode = 1
+  })
 } else if (args[0] === 'personal-endpoint-probe') {
   void import('./daemon/personalEndpointProbeWorker')
 } else if (args[0] === 'difficulty-routing-worker') {

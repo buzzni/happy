@@ -11,6 +11,24 @@ describe('checkpoint event publisher', () => {
     const turnOperationId = '123e4567-e89b-42d3-a456-426614174000';
     const restoreOperationId = '123e4567-e89b-42d3-a456-426614174001';
 
+    // A protected conversation posts with its session credential, which renewals replace.
+    it('reads a token source at each publish', async () => {
+        const post = vi.fn(async (_request: CheckpointEventRequest) => ({
+            event: { id: 'event-1', seq: 7, createdAt: now, idempotent: false },
+        }));
+        let token = 'wmx_session_1';
+        const publisher = createCheckpointEventPublisher({
+            token: () => token, sessionId: 'session-1', serverUrl: 'https://api.happy.engineering',
+            encryption: { encryptionKey, encryptionVariant: 'dataKey' },
+        }, { post, now: () => now });
+
+        await publisher.snapshot({ operationId: turnOperationId, checkpointId: 'a'.repeat(40), excluded: [] });
+        token = 'wmx_session_2';
+        await publisher.snapshot({ operationId: restoreOperationId, checkpointId: 'b'.repeat(40), excluded: [] });
+
+        expect(post.mock.calls.map(([request]) => request.token)).toEqual(['wmx_session_1', 'wmx_session_2']);
+    });
+
     it('encrypts relative-path detail while exposing only the idempotency envelope', async () => {
         const post = vi.fn(async (_request: CheckpointEventRequest) => ({
             event: { id: 'event-1', seq: 7, createdAt: now, idempotent: false },

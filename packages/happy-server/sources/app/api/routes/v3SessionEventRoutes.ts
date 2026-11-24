@@ -7,7 +7,8 @@ import { db } from "@/storage/db";
 import { Prisma } from "@prisma/client";
 import { z } from "zod";
 import { type Fastify } from "../types";
-import { requireSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
+import { requireWorkMachineSessionScopeAuth } from "@/app/api/utils/enableAuthentication";
+import { workMachineWriteGuard, WorkMachineWriteRefused } from "@/app/machine/workMachineExecution";
 
 const validEventTypes = Object.values(SESSION_EVENT_TYPES) as [string, ...string[]];
 
@@ -91,7 +92,7 @@ export function v3SessionEventRoutes(app: Fastify) {
     // GET only. The POST below writes session events, which no managed
     // consumer needs, so sharing a path does not carry it in.
     app.get('/v3/sessions/:sessionId/events', {
-        preHandler: requireSessionScopeAuth(app) as never,
+        preHandler: requireWorkMachineSessionScopeAuth(app),
         schema: {
             params: z.object({
                 sessionId: z.string(),
@@ -155,8 +156,10 @@ export function v3SessionEventRoutes(app: Fastify) {
         });
     });
 
+    // A protected conversation writes its events only with its own session
+    // credential of the live generation; the account bearer is refused there.
     app.post('/v3/sessions/:sessionId/events', {
-        preHandler: app.authenticate,
+        preHandler: requireWorkMachineSessionScopeAuth(app),
         schema: {
             params: z.object({
                 sessionId: z.string(),
@@ -173,33 +176,47 @@ export function v3SessionEventRoutes(app: Fastify) {
                 id: sessionId,
                 ...piiSessionVisibility(request), accountId: userId,
             },
-            select: { id: true },
+            select: { id: true, workMachineId: true },
         });
 
         if (!session) {
             return reply.code(404).send({ error: 'Session not found' });
         }
+        const claim = request.workMachineSessionGrant;
+        if (session.workMachineId && !claim) {
+            return reply.code(403).send({ error: 'Work machine session credential required' });
+        }
+        const guard = claim && workMachineWriteGuard(claim);
 
-        const checkpointEvent = checkpoint
-            ? await persistCheckpointSessionEvent({
-                sessionId,
-                eventType: eventType as SessionEventType,
-                content,
-                checkpoint,
-            })
-            : null;
-        const event = checkpointEvent ?? await persistSessionEvent({
-            sessionId,
-            eventType: eventType as SessionEventType,
-            content,
-        });
+        let event: { id: string; seq: number; createdAt: Date; idempotent?: boolean };
+        try {
+            event = checkpoint
+                ? await persistCheckpointSessionEvent({
+                    sessionId,
+                    eventType: eventType as SessionEventType,
+                    content,
+                    checkpoint,
+                    guard,
+                })
+                : await persistSessionEvent({
+                    sessionId,
+                    eventType: eventType as SessionEventType,
+                    content,
+                    guard,
+                });
+        } catch (error) {
+            if (error instanceof WorkMachineWriteRefused) {
+                return reply.code(403).send({ error: 'Work machine session credential required' });
+            }
+            throw error;
+        }
 
         return reply.send({
             event: {
                 id: event.id,
                 seq: event.seq,
                 createdAt: event.createdAt.getTime(),
-                ...(checkpointEvent ? { idempotent: checkpointEvent.idempotent } : {}),
+                ...(event.idempotent !== undefined ? { idempotent: event.idempotent } : {}),
             },
         });
     });
