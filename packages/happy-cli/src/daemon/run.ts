@@ -1001,7 +1001,8 @@ export async function startDaemon(): Promise<void> {
       return {
         device, initial, authSetup: {
           credentials: { token: initial.token, encryption: local.encryption },
-          machineId: executionBinding.machineId, serverPublicKey: null,
+          // The server copies of the machine key a handoff cleared are wrapped to it (getOrCreateMachine).
+          machineId: executionBinding.machineId, serverPublicKey: settings.serverPublicKey ?? null,
         },
       };
     })();
