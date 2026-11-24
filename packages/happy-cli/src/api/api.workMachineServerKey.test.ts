@@ -29,8 +29,10 @@ function unwrapForServer(envelope: string): Uint8Array | null {
     return tweetnacl.box.open(bytes.subarray(57), bytes.subarray(33, 57), bytes.subarray(1, 33), serverKey.secretKey);
 }
 
-function protectedClient() {
-    return ApiClient.create({ token: 'wmx_daemon_token_for_tests', encryption: { type: 'dataKey', publicKey: account.publicKey, machineKey: MACHINE_KEY } });
+function protectedClient(neverEscrowed = false) {
+    return ApiClient.create({ token: 'wmx_daemon_token_for_tests', encryption: {
+        type: 'dataKey', publicKey: account.publicKey, machineKey: MACHINE_KEY, ...(neverEscrowed ? { neverEscrowed: true as const } : {}),
+    } });
 }
 
 function start(api: ApiClient, machineControl: 'compat' | 'strict' = 'compat', serverPublicKey: string | null = encodeBase64(serverKey.publicKey)) {
@@ -84,6 +86,14 @@ describe('a protected daemon starting as the current device', () => {
 
     it('never sends the machine key itself under strict machine control', async () => {
         await start(await protectedClient(), 'strict');
+
+        expect(uploads()).toHaveLength(1);
+        expect(uploads()[0].body.serverDataEncryptionKey).toBeNull();
+        expect(unwrapForServer(uploads()[0].body.serverRpcKeyEnvelope)).not.toBeNull();
+    });
+
+    it('never sends a machine key that was kept from the server, even outside strict machine control', async () => {
+        await start(await protectedClient(true), 'compat');
 
         expect(uploads()).toHaveLength(1);
         expect(uploads()[0].body.serverDataEncryptionKey).toBeNull();
