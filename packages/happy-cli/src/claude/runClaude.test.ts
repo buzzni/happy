@@ -214,6 +214,8 @@ async function startRemoteRunClaudeHarness(opts: {
         })),
         sessionSyncClient: vi.fn(() => sessionClient),
         deactivateSession: vi.fn(async () => {}),
+        // An account-token conversation, as ApiClient answers outside a work machine.
+        workMachineMcpProof: vi.fn(() => undefined),
     };
     mockApiClientCreate.mockResolvedValue(api);
 
