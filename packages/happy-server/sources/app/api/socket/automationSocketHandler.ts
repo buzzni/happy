@@ -160,6 +160,7 @@ export function automationSocketHandler(
         protocolVersion: data?.protocolVersion === undefined
             ? 1
             : integer(data.protocolVersion, 1, Number.MAX_SAFE_INTEGER),
+        ...(grant ? { currentWorkMachineDevice: true as const } : {}),
     })), async (value) => {
         const result = value as { invalidatedProjectIds?: string[]; targetChanged?: boolean };
         // 계정 전체 이벤트는 그 계정의 모든 Desktop 이 전 프로젝트를 다시 읽게 한다. 재접속한
