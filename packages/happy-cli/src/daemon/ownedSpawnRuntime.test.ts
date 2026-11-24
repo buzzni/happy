@@ -436,6 +436,20 @@ describe('host custody launches skip tmux (H3-R1-02)', () => {
     });
 });
 
+describe('journal compatibility with a daemon from before the directory report', () => {
+    // The previous record schema without additionalDirectories (strict). Only a start that asked for related-project
+    // directories writes the field, so every other record stays readable after a downgrade; those that did are one-way.
+    const preReportSchema = ownedSpawnRecordSchema.omit({ additionalDirectories: true }).strict();
+    it('writes records without requested directories that the previous schema still reads', async () => {
+        const f = await fixture(), runtime = f.build();
+        expect(await runtime.start(await createdSession(f, runtime))).toMatchObject({ state: 'started' });
+        const directory = join(f.home, 'owned-spawns'), [name] = await readdir(directory);
+        const raw = JSON.parse(await readFile(join(directory, name), 'utf8'));
+        expect(() => preReportSchema.parse(raw)).not.toThrow();
+        expect(raw).not.toHaveProperty('additionalDirectories');
+    });
+});
+
 describe('journal compatibility with a daemon from before H3 (H3-R2-01)', () => {
     // origin/main's record schema is this one without the H3 callerCustody field (strict).
     const preH3Schema = ownedSpawnRecordSchema.omit({ callerCustody: true }).strict();
