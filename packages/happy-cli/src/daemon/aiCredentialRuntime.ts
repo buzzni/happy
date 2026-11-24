@@ -3059,6 +3059,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       personalRefEpochs.set(ref, (personalRefEpochs.get(ref) ?? 0) + 1)
     } else personalCancelEpoch++
     personalScheduler.cancel(ref)
+    // A revocation or credential change makes the roster the scheduler reuses stale.
+    personalScheduler.invalidate()
     if (personalCommand && (!ref || personalCommand.ref === ref)) personalCommand.controller.abort()
   }
   async function tokenProbe(input: unknown, signal?: AbortSignal) {
@@ -3082,6 +3084,8 @@ export function createAiCredentialRuntime(deps: AiCredentialRuntimeDependencies)
       } finally {
         signal?.removeEventListener('abort', abort)
         if (personalCommand === flight) personalCommand = null
+        // A consent the scheduler has not read yet is picked up on its next tick.
+        if (request?.operation === 'consent') personalScheduler.invalidate()
       }
     })
   }
