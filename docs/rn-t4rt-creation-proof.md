@@ -16,6 +16,10 @@
 - 새 machine RPC: `owned-spawn-capabilities({spawn})`, `prepare-owned-spawn`, `commit-owned-spawn`,
   `start-created-session`/`start-owned-spawn`, `create-session-status`/`owned-spawn-status`,
   `agent-caller-binding({sessionId,nonce})`. 기존 encrypted machine binding을 사용한다.
+  관련 프로젝트 폴더를 요청한 시작은 기존 spawn RPC처럼 `additionalDirectories {version:1, accepted, skipped}`를
+  provider 시작 성공 직후(binding 확인 전, `starting` 상태에서) 기록에 남기고 start·status 응답에 싣는다
+  (Desktop은 요청했는데 이 값이 없으면 시작 결과를 거절한다). 이 필드는 폴더를 요청한 기록에만 쓰므로 그 밖의 기록은
+  이전 데몬도 읽는다. 폴더를 요청한 기록은 이전 데몬으로 내리면 읽지 못한다(단방향).
 - caller는 실제 owned launch의 session/scope/depth와 daemon machine/account에서 만들고 private key를
   host 메모리에만 둔다. 조회는 nonce/source에 결속되며 새 host·재개 시 새 binding을 만든다.
   immutable 생성 receipt의 caller는 당시 기록이고 현재 relay 등록은 반드시 agent-caller-binding으로 검증한다.

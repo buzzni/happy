@@ -391,7 +391,7 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
             const reconnectEnvironment = { ...buildReconnectSessionEnvironment({ sessionId: created.id, encryption: created, serverSnapshot: created, baselineSeq: 0 }), [RECONNECT_FRESH_LAUNCH_ENV]: '1' };
             startPrepared.set(record.preparationId, { options: { ...opts, reconnectEnvironment }, launch });
         },
-        async start(record) {
+        async start(record, reported) {
             const prepared = startPrepared.get(record.preparationId); if (!prepared) throw new Error('start-not-prepared');
             startPrepared.delete(record.preparationId);
             if (hostCustody(record)) pipeLaunches.add(prepared.options);
@@ -399,6 +399,7 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
             launchFlights.delete(record.preparationId);
             const created = { id: record.created!.sessionId };
             if (result.type !== 'success' || result.sessionId !== created.id) throw new Error('provider-start-unknown');
+            if (result.additionalDirectories) await reported(result.additionalDirectories);
             if (hostCustody(record)) {
                 // Unconfirmed until the child host binds itself; status recovers it without another launch.
                 // Short: main's start RPC has a 20s deadline and the webhook wait already spent part of it.

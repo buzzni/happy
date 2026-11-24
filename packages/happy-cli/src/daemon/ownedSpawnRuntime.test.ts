@@ -17,8 +17,9 @@ import { ownedSpawnRecordSchema } from './ownedSpawn';
 import { ownershipTrustEnv } from './sessionOwnershipTrust';
 const homes: string[] = [];
 afterEach(async () => { vi.restoreAllMocks(); await Promise.all(homes.splice(0).map(home => rm(home, { recursive: true, force: true }))); });
-async function fixture(options: { parent?: string; spawn?: Record<string, unknown> } = {}) {
+async function fixture(options: { parent?: string; spawn?: Record<string, unknown>; startExtra?: Record<string, unknown> } = {}) {
     const home = await mkdtemp(join(tmpdir(), 'owned-runtime-')); homes.push(home);
+    const startExtra = options.startExtra;
     const keys = nacl.sign.keyPair(), now = Date.now();
     const signed = { version: 1, issuer: 'https://studio.test', audience: 'https://happy.test', keyId: await rotationSha256(keys.publicKey), issuedAt: now, expiresAt: now + 60_000 };
     const spawn = options.spawn ?? { directory: '/project', agent: 'codex' };
@@ -54,7 +55,7 @@ async function fixture(options: { parent?: string; spawn?: Record<string, unknow
             expect(JSON.stringify(options)).not.toContain('signature'); expect(JSON.stringify(options)).not.toContain('synthetic-machine-bearer');
             tracked = { pid: 123, happySessionId: 'session', startedBy: 'daemon', directory: '/project' };
             await onStart?.();
-            return { type: 'success', sessionId: 'session' };
+            return { type: 'success', sessionId: 'session', ...startExtra } as never;
         },
         ...extra,
     });
@@ -124,6 +125,19 @@ it('transports the signed snapshot through encrypted machine RPC and answers a m
     expect(fresh.caller.callerBindingId).not.toBe(reply.caller.callerBindingId);
     expect(f.counts()).toEqual({ posts: 1, starts: 1 });
 });
+it('reports the related-project directory result of the start, as the legacy spawn RPC does', async () => {
+    // Desktop refuses a start without it when directories were requested ("Malformed additional directories result").
+    const report = { version: 1, accepted: ['/related/a'], skipped: { missing: 1 } };
+    const f = await fixture({ spawn: { directory: '/project', agent: 'codex', additionalDirectories: ['/related/a', '/related/b'] },
+        startExtra: { additionalDirectories: report } }), runtime = f.build();
+    const p = await runtime.prepare({ intent: f.intent, spawn: f.spawn });
+    await runtime.commit({ creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof(p) });
+    const started = await runtime.start({ creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' });
+    expect(started).toMatchObject({ state: 'started', additionalDirectories: report });
+    // Status after a daemon restart reads the same report from the journal.
+    expect(await f.build().status({ creationRequestId: 'creation' })).toMatchObject({ state: 'started', additionalDirectories: report });
+});
+
 it('answers non-journal sources only from daemon-vouched launch bindings (T1c-b2 H2)', async () => {
     const f = await fixture(), nonce = 'main-verifier-nonce';
     await expect(f.build().callerBinding({ sessionId: 'terminal-source', nonce })).rejects.toThrow('caller-unavailable');
@@ -369,6 +383,29 @@ describe('custody fixed at start survives trust changes (H3-R1-01)', () => {
         expect(f.counts()).toEqual({ posts: 1, starts: 1 });
     });
 });
+describe('the related-project directory report survives a start confirmed later (PR #1338 review)', () => {
+    const report = { version: 1, accepted: ['/related/a'], skipped: { missing: 1 } };
+    const withDirectories = () => fixture({ spawn: { directory: '/project', agent: 'codex', additionalDirectories: ['/related/a', '/related/b'] },
+        startExtra: { additionalDirectories: report } });
+    it('host custody: a child binding that arrives after the start is recovered through status with the report', async () => {
+        const f = await withDirectories(), hosts = hostCallers(), runtime = f.build({ launchCallers: hosts, hostBindingWaitMs: 0 });
+        const start = await createdSession(f, runtime);
+        expect(await runtime.start(start)).toMatchObject({ state: 'starting' });
+        hosts.callers.set('session', hostCaller({ sessionId: 'session' }));
+        expect(await runtime.status({ creationRequestId: 'creation' })).toMatchObject({ state: 'started', additionalDirectories: report });
+        expect(await f.journal.read('creation')).toMatchObject({ state: 'started', additionalDirectories: report });
+        expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+    });
+    it('daemon custody: a session not yet live at start is recovered after a daemon restart with the report', async () => {
+        const f = await withDirectories(), runtime = f.build();
+        const start = await createdSession(f, runtime);
+        f.setAlive(false);
+        expect(await runtime.start(start)).toMatchObject({ state: 'starting' });
+        f.setAlive(true);
+        expect(await f.build().status({ creationRequestId: 'creation' })).toMatchObject({ state: 'started', additionalDirectories: report });
+        expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+    });
+});
 describe('host custody launches skip tmux (H3-R1-02)', () => {
     it('an owned start with TMUX_SESSION_NAME is a pipe launch and reaches started with its own binding', async () => {
         const spawn = { directory: '/project', agent: 'codex', environmentVariables: { TMUX_SESSION_NAME: 'work' } };
@@ -396,6 +433,20 @@ describe('host custody launches skip tmux (H3-R1-02)', () => {
         expect(source).toContain('if (!tmuxAvailable || tmuxSessionName === undefined || ownerPipeRequired || contextOwnedChildren.has(options))');
         expect(source).toContain('const ownerPipeRequired = ownedPipeOnlyLaunch?.(options) === true;');
         expect(source).toContain('ownedPipeOnlyLaunch = options => ownedSpawn.pipeOnlyLaunch(options);');
+    });
+});
+
+describe('journal compatibility with a daemon from before the directory report', () => {
+    // The previous record schema without additionalDirectories (strict). Only a start that asked for related-project
+    // directories writes the field, so every other record stays readable after a downgrade; those that did are one-way.
+    const preReportSchema = ownedSpawnRecordSchema.omit({ additionalDirectories: true }).strict();
+    it('writes records without requested directories that the previous schema still reads', async () => {
+        const f = await fixture(), runtime = f.build();
+        expect(await runtime.start(await createdSession(f, runtime))).toMatchObject({ state: 'started' });
+        const directory = join(f.home, 'owned-spawns'), [name] = await readdir(directory);
+        const raw = JSON.parse(await readFile(join(directory, name), 'utf8'));
+        expect(() => preReportSchema.parse(raw)).not.toThrow();
+        expect(raw).not.toHaveProperty('additionalDirectories');
     });
 });
 

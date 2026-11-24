@@ -13,6 +13,9 @@ export const ownedSnapshotSchema = z.object({ body: SessionExecutionCreateBodySc
 export const ownedCreatedSchema = z.object({ sessionId: ownershipId, ownershipBindingId: ownershipId.optional(),
     registrationState: z.enum(['pending', 'confirmed']).optional(), createDigest: z.string().regex(/^[a-f0-9]{64}$/),
 }).strict();
+/** The start's related-project directory result, as the legacy spawn RPC reports it (Desktop requires it when it asked). */
+const additionalDirectoriesReportSchema = z.object({ version: z.literal(1), accepted: z.array(z.string()).max(8),
+    skipped: z.record(z.string(), z.number().int().positive()) }).strict();
 export const ownedSpawnRecordSchema = z.object({ version: z.literal(1), intent: SessionOwnershipIntentSchema,
     spawn: z.record(z.string(), z.unknown()), preparationId: ownershipId, intentDigest: z.string(),
     state: z.enum(['preparing', 'prepared', 'committing', 'created', 'starting', 'started', 'failed']),
@@ -24,6 +27,7 @@ export const ownedSpawnRecordSchema = z.object({ version: z.literal(1), intent: 
     /** 'host': the child host holds the caller key, fixed when the start is submitted (H3). Absent means daemon
      * custody, as on every earlier record, so a daemon from before H3 still reads those. */
     callerCustody: z.literal('host').optional(),
+    additionalDirectories: additionalDirectoriesReportSchema.optional(),
 }).strict();
 export type OwnedSpawnRecord = z.infer<typeof ownedSpawnRecordSchema>;
 export type OwnedSpawnSnapshot = z.infer<typeof ownedSnapshotSchema>;
@@ -39,7 +43,9 @@ export interface OwnedSpawnDependencies {
     /** Read-only recovery, including expired proof. Never creates a new tag or re-encrypts. */
     discover(record: OwnedSpawnRecord): Promise<OwnedCreated | null>;
     prepareStart?(record: OwnedSpawnRecord): Promise<void>;
-    start(record: OwnedSpawnRecord): Promise<StartedProvider>;
+    /** reported: the provider's related-project directory result, kept before the binding is proven so a start
+     * confirmed later through status still answers with it. */
+    start(record: OwnedSpawnRecord, reported: (additionalDirectories: unknown) => Promise<void>): Promise<StartedProvider>;
     observeStart(record: OwnedSpawnRecord): Promise<StartedProvider | null>;
     /** null: the child host holds its own key and its binding arrives with the started provider (T1c-b2 H3). */
     caller(record: OwnedSpawnRecord): Promise<z.infer<typeof OwnershipCallerBindingSchema> | null>;
@@ -77,6 +83,7 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
             ...(r.unprovenReason ? { unprovenReason: r.unprovenReason } : {}),
             ...(r.created ?? {}), ...(r.providerRuntimeId ? { providerRuntimeId: r.providerRuntimeId } : {}),
             ...(r.caller ? { caller: r.caller } : {}),
+            ...(r.additionalDirectories ? { additionalDirectories: r.additionalDirectories } : {}),
         };
     }
     async function created(r: OwnedSpawnRecord, value: OwnedCreated, recovered = false) {
@@ -204,7 +211,9 @@ export function createOwnedSpawn(deps: OwnedSpawnDependencies) {
                 }
                 r.state = 'starting'; await deps.journal.write(r);
                 try {
-                    adopt(r, await deps.start(r));
+                    adopt(r, await deps.start(r, async report => {
+                        r.additionalDirectories = additionalDirectoriesReportSchema.parse(report); await deps.journal.write(r);
+                    }));
                     await deps.journal.write(r);
                 } catch (error) {
                     if (error instanceof OwnedStartRefused) {
