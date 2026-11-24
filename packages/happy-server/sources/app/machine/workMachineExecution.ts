@@ -606,6 +606,62 @@ export async function handoffWorkMachineExecution(
     return { changed: true as const, machine };
 }
 
+export type WorkMachineServerKeyRefusal = 'not-current' | 'data-encryption-key-conflict' | 'server-key-conflict';
+
+class WorkMachineServerKeyConflict extends Error {}
+
+/**
+ * A handoff clears the server copies of the machine key with the old key. The
+ * device now current puts them back, as a registration would have: the server
+ * lane key envelope and, unless the device is strict, the machine key escrow.
+ *
+ * Only the generation's current device, while not frozen (drain still allows
+ * it: it starts no work, and drain's refusals are per request), and only while
+ * the machine still has the data key the device read. A slot is only filled:
+ * a present copy is never replaced (the whole upload is rolled back), and the
+ * data key itself is never written. The authority row is locked before the
+ * machine row, as in a handoff, so a concurrent handoff either runs first (and
+ * this sees another key or generation) or waits. Repeating the same upload
+ * reports no change.
+ */
+export async function fillWorkMachineServerKeyCopies(
+    db: Pick<PrismaClient, '$transaction'>,
+    grant: WorkMachineDeviceGrant,
+    copies: { expectedDataEncryptionKey: Uint8Array; serverRpcKeyEnvelope: Uint8Array; serverDataEncryptionKey: Uint8Array | null },
+): Promise<{ changed: boolean } | { refused: WorkMachineServerKeyRefusal }> {
+    const { accountId, machineId } = grant;
+    const same = (stored: Uint8Array | null | undefined, wanted: Uint8Array) => !!stored && machineDataKeyEnvelopesEqual(stored, wanted);
+    try {
+        return await db.$transaction(async tx => {
+            if (!await lockWorkMachineExecution(tx, grant)) return { refused: 'not-current' as const };
+            const current = { id: machineId, accountId, dataEncryptionKey: new Uint8Array(copies.expectedDataEncryptionKey) };
+            const lane = await tx.machine.updateMany({
+                where: { ...current, serverRpcKeyEnvelope: null },
+                data: { serverRpcKeyEnvelope: new Uint8Array(copies.serverRpcKeyEnvelope) },
+            });
+            const escrow = copies.serverDataEncryptionKey ? await tx.machine.updateMany({
+                where: { ...current, serverDataEncryptionKey: null },
+                data: { serverDataEncryptionKey: new Uint8Array(copies.serverDataEncryptionKey) },
+            }) : { count: 0 };
+            const machine = await tx.machine.findFirst({
+                where: { id: machineId, accountId },
+                select: { dataEncryptionKey: true, serverRpcKeyEnvelope: true, serverDataEncryptionKey: true },
+            });
+            if (!machine || !same(machine.dataEncryptionKey, copies.expectedDataEncryptionKey)) {
+                return { refused: 'data-encryption-key-conflict' as const };
+            }
+            if (!same(machine.serverRpcKeyEnvelope, copies.serverRpcKeyEnvelope)
+                || (copies.serverDataEncryptionKey && !same(machine.serverDataEncryptionKey, copies.serverDataEncryptionKey))) {
+                throw new WorkMachineServerKeyConflict();
+            }
+            return { changed: lane.count + escrow.count > 0 };
+        });
+    } catch (error) {
+        if (error instanceof WorkMachineServerKeyConflict) return { refused: 'server-key-conflict' };
+        throw error;
+    }
+}
+
 /**
  * The operator's verdict on a connector call whose outcome nobody can
  * confirm. Only a frozen generation's call can be closed this way; it records
