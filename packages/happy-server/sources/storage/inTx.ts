@@ -32,7 +32,10 @@ export async function inTx<T>(fn: (tx: Tx) => Promise<T>): Promise<T> {
             return result.result;
         } catch (e) {
             if (e instanceof Prisma.PrismaClientKnownRequestError) {
-                if (e.code === 'P2034' && counter < 3) {
+                // A raw query's serialization failure or deadlock (e.g. SELECT … FOR SHARE on a row
+                // updated after the snapshot) arrives as P2010 carrying the SQLSTATE, not as P2034.
+                const rawConflict = e.code === 'P2010' && ['40001', '40P01'].includes(String(e.meta?.code));
+                if ((e.code === 'P2034' || rawConflict) && counter < 3) {
                     counter++;
                     await delay(counter * 100);
                     continue;
