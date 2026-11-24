@@ -14,8 +14,9 @@ vi.mock('@/codex/runCodex', () => ({}))
 vi.mock('./ui/auth', () => ({ authAndSetupMachineIfNeeded: async () => ({ credentials: { token: 'token' } }) }))
 vi.mock('./daemon/ensureDaemonRunning', () => ({ ensureDaemonRunning: async () => undefined }))
 vi.mock('@/agent/acp', async () => {
-  const actual = await vi.importActual<typeof import('@/agent/acp')>('@/agent/acp')
-  return { ...actual, runAcp: mocks.runAcp }
+  // Keep real argument parsing without loading the runner and its dependencies.
+  const { parseAcpSubcommandArgs, resolveAcpAgentConfig } = await import('./agent/acp/acpAgentConfig')
+  return { parseAcpSubcommandArgs, resolveAcpAgentConfig, runAcp: mocks.runAcp }
 })
 
 const originalArgv = process.argv
