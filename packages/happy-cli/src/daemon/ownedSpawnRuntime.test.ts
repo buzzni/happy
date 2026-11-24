@@ -1,5 +1,7 @@
 import { mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
+import { once } from 'node:events';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -8,7 +10,7 @@ import nacl from 'tweetnacl';
 import { signOwnership, ownershipDigest, sessionCreateBodyHash, rotationSha256, sharedMachineRotationFixture, OwnershipCallerBindingSchema } from '@slopus/happy-wire';
 import type { Metadata } from '@/api/types';
 import type { TrackedSession } from './types';
-import { createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship } from './ownedSpawnRuntime';
+import { createOwnedSpawnRuntime, createOwnedStartGuard, ownedSessionAuthorship, readOwnedSpawnPrincipal } from './ownedSpawnRuntime';
 import { registerOwnedSpawnRpc } from './ownedSpawnRpc';
 import { createOwnedSpawnJournal } from './ownedSpawnJournal';
 import { ownedSpawnRecordSchema } from './ownedSpawn';
@@ -29,6 +31,7 @@ async function fixture(options: { parent?: string; spawn?: Record<string, unknow
     let lastStart: unknown;
     const fetcher = vi.fn(async (url: string | URL | Request, options?: RequestInit) => {
         if (String(url).endsWith('/v1/account/profile')) return Response.json({ id: 'account' });
+        if (String(url).endsWith('/v1/machines/machine')) return Response.json({ machine: { id: 'machine', accountId: 'account' } });
         if (String(url).includes('/v2/sessions')) return Response.json({ sessions: raw ? [raw] : [], hasNext: false, nextCursor: null });
         expect(String(url)).toBe('https://happy.test/v1/sessions'); posts++;
         const body = JSON.parse(String(options?.body));
@@ -61,11 +64,53 @@ async function fixture(options: { parent?: string; spawn?: Record<string, unknow
         proof: (p: { sessionCreateBodyHash: string; sessionTagHash: string }) => signOwnership({ ...signed, ...scope, type: 'saycode-session-ownership',
             nonce: Buffer.alloc(32, 1).toString('base64url'), createBodyHash: p.sessionCreateBodyHash, tagHash: p.sessionTagHash }, keys.secretKey) };
 }
+it.each([
+    ['registered', 200, 'machine', 'account'],
+    ['absent', 404, 'machine', 'account'],
+    ['wrong machine', 200, 'different-machine', 'account'],
+    ['wrong account', 200, 'machine', 'different-account'],
+    ['changed local credential', 200, 'machine', 'account'],
+    ['changed local machine', 200, 'machine', 'account'],
+] as const)('verifies account-authenticated daemon registration: %s', async (scenario, status, machineId, accountId) => {
+    let state = { machineId: 'machine', epoch: 'registration', credentials: { token: 'synthetic-machine-bearer',
+        encryption: { type: 'legacy' as const, secret: new Uint8Array(32) } } };
+    const requests: Record<string, string | undefined> = {};
+    const server = createServer((request, response) => {
+        const path = request.url ?? '/';
+        requests[path] = request.headers.authorization;
+        if (path === '/v1/machines/machine') {
+            if (scenario === 'changed local credential') state = { ...state, credentials: { ...state.credentials, token: 'replaced' } };
+            if (scenario === 'changed local machine') state = { ...state, machineId: 'replaced' };
+            response.writeHead(status, { 'content-type': 'application/json' });
+            response.end(JSON.stringify({ machine: { id: machineId, accountId } }));
+            return;
+        }
+        response.writeHead(path === '/v1/account/profile' ? 200 : 404, { 'content-type': 'application/json' });
+        response.end(JSON.stringify({ id: 'account' }));
+    }).listen(0, '127.0.0.1');
+    try {
+        await once(server, 'listening');
+        const address = server.address();
+        if (!address || typeof address === 'string') throw new Error('missing test server address');
+        const read = readOwnedSpawnPrincipal('http://127.0.0.1:' + address.port, async () => state);
+        if (scenario === 'registered') {
+            await expect(read).resolves.toEqual({ machineId: 'machine', happyAccountId: 'account', epoch: 'registration' });
+            expect(requests).toEqual({ '/v1/machines/machine': 'Bearer synthetic-machine-bearer',
+                '/v1/account/profile': 'Bearer synthetic-machine-bearer' });
+        } else {
+            await expect(read).rejects.toThrow('identity-changed');
+        }
+    } finally {
+        server.closeAllConnections();
+        await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    }
+});
+
 it('transports the signed snapshot through encrypted machine RPC and answers a mock main nonce verifier from live launch state', async () => {
     const f = await fixture(), runtime = f.build(), handlers = new Map<string, (raw: unknown) => Promise<any>>();
     registerOwnedSpawnRpc((name, handler) => handlers.set(name, handler), runtime);
     const rpc = (name: string, body: unknown) => handlers.get(name)!(body);
-    expect(await rpc('owned-spawn-capabilities', { spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true });
+    expect(await rpc('owned-spawn-capabilities', { spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true });
     const p = await rpc('prepare-owned-spawn', { intent: f.intent, spawn: f.spawn });
     const c = await rpc('commit-owned-spawn', { creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof(p) });
     expect(c).toMatchObject({ sessionId: 'session', ownershipOutcome: 'pending' });
@@ -270,11 +315,11 @@ describe('owned child host custody (T1c-b2 H3)', () => {
     });
     it('advertises owned-child contact separately from owned spawn and only for a supported spawn', async () => {
         const f = await fixture();
-        expect(await f.build({ launchCallers: hostCallers() }).capabilities({ spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true, ownedChildOwnerContactV1: true });
+        expect(await f.build({ launchCallers: hostCallers() }).capabilities({ spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true, ownedChildOwnerContactV1: true });
         expect(await f.build({ launchCallers: hostCallers() }).capabilities({ spawn: { ...f.spawn, agent: 'gemini' } }))
             .toEqual({ ownedSpawnPrepareV1: false, ownedChildOwnerContactV1: false });
         // Switch off or contact unconfigured: exactly the existing answer.
-        expect(await f.build({ launchCallers: hostCallers(false) }).capabilities({ spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true });
+        expect(await f.build({ launchCallers: hostCallers(false) }).capabilities({ spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true });
     });
     it('keeps the existing daemon-held binding when owner contact is unavailable', async () => {
         const f = await fixture(), hosts = hostCallers(false), runtime = f.build({ launchCallers: hosts });
@@ -427,7 +472,7 @@ describe('owned spawn carries the fields Desktop actually sends (T4RT-03)', () =
         const f = await fixture({ spawn: desktopSpawn }), runtime = f.build(), handlers = new Map<string, (raw: unknown) => Promise<any>>();
         registerOwnedSpawnRpc((name, handler) => handlers.set(name, handler), runtime);
         const rpc = (name: string, body: unknown) => handlers.get(name)!(body);
-        expect(await rpc('owned-spawn-capabilities', { spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true });
+        expect(await rpc('owned-spawn-capabilities', { spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true });
         const p = await rpc('prepare-owned-spawn', { intent: f.intent, spawn: desktopSpawn });
         await rpc('commit-owned-spawn', { creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof(p) });
         await rpc('start-owned-spawn', { creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' });
@@ -457,15 +502,15 @@ describe('owned spawn carries the fields Desktop actually sends (T4RT-03)', () =
 
     it('drops a malformed session source as the legacy RPC does, without refusing the spawn', async () => {
         const f = await fixture();
-        expect(await f.build().capabilities({ spawn: { ...desktopSpawn, sessionSource: 'Not A Source!' } })).toEqual({ ownedSpawnPrepareV1: true });
+        expect(await f.build().capabilities({ spawn: { ...desktopSpawn, sessionSource: 'Not A Source!' } })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true });
     });
 
     it('offers owned creation on a daemon whose only ownership trust is the pinned table (D5)', async () => {
         const f = await fixture(), env = ownershipTrustEnv({}, 'https://happy.test', { 'https://happy.test': f.trust });
         expect(await f.build({ env: {} }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: false });
-        expect(await f.build({ env }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true });
+        expect(await f.build({ env }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true });
         // Trust is not the owner-contact switch: without host callers the child-contact capability stays absent.
-        expect(await f.build({ env, launchCallers: hostCallers(false) }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true });
+        expect(await f.build({ env, launchCallers: hostCallers(false) }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true });
     });
 
     it('verifies an intent with the pinned key and refuses one the table does not pin (D5)', async () => {
