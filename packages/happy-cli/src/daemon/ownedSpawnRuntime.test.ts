@@ -383,6 +383,29 @@ describe('custody fixed at start survives trust changes (H3-R1-01)', () => {
         expect(f.counts()).toEqual({ posts: 1, starts: 1 });
     });
 });
+describe('the related-project directory report survives a start confirmed later (PR #1338 review)', () => {
+    const report = { version: 1, accepted: ['/related/a'], skipped: { missing: 1 } };
+    const withDirectories = () => fixture({ spawn: { directory: '/project', agent: 'codex', additionalDirectories: ['/related/a', '/related/b'] },
+        startExtra: { additionalDirectories: report } });
+    it('host custody: a child binding that arrives after the start is recovered through status with the report', async () => {
+        const f = await withDirectories(), hosts = hostCallers(), runtime = f.build({ launchCallers: hosts, hostBindingWaitMs: 0 });
+        const start = await createdSession(f, runtime);
+        expect(await runtime.start(start)).toMatchObject({ state: 'starting' });
+        hosts.callers.set('session', hostCaller({ sessionId: 'session' }));
+        expect(await runtime.status({ creationRequestId: 'creation' })).toMatchObject({ state: 'started', additionalDirectories: report });
+        expect(await f.journal.read('creation')).toMatchObject({ state: 'started', additionalDirectories: report });
+        expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+    });
+    it('daemon custody: a session not yet live at start is recovered after a daemon restart with the report', async () => {
+        const f = await withDirectories(), runtime = f.build();
+        const start = await createdSession(f, runtime);
+        f.setAlive(false);
+        expect(await runtime.start(start)).toMatchObject({ state: 'starting' });
+        f.setAlive(true);
+        expect(await f.build().status({ creationRequestId: 'creation' })).toMatchObject({ state: 'started', additionalDirectories: report });
+        expect(f.counts()).toEqual({ posts: 1, starts: 1 });
+    });
+});
 describe('host custody launches skip tmux (H3-R1-02)', () => {
     it('an owned start with TMUX_SESSION_NAME is a pipe launch and reaches started with its own binding', async () => {
         const spawn = { directory: '/project', agent: 'codex', environmentVariables: { TMUX_SESSION_NAME: 'work' } };
