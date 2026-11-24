@@ -1832,7 +1832,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             workspaceTitleObserved = true;
             void runtimeGate.admit(() => offTurnTitle.settled(), 'writer').catch(() => logger.warn('[workspace-context] Title writer unconfirmed'));
         }
-        if (!coveredTitle) {
+        // An app session (aplus agent-app-api T5) has no chat to title: the nudge would reach the end user's answer.
+        if (!coveredTitle && !appProfile) {
             const withTitle = appendTitleInstruction(pushText);
             if (withTitle !== pushText) {
                 pushText = withTitle;
@@ -1955,7 +1956,8 @@ export async function runClaude(principal: RunnerPrincipal, options: StartOption
             : {}),
         sink: {
             sessionId: session.sessionId,
-            hasTitle: () => session.hasTitle(),
+            // An app session has no chat to title, so its first prompt gets no title nudge either (aplus agent-app-api T5).
+            hasTitle: () => appProfile !== undefined || session.hasTitle(),
             sendClaudeSessionMessage: (record, localId) => session.sendClaudeSessionMessage(record, localId),
             recordAppPrompt,
             pushPrompt: (text) => {

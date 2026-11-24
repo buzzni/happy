@@ -2250,6 +2250,28 @@ describe('runClaude remote JSONL scanner', () => {
         await harness.finish();
     });
 
+    // aplus-dev-studio specs/agent-app-api T5 — an app session answers a public end user and has no chat to title;
+    // the nudge is user-turn text, so the profile's system prompt does not cover it.
+    it('appends no change_title instruction to an app-profile session and hands the profile to the loop', async () => {
+        process.env.HAPPY_AUTOMATION_RUN_ONCE = '1';
+        process.env.HAPPY_INITIAL_PROMPT = '운동화 추천해줘';
+        process.env.HAPPY_INITIAL_APP_PROFILE = JSON.stringify({ version: 1, mcpServers: ['shopping'], systemPrompt: '너는 쇼핑 도우미다.' });
+        const harness = await startRemoteRunClaudeHarness();
+        expect(harness.loopOptions.appProfile).toEqual({ version: 1, mcpServers: ['shopping'], systemPrompt: '너는 쇼핑 도우미다.' });
+        harness.sessionClient.hasTitle.mockReturnValue(false);
+        await vi.waitFor(() => {
+            expect(harness.sessionClient.onUserMessage).toHaveBeenCalled();
+        });
+        const userMessageHandler = harness.sessionClient.onUserMessage.mock.calls[0][0];
+
+        await userMessageHandler({ content: { text: '러닝화 추천해줘' }, meta: {} });
+
+        const queued = harness.loopOptions.messageQueue.queue;
+        expect(queued.length).toBeGreaterThan(0);
+        for (const entry of queued) expect(entry.message).not.toContain(TITLE_INSTRUCTION);
+        await harness.finish();
+    });
+
     it('exposes the latest Saycode prompt policy to local mode transitions', async () => {
         const harness = await startRemoteRunClaudeHarness();
         await vi.waitFor(() => {
