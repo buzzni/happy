@@ -4,13 +4,15 @@ function setup() {
  let now=1000000,online=true,active=true
  let rows:any[]=[{accountRef:'ref',credentialGeneration:1,scope:'personal',enabled:false,ackCost:false,credentialType:'setup_token',eligibility:'disabled',budget:{remaining:96,machineRemaining:288,retryAt:null}}]
  const collect=vi.fn(async(_row:any,_signal:AbortSignal)=>{})
- const scheduler=createPersonalProbeScheduler({now:()=>now,online:()=>online,inUse:()=>active,roster:async()=>rows,collect})
- return {scheduler,collect,rows,advance:(n:number)=>{now+=n},offline:()=>{online=false},inactive:()=>{active=false},replace:()=>{rows=[{...rows[0],credentialGeneration:2}]}}
+ const roster=vi.fn(async()=>rows)
+ const scheduler=createPersonalProbeScheduler({now:()=>now,online:()=>online,inUse:()=>active,roster,collect})
+ return {scheduler,collect,rows,reads:()=>roster.mock.calls.length,advance:(n:number)=>{now+=n},offline:()=>{online=false},inactive:()=>{active=false},active:()=>{active=true},replace:()=>{rows=[{...rows[0],credentialGeneration:2}]}}
 }
 describe('resident personal scheduler',()=>{
  it('defaults off, requires online Claude use, and waits15min between starts',async()=>{
   const s=setup();await s.scheduler.tick();expect(s.collect).not.toHaveBeenCalled()
-  Object.assign(s.rows[0],{enabled:true,ackCost:true,eligibility:'eligible'})
+  // Consent goes through the runtime, which invalidates the roster it read.
+  Object.assign(s.rows[0],{enabled:true,ackCost:true,eligibility:'eligible'});s.scheduler.invalidate()
   await s.scheduler.tick();await Promise.resolve();expect(s.collect).toHaveBeenCalledTimes(1)
   s.advance(899999);await s.scheduler.tick();expect(s.collect).toHaveBeenCalledTimes(1)
   s.advance(1);await s.scheduler.tick();expect(s.collect).toHaveBeenCalledTimes(2)
@@ -32,14 +34,37 @@ describe('resident personal scheduler',()=>{
  it('never collects managed, budget exhausted or backing-off rows and serializes candidates',async()=>{
   const s=setup();Object.assign(s.rows[0],{enabled:true,ackCost:true,eligibility:'eligible',scope:'organization'})
   await s.scheduler.tick();expect(s.collect).not.toHaveBeenCalled()
-  s.rows[0].scope='personal';s.rows[0].budget.remaining=0
+  s.rows[0].scope='personal';s.rows[0].budget.remaining=0;s.scheduler.invalidate()
   await s.scheduler.tick();expect(s.collect).not.toHaveBeenCalled()
-  s.rows[0].budget.remaining=96;s.rows[0].budget.retryAt=2000000
+  s.rows[0].budget.remaining=96;s.rows[0].budget.retryAt=2000000;s.scheduler.invalidate()
   await s.scheduler.tick();expect(s.collect).not.toHaveBeenCalled()
-  s.rows[0].budget.retryAt=null;s.rows.push({...s.rows[0],accountRef:'other'})
+  s.rows[0].budget.retryAt=null;s.rows.push({...s.rows[0],accountRef:'other'});s.scheduler.invalidate()
   let finish!:()=>void;s.collect.mockImplementation(async()=>new Promise<void>(resolve=>finish=resolve))
   await s.scheduler.tick();await s.scheduler.tick();expect(s.collect).toHaveBeenCalledTimes(1)
   finish();await Promise.resolve();await Promise.resolve();await s.scheduler.tick();expect(s.collect).toHaveBeenCalledTimes(2)
+ })
+ // 2026-11-24: the daemon ticks every 5s while Claude is in use, and each roster read starts cswap (Python) twice. With no
+ // personal probe consented that was ~24 Python starts a minute for nothing.
+ it('reuses a roster read: ten minutes while no personal probe can run, one minute while one can',async()=>{
+  const s=setup()
+  for(let i=0;i<12;i++){await s.scheduler.tick();s.advance(5000)}
+  expect(s.reads()).toBe(1)
+  s.advance(600000);await s.scheduler.tick();expect(s.reads()).toBe(2)
+  // Consented, but its budget is spent: nothing starts, the roster is read once a minute.
+  Object.assign(s.rows[0],{enabled:true,ackCost:true,eligibility:'eligible',budget:{...s.rows[0].budget,remaining:0}});s.scheduler.invalidate()
+  await s.scheduler.tick();expect(s.reads()).toBe(3)
+  s.advance(59999);await s.scheduler.tick();expect(s.reads()).toBe(3)
+  s.advance(1);await s.scheduler.tick();expect(s.reads()).toBe(4)
+  expect(s.collect).not.toHaveBeenCalled()
+ })
+ it('reads again after invalidation, when Claude use starts again, and on every tick of a running collect',async()=>{
+  const s=setup();await s.scheduler.tick();await s.scheduler.tick();expect(s.reads()).toBe(1)
+  s.scheduler.invalidate();await s.scheduler.tick();expect(s.reads()).toBe(2)
+  s.inactive();await s.scheduler.tick();s.active();await s.scheduler.tick();expect(s.reads()).toBe(3)
+  Object.assign(s.rows[0],{enabled:true,ackCost:true,eligibility:'eligible'});s.scheduler.invalidate()
+  s.collect.mockImplementation(async(_row,abort)=>new Promise<void>(resolve=>abort.addEventListener('abort',()=>resolve())))
+  await s.scheduler.tick();await s.scheduler.tick();await s.scheduler.tick();expect(s.reads()).toBe(6)
+  s.scheduler.close()
  })
 })
 

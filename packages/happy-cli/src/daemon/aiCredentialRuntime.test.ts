@@ -3942,6 +3942,28 @@ describe('resident personal runtime wiring',()=>{
   expect(aborted).toBe(true)
   runtime.stopPersonalScheduler()
  })
+ // 2026-11-24: the 5s tick reuses the roster (each read starts cswap twice); a consent is still read on the next tick.
+ it('reuses the roster across ticks and rereads it on the tick after a consent',async()=>{
+  const ref='11111111-1111-4111-8111-111111111111';let enabled=false
+  const row=()=>({accountRef:ref,credentialGeneration:1,number:1,roster:{email:'personal@token.local',organizationUuid:'',uuid:''},credentialType:'setup_token',probeEnabled:enabled,authState:'usable',usageStatus:'partial',reasonCodes:['coverage_unknown'],probeBudget:{scope:'local-per-token',accountUsed24h:0,accountLimit24h:96,accountRemaining24h:96,nextProbeAt:null,failureStreak:0,minIntervalSeconds:300,recommendedIntervalSeconds:900}})
+  const invoke=vi.fn(async(_command:string,args:string[])=>{
+   if(args[1]==='capabilities')return {stdout:JSON.stringify({artifact:'saycode-setup-token-runtime-v1',setupTokenObservation:true,durableProbeBudget:true,personalProbeVersion:1}),stderr:''}
+   if(args[1]==='status')return {stdout:JSON.stringify({accounts:[row()],budget:{machineUsed24h:0,machineLimit24h:288,machineRemaining24h:288,machineSlotFreesAt:null,accountLimit24h:96}}),stderr:''}
+   if(args[1]==='consent'){enabled=true;return {stdout:'{}',stderr:''}}
+   return {stdout:'{}',stderr:''}
+  })
+  const reads=()=>invoke.mock.calls.filter(([,args])=>args[1]==='status').length
+  const {runtime}=setup({execFile:invoke,now:()=>1000000})
+  try {
+   for(let i=0;i<3;i++)await runtime.personalSchedulerTick({online:true,inUse:true})
+   expect(reads()).toBe(1)
+   await runtime.tokenProbe({version:1,operation:'consent',accountRef:ref,credentialGeneration:1,enabled:true,ackCost:true})
+   const afterConsent=reads()
+   await runtime.personalSchedulerTick({online:true,inUse:true})
+   expect(reads()).toBe(afterConsent+1)
+   await vi.waitFor(()=>expect(invoke.mock.calls.some(([,args])=>args[1]==='collect')).toBe(true))
+  } finally { runtime.stopPersonalScheduler() }
+ })
  it('cancels a native command without returning buffered output',async()=>{
   const controller=new AbortController()
   const pending=runAiCredentialCommand(process.execPath,['-e','process.stdout.write("private"); setInterval(()=>{},1000)'],{signal:controller.signal,timeoutMs:5000})
