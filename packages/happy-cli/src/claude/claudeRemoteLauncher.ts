@@ -1776,6 +1776,7 @@ export async function claudeRemoteLauncher(session: Session): Promise<'switch' |
                     onMessage,
                     onUsageTranscriptLocation: (projectDir, nativeId) => session.client.setClaudeUsageTranscript?.(projectDir, nativeId),
                     onAiAuthObservationReady: (observation) => { aiAuthObservation = observation; },
+                    onAiPlanTierSourceReady: (source) => session.client.setAiPlanTierSource?.(source),
                     onStreamEvent: (message) => {
                         transientRetry.observe(message);
                         session.client.noteClaudeStreamEvent?.(message);

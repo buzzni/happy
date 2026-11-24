@@ -77,6 +77,7 @@ export function createOfflineSessionStub(sessionTag: string): ApiSessionClient {
         sendAgentMessage: () => {},
         sendClaudeSessionMessage: () => {},
         sendProviderUsageEvent: () => {},
+        setAiPlanTierSource: () => {},
         sendSessionProtocolMessage: () => {},
         keepAlive: () => {},
         // No runtime report leaves the stub; after the swap the next sub-agent list marks the real session.

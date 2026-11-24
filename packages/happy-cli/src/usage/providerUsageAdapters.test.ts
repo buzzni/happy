@@ -106,6 +106,19 @@ describe('createCodexUsageEvent', () => {
         });
     });
 
+    it('carries the reported login plan, and omits it when unknown (aplus specs/org-member-ai-plan-usage)', () => {
+        const usage = {
+            totalTokens: 15, inputTokens: 10, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 0,
+        };
+        const base = { sessionId: 's', responseId: 'r', occurredAt: 1, model: 'gpt-5.5', usage };
+        expect(createCodexUsageEvent({ ...base, planTier: 'chatgpt:pro' }).planTier).toBe('chatgpt:pro');
+        expect('planTier' in createCodexUsageEvent({ ...base, planTier: null })).toBe(false);
+        expect('planTier' in createCodexUsageEvent(base)).toBe(false);
+        const rateLimits = { fiveHour: { usedPercent: 20, resetsAt: null } };
+        expect(createCodexUsageEvent({ ...base, rateLimits }).rateLimits).toEqual(rateLimits);
+        expect('rateLimits' in createCodexUsageEvent({ ...base, rateLimits: null })).toBe(false);
+    });
+
     it('rejects an invalid provider total instead of silently changing it', () => {
         expect(() => createCodexUsageEvent({
             sessionId: 'happy-session-2',

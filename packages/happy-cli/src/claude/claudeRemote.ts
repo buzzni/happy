@@ -62,6 +62,8 @@ import { randomUUID } from 'node:crypto';
 import type { ContentBlockParam } from '@anthropic-ai/sdk/resources';
 import { managedSettingSources } from '@/managed/managedStartup';
 import { observeClaudeQueryAuth, type ClaudeAuthObservation } from './aiAuthObservation';
+import { observeClaudeQueryPlanTier } from './aiPlanTierObservation';
+import type { AiPlanTierSource } from '@/usage/aiPlanTier';
 import type { LessonReviewWorker } from '@/memory/lessonReviewWorker';
 import type { LessonTurnKind } from '@/memory/lessonTurnEvidence';
 import {
@@ -261,6 +263,11 @@ export async function claudeRemote(opts: {
      * source the envelope already decided.
      */
     onAiAuthObservationReady?: (observation: ClaudeAuthObservation | null) => void,
+    /**
+     * This run's login plan tier (src/claude/aiPlanTierObservation.ts), then `null` once the
+     * run is over. Not started for a managed run, like the auth observation.
+     */
+    onAiPlanTierSourceReady?: (source: AiPlanTierSource | null) => void,
     exitAfterFirstTurn?: boolean,
     /** Session-scoped structured output (specs/claude-cli-benchmark-followups R2); every query of the session carries it. */
     outputFormat?: ClaudeOutputFormat,
@@ -937,6 +944,10 @@ function readTurnText(content: unknown): string {
         ? observeClaudeQueryAuth(response)
         : null;
     if (aiAuthObservation) opts.onAiAuthObservationReady?.(aiAuthObservation);
+    const aiPlanTierSource = opts.onAiPlanTierSourceReady && opts.managedRun !== true
+        ? observeClaudeQueryPlanTier(response)
+        : null;
+    if (aiPlanTierSource) opts.onAiPlanTierSourceReady?.(aiPlanTierSource);
     try {
         logger.debug(`[claudeRemote] Starting to iterate over response`);
 
@@ -1428,6 +1439,7 @@ function readTurnText(content: unknown): string {
             aiAuthObservation.dispose();
             opts.onAiAuthObservationReady?.(null);
         }
+        if (aiPlanTierSource) opts.onAiPlanTierSourceReady?.(null);
         opts.lessonProposalTurn?.cancel();
         opts.signal?.removeEventListener('abort', cancelProposal);
         queryClosed = true;

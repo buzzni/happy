@@ -81,6 +81,9 @@ import packageJson from '../../package.json';
 import { resolveCodexSandboxPolicy } from './executionPolicy';
 import { CodexAuthRecoveryError, type CodexAuthCheck, type CodexAuthSource } from './codexAuthRecovery';
 import { sanitizeChildEnv } from '@/utils/childEnv';
+import { codexPlanTier } from '@/usage/aiPlanTier';
+import { codexRateLimits } from '@/usage/aiRateLimits';
+import type { UsageRateLimitsV1 } from '@slopus/happy-wire';
 
 type PendingRequest = {
     resolve: (result: unknown) => void;
@@ -296,6 +299,10 @@ export class CodexAppServerClient {
     private shutdownInputFrozen = false;
     private disconnectRevision = 0;
     private initializedEpoch = -1;
+    /** aplus specs/org-member-ai-plan-usage — the ChatGPT plan this app-server last reported for its login. */
+    private reportedPlanTier: string | null = null;
+    /** P10 — the five-hour and weekly windows this app-server last reported. */
+    private reportedRateLimits: UsageRateLimitsV1 | null = null;
     private reconnecting = 0;
     private shutdownObservationFinished = false;
     private disconnectOperation: { key: string; promise: Promise<void> } | null = null;
@@ -1311,6 +1318,9 @@ export class CodexAppServerClient {
         this.assertInputOpen();
         if ((this.outputFailed && this.process) || (!this.connected && !this.outputSettled)) throw new Error('Codex output must drain before reconnect');
         if (this.connected) return;
+        // A new app-server may run another login; nothing it has not reported yet is known.
+        this.reportedPlanTier = null;
+        this.reportedRateLimits = null;
 
         if (this.multiAuthProxy || this.multiAuthProxyCleanup) {
             await this.cleanupMultiAuthProxy();
@@ -2511,6 +2521,37 @@ export class CodexAppServerClient {
         return process.env.CODEX_HOME ? 'custom-home' : 'cli-login';
     }
 
+    /**
+     * The run login's ChatGPT plan (`chatgpt:plus`), read from the account notifications Codex
+     * already sends — never an extra request. A rotation proxy or a managed/plan provider picks
+     * the payer itself, so those report nothing.
+     */
+    get aiPlanTier(): string | null {
+        return this.reportsOwnLogin() ? this.reportedPlanTier : null;
+    }
+
+    /** The run login's windows from the same notifications, under the same rule as `aiPlanTier`. */
+    get aiRateLimits(): UsageRateLimitsV1 | null {
+        return this.reportsOwnLogin() ? this.reportedRateLimits : null;
+    }
+
+    private reportsOwnLogin(): boolean {
+        const source = this.authRecoverySource;
+        return source === 'cli-login' || source === 'custom-home';
+    }
+
+    private observeAccountPlan(method: string, params: any): void {
+        if (method === 'account/updated') {
+            this.reportedPlanTier = params?.authMode === 'chatgpt'
+                ? codexPlanTier({ type: 'chatgpt', planType: params?.planType })
+                : null;
+        } else if (method === 'account/rateLimits/updated') {
+            // A snapshot without a plan (API-key usage) leaves the login's plan as last reported.
+            this.reportedPlanTier = codexPlanTier({ type: 'chatgpt', planType: params?.rateLimits?.planType }) ?? this.reportedPlanTier;
+            this.reportedRateLimits = codexRateLimits(params?.rateLimits) ?? this.reportedRateLimits;
+        }
+    }
+
     get authRecoveryBusy(): boolean {
         // Display-only project RPCs can be abandoned when explicit recovery replaces the process.
         const pendingControl = [...this.pending.values()].some(request =>
@@ -3482,6 +3523,7 @@ export class CodexAppServerClient {
     }
 
     private handleNotification(method: string, params: any): void {
+        this.observeAccountPlan(method, params);
         if (method === 'serverRequest/resolved') {
             const request = this.userInputRequests.get(params?.requestId);
             if (request && request.threadId === params?.threadId) {

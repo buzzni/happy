@@ -23,7 +23,7 @@ import { buildInitialPromptUserRecord } from '@/utils/initialPrompt';
 import { decodeBase64, decrypt, decryptBlob, encodeBase64, encrypt } from './encryption';
 import type { Metadata, Update } from './types';
 import { logger } from '@/ui/logger';
-import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
+import { createClaudeUsageEvent, createCodexUsageEvent } from '@/usage/providerUsageAdapters';
 import { RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
@@ -1779,6 +1779,54 @@ describe('ApiSessionClient v3 messages API migration', () => {
                 ['test-session-id:anthropic:msg-stream', 0],
                 ['test-session-id:anthropic:turn:zero-result', 9],
             ]);
+            await client.close();
+        });
+    });
+
+    describe('plan tier stamping (aplus specs/org-member-ai-plan-usage P1)', () => {
+        const usageEvent = () => createCodexUsageEvent({
+            sessionId: 'test-session-id', responseId: 'plan-1', occurredAt: 1_788_000_000_000, model: 'gpt-test',
+            usage: { totalTokens: 15, inputTokens: 10, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 0 },
+        });
+        const sentEvents = (): Record<string, unknown>[] => mockSocket.emit.mock.calls
+            .filter(([name]: [string]) => name === 'provider-usage-report')
+            .map(([, event]: [string, Record<string, unknown>]) => event);
+
+        it('stamps the run plan tier for the event provider', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            client.setAiPlanTierSource({ current: (provider) => (provider === 'openai' ? 'chatgpt:plus' : null) });
+            client.sendProviderUsageEvent(usageEvent());
+            expect(sentEvents()[0]).toMatchObject({ planTier: 'chatgpt:plus' });
+            await client.close();
+        });
+
+        it('stamps a Claude event with the windows the session already holds (P10)', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            (client as unknown as { agentState: unknown }).agentState = {
+                usageLimits: { capturedAt: 1, windows: [{ id: 'five_hour', utilization: 72, resetsAt: '2026-11-24T05:00:00.000Z' }] },
+            };
+            client.sendProviderUsageEvent(createClaudeUsageEvent({
+                sessionId: 'test-session-id', occurredAt: 1_788_000_000_000, messageId: 'rl-1', transcriptUuid: 'rl-1',
+                model: 'claude-test', usage: { input_tokens: 10, output_tokens: 5 }, env: {},
+            }));
+            expect(sentEvents()[0]).toMatchObject({
+                rateLimits: { fiveHour: { usedPercent: 72, resetsAt: Date.parse('2026-11-24T05:00:00.000Z') } },
+            });
+            await client.close();
+        });
+
+        it('leaves the event exactly as an older CLI sends it when no plan is known', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            client.setAiPlanTierSource({ current: () => null });
+            client.sendProviderUsageEvent(usageEvent());
+            client.setAiPlanTierSource(null);
+            client.sendProviderUsageEvent(createCodexUsageEvent({
+                sessionId: 'test-session-id', responseId: 'plan-2', occurredAt: 1_788_000_000_000, model: 'gpt-test',
+                usage: { totalTokens: 15, inputTokens: 10, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 0 },
+            }));
+            expect(sentEvents().map((event) => 'planTier' in event)).toEqual([false, false]);
+            // A Codex event never takes Claude's session windows.
+            expect(sentEvents().map((event) => 'rateLimits' in event)).toEqual([false, false]);
             await client.close();
         });
     });
