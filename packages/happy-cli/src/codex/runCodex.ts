@@ -30,6 +30,8 @@ import { MANAGED_STOP_CLEAN } from '@/managed/managedControlChannel';
 const CODEX_END_INPUT_BUDGET_MS = 10_000;
 import React from "react";
 import { ApiClient } from '@/api/api';
+import { openWorkMachineSessionCredentials } from '@/daemon/workMachineCredential';
+import { startsNewWorkMachineConversation } from '@/daemon/workMachineNewSession';
 import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidenceOption } from '@/utils/inputEvidenceSettings';
 import { CodexAppServerClient } from './codexAppServerClient';
 import { describeCodexFailure, describeCodexInactivityAbort } from './codexAbortNotice';
@@ -318,12 +320,13 @@ export async function runCodex(opts: {
     });
     const allowAutomationReconnectPrompt = process.env.HAPPY_AUTOMATION_RESUME_PROMPT === '1';
     delete process.env.HAPPY_AUTOMATION_RESUME_PROMPT;
+    const freshLaunch = consumeReconnectFreshLaunch(process.env);
     const preparedInitialPrompt = prepareCodexInitialPrompt({
         env: process.env,
         reconnectSessionId,
         automationRunOnceRequested,
         allowAutomationReconnectPrompt,
-        freshLaunch: consumeReconnectFreshLaunch(process.env),
+        freshLaunch,
     });
 
     // Early check: ensure Codex CLI is installed before proceeding
@@ -352,7 +355,10 @@ export async function runCodex(opts: {
     // Set backend for offline warnings (before any API calls)
     connectionState.setBackend('Codex');
 
-    const api = opts.principal.kind === 'managed'
+    const workMachine = opts.principal.kind === 'account' && await openWorkMachineSessionCredentials(
+        configuration.happyHomeDir, configuration.serverUrl, reconnectSessionId,
+    );
+    const api = workMachine ? ApiClient.workMachineSession(workMachine) : opts.principal.kind === 'managed'
         ? ApiClient.managed(opts.principal.startup.attachment)
         : await ApiClient.create(opts.principal.credentials);
 
@@ -386,7 +392,7 @@ export async function runCodex(opts: {
     logger.debug(`Using machineId: ${machineId}`);
     // A managed child has no machine of its own; the runtime it runs inside is
     // the registered thing.
-    if (!managedStartup) {
+    if (!managedStartup && !workMachine) {
         await api.getOrCreateMachine({
             machineId: requireAccountMachineId(machineId),
             metadata: initialMachineMetadata
@@ -435,6 +441,17 @@ export async function runCodex(opts: {
     const inputEvidenceEnabled = resolveInputEvidenceOption(inputEvidenceOption, reconnectSession?.metadata);
     const metadata = inputEvidenceMetadata(mergeReconnectSessionMetadata(reconnectSession?.metadata, freshMetadata), inputEvidenceEnabled);
 
+    if (workMachine) {
+        const threadId = reconnectSession?.metadata?.codexThreadId;
+        // A conversation the daemon just created has no thread yet; every other one resumes its own.
+        if (startsNewWorkMachineConversation(freshLaunch, threadId) ? opts.resumeThreadId !== undefined
+            : !threadId || opts.resumeThreadId !== threadId) {
+            throw new Error('WORK_MACHINE_CODEX_THREAD_UNAVAILABLE');
+        }
+        // Without a prompt to run now, the first turn asks for its own permit (ApiSessionClient).
+        await api.permitWorkMachineSessionExecution(preparedInitialPrompt.prompt === null ? { start: true } : {});
+    }
+
     let response: ApiSession | null;
     if (managedStartup) {
         // Looked up, proven against the key this process holds, and placed on
@@ -477,7 +494,8 @@ export async function runCodex(opts: {
             env: process.env,
             checkpointEvents: sandboxConfig?.checkpointProtection
                 ? createCheckpointEventPublisher({
-                    token: requireAccountToken(accountToken),
+                    // A protected conversation posts with its own session credential; the server refuses the account token there.
+                    token: api.workMachineMcpProof()?.token ?? requireAccountToken(accountToken),
                     sessionId: response.id,
                     encryption: {
                         encryptionKey: response.encryptionKey,
@@ -2202,10 +2220,11 @@ export async function runCodex(opts: {
     const bridgeEntrypoint = join(projectPath(), 'bin', 'happy-mcp.mjs');
     // Account-only: the aplus MCP config belongs to a user, and a managed run
     // has none. Skipped rather than attempted with a scoped bearer.
+    const workMachineExecution = workMachine ? api.workMachineMcpProof() : undefined;
     const initialAplusMcpSnapshot = accountToken === null ? null : await fetchAplusMcpConfigSnapshot(
         accountToken,
         requireAccountMachineId(machineId),
-        { sessionId: session.sessionId, ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) },
+        { sessionId: session.sessionId, workMachineExecution, ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) },
     );
     // R10.1: before the first turn — the session stops advertising bypass under a ceiling below it.
     const dangerouslySkipPermissions = initialPermissionMode === 'yolo' || initialPermissionMode === 'bypassPermissions';
@@ -2317,6 +2336,7 @@ export async function runCodex(opts: {
         ? () => {}
         : startMcpCallerGrantRefreshTimer(() => refreshMcpCallerGrantIfExpiring(accountToken, grantMachineId, {
             sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined,
+            workMachineExecution,
         }));
     // 체인 상한(7일) 등으로 더는 교환할 수 없게 되면 한 번 알린다. 대화를 다시 시작하면 새 grant 를 받는다.
     const stopCallerGrantExpiryNotice = onMcpCallerGrantExpired(() => {
@@ -2330,11 +2350,11 @@ export async function runCodex(opts: {
             // 조회 직전에 교환해야 새 grant 로 조회된다. 24시간을 넘겨 사는
             // 세션이 403 으로 마지막 정상 설정에 갇히는 것을 막는다.
             const account = requireAccountMachineId(machineId);
-            await refreshMcpCallerGrantIfExpiring(requireAccountToken(accountToken), account, { sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined });
+            await refreshMcpCallerGrantIfExpiring(requireAccountToken(accountToken), account, { sessionId: readLessonOwner() === 'host' ? session.sessionId : undefined, workMachineExecution });
             const result = await fetchAplusMcpServersResult(
                 requireAccountToken(accountToken),
                 account,
-                { sessionId: session.sessionId, lifecycle: 'turn', ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) },
+                { sessionId: session.sessionId, lifecycle: 'turn', workMachineExecution, ...(orgGate ? { onRequirements: orgGate.onRequirements } : {}) },
             );
             configStatuses = mcpConfigFailureStatuses(result);
             return result;

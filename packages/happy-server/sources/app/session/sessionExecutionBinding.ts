@@ -9,6 +9,7 @@ import {
 import { inTx, afterTx } from '@/storage/inTx';
 import { eventRouter, buildNewSessionUpdate } from '@/app/events/eventRouter';
 import { randomKeyNaked } from '@/utils/randomKeyNaked';
+import { lockLegacyWorkMachineExecution } from '@/app/machine/workMachineExecution';
 
 export class ExecutionBindingError extends Error {
   constructor(readonly statusCode: 400 | 403 | 409 | 503, message: string) { super(message); }
@@ -71,6 +72,7 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
     try {
       return await inTx(async tx => {
         fresh(proof);
+        if (!await lockLegacyWorkMachineExecution(tx, ticket.machineOwnerAccountId, ticket.machineId)) refuse();
         const machine = await tx.machine.findUnique({ where: { id: ticket.machineId } });
         if (!machine || machine.accountId !== ticket.machineOwnerAccountId) refuse();
         const existing = await tx.session.findUnique({ where: { accountId_tag: { accountId: ownerAccountId, tag: body.tag } } });

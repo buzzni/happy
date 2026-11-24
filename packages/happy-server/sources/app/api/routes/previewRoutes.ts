@@ -22,7 +22,7 @@ import { z } from "zod";
 import { db } from "@/storage/db";
 import { log } from "@/utils/log";
 import { eventRouter } from "@/app/events/eventRouter";
-import { findMachineSockets as findMachineSocketsCrossReplica } from "@/app/events/findMachineSockets";
+import { findMachineSockets as findMachineSocketsCrossReplica, findMachineSocketsForDispatch } from "@/app/events/findMachineSockets";
 import {
     signPreviewToken,
     verifyPreviewToken,
@@ -1314,7 +1314,10 @@ export function previewRoutes(app: Fastify) {
                 // stale machine-scoped connections around; try all live
                 // candidates so one stale socket cannot pin preview to a 35s
                 // relay timeout while a fresh daemon socket is already ready.
-                const { sockets: machineSockets, degraded } = await findMachineSockets(claims.userId, params.machineId);
+                const { sockets: machineSockets, degraded } = await findMachineSocketsForDispatch(
+                    eventRouter.server, claims.userId, params.machineId,
+                    ['GET', 'HEAD', 'OPTIONS'].includes(request.method),
+                );
                 const failureContext = {
                     method: request.method,
                     machineId: params.machineId,

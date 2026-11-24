@@ -64,7 +64,8 @@ const acknowledgementSchema = z.object({
 
 export function createCheckpointEventPublisher(
     input: {
-        token: string;
+        /** A function is read at each publish: a protected conversation's session credential is renewed. */
+        token: string | (() => string);
         sessionId: string;
         serverUrl?: string;
         encryption: {
@@ -90,7 +91,7 @@ export function createCheckpointEventPublisher(
         const detail = checkpointEventDetailSchema.parse(detailInput);
         const response = await post({
             url: `${serverUrl}/v3/sessions/${encodeURIComponent(input.sessionId)}/events`,
-            token: input.token,
+            token: typeof input.token === 'function' ? input.token() : input.token,
             body: {
                 eventType,
                 content: encodeBase64(encrypt(

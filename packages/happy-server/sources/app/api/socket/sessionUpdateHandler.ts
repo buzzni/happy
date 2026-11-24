@@ -11,6 +11,28 @@ import { persistSessionEvent } from "@/app/events/persistSessionEvent";
 import { sessionStreamRateLimiter } from "@/app/events/sessionStreamRateLimiter";
 import { SESSION_EVENT_TYPES } from "@/app/events/sessionEventTypes";
 import { Socket } from "socket.io";
+import type { Prisma } from "@prisma/client";
+import type { WorkMachineExecutionClaims } from "@/app/auth/workMachineExecutionToken";
+import { lockWorkMachineExecution } from "@/app/machine/workMachineExecution";
+
+function sessionGrantMatches(
+    grant: WorkMachineExecutionClaims, userId: string, sessionId: string,
+): grant is Extract<WorkMachineExecutionClaims, { purpose: 'session' }> {
+    return grant.purpose === 'session' && grant.accountId === userId && grant.sessionId === sessionId
+        && grant.expiresAt > Date.now();
+}
+
+async function updateAuthorizedSession(socket: Socket, accountId: string, sessionId: string, update: Prisma.SessionUpdateManyArgs) {
+    const grant = socket.data?.workMachineExecution as WorkMachineExecutionClaims | undefined;
+    if (!grant) {
+        return db.session.updateMany({ ...update, where: { ...update.where, accountId, workMachineId: null } });
+    }
+    if (!sessionGrantMatches(grant, accountId, sessionId)) return null;
+    return db.$transaction(async tx => {
+        if (!await lockWorkMachineExecution(tx, grant)) return null;
+        return tx.session.updateMany({ ...update, where: { ...update.where, accountId, workMachineId: grant.machineId } });
+    });
+}
 
 // streamDeltaRelay caps a delta at DEFAULT_STREAM_MAX_BYTES = 2048 UTF-16
 // code units — but that bounds *characters*, not bytes: dense CJK text (this
@@ -51,14 +73,18 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             }
 
             // Update metadata
-            const { count } = await db.session.updateMany({
+            const updated = await updateAuthorizedSession(socket, userId, sid, {
                 where: { id: sid, metadataVersion: expectedVersion },
                 data: {
                     metadata: metadata,
                     metadataVersion: expectedVersion + 1
                 }
             });
-            if (count === 0) {
+            if (!updated) {
+                callback?.({ result: 'error' });
+                return;
+            }
+            if (updated.count === 0) {
                 callback({ result: 'version-mismatch', version: session.metadataVersion, metadata: session.metadata });
                 return null;
             }
@@ -118,14 +144,18 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             }
 
             // Update agent state
-            const { count } = await db.session.updateMany({
+            const updated = await updateAuthorizedSession(socket, userId, sid, {
                 where: { id: sid, agentStateVersion: expectedVersion },
                 data: {
                     agentState: agentState,
                     agentStateVersion: expectedVersion + 1
                 }
             });
-            if (count === 0) {
+            if (!updated) {
+                callback?.({ result: 'error' });
+                return;
+            }
+            if (updated.count === 0) {
                 callback({ result: 'version-mismatch', version: session.agentStateVersion, agentState: session.agentState });
                 return null;
             }
@@ -277,8 +307,18 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 // Allocate and insert under the Session row lock REST batches also take,
                 // so no reader can advance past a seq whose message is not stored yet.
                 const msg = await db.$transaction(async (tx) => {
-                    const locked = await tx.$queryRaw<Array<{ id: string }>>`SELECT "id" FROM "Session" WHERE "id" = ${sid} AND "accountId" = ${userId} FOR UPDATE`;
-                    if (!locked.length) return null;
+                    const [locked] = await tx.$queryRaw<{ id: string; workMachineId: string | null }[]>`
+                        SELECT "id", "workMachineId" FROM "Session"
+                        WHERE "id" = ${sid} AND "accountId" = ${userId} FOR UPDATE
+                    `;
+                    if (!locked) return null;
+                    const grant = socket.data?.workMachineExecution as WorkMachineExecutionClaims | undefined;
+                    if (grant) {
+                        if (!sessionGrantMatches(grant, userId, sid) || locked.workMachineId !== grant.machineId
+                            || !await lockWorkMachineExecution(tx, grant)) return null;
+                    } else if (locked.workMachineId) {
+                        return null;
+                    }
                     // A concurrent retry may have committed while this one waited for the lock.
                     if (useLocalId && await tx.sessionMessage.findFirst({ where: { sessionId: sid, localId: useLocalId } })) return null;
                     const [msgSeq] = await allocateSessionSeqBatch(sid, 1, tx);
@@ -339,10 +379,11 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             }
 
             // Update last active at
-            await db.session.update({
+            const updated = await updateAuthorizedSession(socket, userId, sid, {
                 where: { id: sid },
                 data: { lastActiveAt: new Date(t), active: false }
             });
+            if (!updated?.count) return;
 
             // Emit session activity update
             const sessionActivity = buildSessionActivityEphemeral(

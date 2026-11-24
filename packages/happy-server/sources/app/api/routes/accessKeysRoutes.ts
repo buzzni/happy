@@ -3,6 +3,16 @@ import { Fastify } from "../types";
 import { z } from "zod";
 import { db } from "@/storage/db";
 import { log } from "@/utils/log";
+import type { FastifyRequest } from "fastify";
+
+/** The same exemption the session routes give the customer client of a work machine. */
+function legacyWorkMachineScope(request: FastifyRequest) {
+    const canMutateWorkMachine =
+        request.principal?.kind === 'browser-sync' && request.principal.workMachineIngress === true;
+    return canMutateWorkMachine
+        ? { session: {}, machine: {} }
+        : { session: { workMachineId: null }, machine: { workMachineExecution: { is: null } } };
+}
 
 export function accessKeysRoutes(app: Fastify) {
     // Get Access Key API
@@ -117,13 +127,15 @@ export function accessKeysRoutes(app: Fastify) {
         const { data } = request.body;
 
         try {
-            // Verify session and machine belong to user
+            // Verify session and machine belong to user. A work machine and its
+            // conversations take key writes only from a work-machine credential.
+            const legacy = legacyWorkMachineScope(request);
             const [session, machine] = await Promise.all([
                 db.session.findFirst({
-                    where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId }
+                    where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId, ...legacy.session }
                 }),
                 db.machine.findFirst({
-                    where: { id: machineId, accountId: userId }
+                    where: { id: machineId, accountId: userId, ...legacy.machine }
                 })
             ]);
 
@@ -214,11 +226,18 @@ export function accessKeysRoutes(app: Fastify) {
         const { data, expectedVersion } = request.body;
 
         try {
-            const session = await db.session.findFirst({
-                where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId },
-                select: { id: true },
-            });
-            if (!session) return reply.code(404).send({ error: 'Access key not found' });
+            const legacy = legacyWorkMachineScope(request);
+            const [session, machine] = await Promise.all([
+                db.session.findFirst({
+                    where: { ...piiSessionVisibility(request), id: sessionId, accountId: userId, ...legacy.session },
+                    select: { id: true },
+                }),
+                db.machine.findFirst({
+                    where: { id: machineId, accountId: userId, ...legacy.machine },
+                    select: { id: true },
+                }),
+            ]);
+            if (!session || !machine) return reply.code(404).send({ error: 'Access key not found' });
             // Get current access key for version check
             const currentAccessKey = await db.accessKey.findUnique({
                 where: {

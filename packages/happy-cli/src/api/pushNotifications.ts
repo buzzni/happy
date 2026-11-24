@@ -72,12 +72,13 @@ export function getSessionNotificationCopy(
 }
 
 export class PushNotificationClient {
-    private readonly token: string
+    /** Read per request: a protected conversation's session credential is renewed. */
+    private readonly token: () => string
     private readonly baseUrl: string
     private readonly expo: Expo
 
-    constructor(token: string, baseUrl: string = 'https://api.cluster-fluster.com') {
-        this.token = token
+    constructor(token: string | (() => string), baseUrl: string = 'https://api.cluster-fluster.com') {
+        this.token = typeof token === 'function' ? token : () => token
         this.baseUrl = baseUrl
         this.expo = new Expo()
     }
@@ -94,7 +95,7 @@ export class PushNotificationClient {
                     `${this.baseUrl}/v1/push-tokens`,
                     {
                         headers: {
-                            'Authorization': `Bearer ${this.token}`,
+                            'Authorization': `Bearer ${this.token()}`,
                             'Content-Type': 'application/json',
                             'X-Happy-Client': `cli-daemon/${configuration.currentCliVersion}`
                         }
@@ -285,7 +286,7 @@ export class PushNotificationClient {
                     },
                     {
                         headers: {
-                            'Authorization': `Bearer ${this.token}`,
+                            'Authorization': `Bearer ${this.token()}`,
                             'Content-Type': 'application/json',
                             'X-Happy-Client': `cli-daemon/${configuration.currentCliVersion}`,
                         },

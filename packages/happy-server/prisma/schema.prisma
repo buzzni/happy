@@ -143,10 +143,13 @@ model Session {
     executionBinding SessionExecutionBinding?
     ownershipBinding SessionOwnershipBinding?
     reservationLease ReservationConversationLease?
+    workMachineId       String?
+    workMachineExecution WorkMachineExecution? @relation(fields: [workMachineId, accountId], references: [machineId, accountId], onDelete: Restrict, onUpdate: Restrict)
 
     @@unique([id, accountId])
     @@unique([accountId, tag])
     @@index([accountId, updatedAt(sort: Desc)])
+    @@index([workMachineId, accountId])
 }
 
 model SessionMessage {
@@ -326,10 +329,55 @@ model Machine {
     automations        Automation[] @relation("AutomationTargetMachine")
 
     executionBindings SessionExecutionBinding[]
+    workMachineExecution WorkMachineExecution?
 
     @@unique([accountId, id])
     @@unique([id, accountId])
     @@index([accountId])
+}
+
+/// Generation and device authority for machines explicitly enrolled for replacement.
+model WorkMachineExecution {
+    machineId        String    @id
+    accountId        String
+    machine          Machine   @relation(fields: [machineId, accountId], references: [id, accountId], onDelete: Restrict, onUpdate: Restrict)
+    generation       Int
+    deviceId         String
+    /// The device a replace moved the authority away from; the only device a restore may return it to.
+    previousDeviceId String?
+    drainingAt       DateTime?
+    frozenAt         DateTime?
+    firstExecutionAt DateTime?
+    sessions         Session[]
+    renewalProofs    WorkMachineRenewalProof[]
+    mcpCalls         WorkMachineMcpCall[]
+
+    @@unique([machineId, accountId])
+    @@index([accountId])
+}
+
+model WorkMachineMcpCall {
+    requestId   String   @id
+    machineId   String
+    accountId   String
+    machine     WorkMachineExecution @relation(fields: [machineId, accountId], references: [machineId, accountId], onDelete: Restrict, onUpdate: Restrict)
+    deviceId    String
+    generation  Int
+    admittedAt  DateTime @default(now())
+    completedAt DateTime?
+    reconciledAt DateTime?
+
+    @@index([machineId, completedAt])
+}
+
+model WorkMachineRenewalProof {
+    machineId String
+    machine   WorkMachineExecution @relation(fields: [machineId], references: [machineId], onDelete: Cascade)
+    nonce     String
+    expiresAt DateTime
+
+    @@id([machineId, nonce])
+    @@index([machineId, expiresAt])
 }
 
 model UploadedFile {
@@ -1252,6 +1300,7 @@ model SessionOwnershipBinding {
     @@unique([subjectIssuer, intentId])
     @@unique([subjectIssuer, operationId])
     @@unique([subjectIssuer, nonce])
+    @@index([machineId, machineAccountId])
 }
 
 // Retired v5 persistence only. Kept with the published additive migration to preserve data; no executor uses it after rollback.

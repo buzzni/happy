@@ -25,6 +25,8 @@ import { ORG_SUBAGENT_OPERATION_ENV } from '@/utils/childEnv';
 import { createMachineTypeMarker } from './machineTypeMarker';
 import { createSharedPcAutoConfirm } from './sharedPcAutoConfirm';
 import { loadOrCreateDeviceKeys } from './deviceKeys';
+import { openWorkMachineCredentials, readWorkMachineExecutionBinding, watchWorkMachineCredential } from './workMachineCredential';
+import { prepareWorkMachineNewSession } from './workMachineNewSession';
 import { deliverAutomationConversation } from './automations/automationConversationRunner';
 import { scopeResumeSelection } from './sessionWriteScopeRestart';
 import { createSessionWriteScopeRuntime, isSessionWriteScopeLaunch, type SessionWriteScopeRuntime } from './sessionWriteScopeRuntime';
@@ -53,7 +55,7 @@ import { runManagedScript } from './automations/managedScriptRunner';
 
 import { ApiClient } from '@/api/api';
 import { TrackedSession, SessionEncryptionData } from './types';
-import { MachineMetadata, DaemonState, Metadata, Machine, SPAWN_SESSION_KEY_CAPABILITY } from '@/api/types';
+import { MachineMetadata, DaemonState, Metadata, Machine, Session, SPAWN_SESSION_KEY_CAPABILITY } from '@/api/types';
 import {
   type RecoverSessionOptions,
   type RecoverSessionResult,
@@ -62,6 +64,7 @@ import {
   type SpawnSessionResult,
 } from '@/modules/common/registerCommonHandlers';
 import { LIST_FILES_PAGE_CAPABILITY } from '@/modules/common/listFilesPageCapability';
+import { FIXED_READ_RPCS_CAPABILITY } from './fixedReadRpcsCapability';
 import { BASH_PREFIX_MATCHER_CAPABILITY } from '@/claude/utils/bashPrefixMatcher';
 import { logger } from '@/ui/logger';
 import { authAndSetupMachineIfNeeded } from '@/ui/auth';
@@ -202,7 +205,7 @@ import {
   resolveAutomationDirectoryMatch,
   shareInFlight,
 } from './resumeGuards';
-import { decideResumeCursorPersist } from './resumeCursorPersistence';
+import { decideResumeCursorPersist, withReportedProviderIdentity, type ProviderIdentity } from './resumeCursorPersistence';
 import { createSessionRetention, retentionProtects } from './sessionRetention';
 import { readStaleRuntimeRestartConfig, sweepStaleRuntimeSessions } from './staleRuntimeSessionRestart';
 import { stageInitialPromptEnvironment } from '@/utils/initialPrompt';
@@ -492,6 +495,7 @@ export const initialMachineMetadata: MachineMetadata = {
   structuredOutput: STRUCTURED_OUTPUT_CAPABILITY,
   writeFileAttempt: WRITE_FILE_ATTEMPT_CAPABILITY,
   listFilesPage: LIST_FILES_PAGE_CAPABILITY,
+  fixedReadRpcs: FIXED_READ_RPCS_CAPABILITY,
   permissionGrants: BASH_PREFIX_MATCHER_CAPABILITY,
   machineRun: {
     protocolVersion: 1,
@@ -734,6 +738,23 @@ export function shouldRunScriptAutomations(input: {
     return input.enabled === undefined || input.enabled === '1';
 }
 
+/**
+ * The account the script automation worker runs for. A protected daemon holds
+ * a device credential, not an account token, so the account profile route
+ * refuses it; its execution binding names the account that credential is
+ * issued for, which every renewal and the machine's script listing that
+ * follows the preflight check on the server. Other daemons read the profile.
+ */
+export async function scriptAutomationAccountId(input: {
+    workMachineAccountId: string | null;
+    readProfile: () => Promise<unknown>;
+}): Promise<string> {
+    if (input.workMachineAccountId) return input.workMachineAccountId;
+    const profile = await input.readProfile() as { id?: unknown };
+    if (typeof profile.id !== 'string' || !profile.id) throw new Error('SCRIPT_ACCOUNT_UNAVAILABLE');
+    return profile.id;
+}
+
 export async function startDaemon(): Promise<void> {
   // Host bootstrap belongs to this incarnation, never to spawned agent children.
   const writeScopeHostEnvironment = Object.fromEntries(Object.entries(process.env)
@@ -901,6 +922,7 @@ export async function startDaemon(): Promise<void> {
   let standaloneWindows: Awaited<ReturnType<typeof createStandaloneWindowsRuntime>>;
   let residentModules: ReturnType<typeof startResidentModuleHost> | undefined;
   let stopUsageRecovery: () => Promise<void> = async () => undefined;
+  let stopWorkMachineCredential = () => {};
   let stopScriptWorker: () => Promise<void> = async () => undefined;
   let stopBrowserAttention: () => Promise<void> = async () => undefined;
   try {
@@ -966,6 +988,24 @@ export async function startDaemon(): Promise<void> {
     // its state layout and checks its modes itself, so only BYOS is repaired.
     if (!managedCredential?.ok) hardenHappyHomePermissions();
 
+    const executionBinding = managedCredential?.ok ? null : await readWorkMachineExecutionBinding(configuration.happyHomeDir);
+    const workMachine = executionBinding && await (async () => {
+      if (process.platform !== 'linux') throw new Error('Work machine execution requires a Linux Happy CLI host');
+      const [local, settings] = await Promise.all([readCredentials(), readSettings({ strict: true })]);
+      if (local?.encryption.type !== 'dataKey' || settings.machineId !== executionBinding.machineId
+        || (configuration.machineControl === 'strict' && !local.encryption.neverEscrowed)) {
+        throw new Error('Work machine execution does not match this local machine and data key');
+      }
+      const device = await openWorkMachineCredentials(configuration.happyHomeDir, configuration.serverUrl, executionBinding);
+      const initial = await device.renew();
+      return {
+        device, initial, authSetup: {
+          credentials: { token: initial.token, encryption: local.encryption },
+          machineId: executionBinding.machineId, serverPublicKey: null,
+        },
+      };
+    })();
+
     // Ensure auth and machine registration BEFORE anything else
     const authSetup = managedCredential?.ok
       ? {
@@ -980,7 +1020,7 @@ export async function startDaemon(): Promise<void> {
         machineId: managedCredential.credential.machineId,
         serverPublicKey: null,
       }
-      : await authAndSetupMachineIfNeeded();
+      : workMachine ? workMachine.authSetup : await authAndSetupMachineIfNeeded();
     const { machineId, serverPublicKey } = authSetup;
     const machineIdTwins = listMachineIdTwins(configuration.happyHomeDir, machineId);
     if (machineIdTwins.length > 0) {
@@ -990,7 +1030,7 @@ export async function startDaemon(): Promise<void> {
     // can use the machine key, strict mode replaces one the server may hold,
     // and the daemon does not start when it cannot. A managed runtime
     // registers nothing and keeps the key its parent provisioned.
-    const credentials = managedCredential?.ok
+    const credentials = managedCredential?.ok || workMachine
       ? authSetup.credentials
       // aplus-dev-studio specs/script-automation-viewer-key R2 — agents read the viewer key from access.key.
       : await backfillViewerPublicKey(await settleMachineControl({
@@ -1239,6 +1279,13 @@ export async function startDaemon(): Promise<void> {
     const mcpCallerGrantConsumer = new McpCallerGrantEnvelopeConsumer({
       machineId,
       secretKey: mcpCallerGrantKeyPair.secretKey,
+      // A protected work machine's Studio grants are v2 and name this binding.
+      workMachine: executionBinding && {
+        accountId: executionBinding.accountId,
+        machineId: executionBinding.machineId,
+        deviceId: executionBinding.deviceId,
+        generation: executionBinding.generation,
+      },
     });
     // aplus specs/org-agent-plan §6.3-2: the Studio seals plan grants to the same published key.
     const agentPlanGrantConsumer = new AgentPlanGrantEnvelopeConsumer({
@@ -1813,6 +1860,7 @@ export async function startDaemon(): Promise<void> {
         launchedBackgroundJob?: boolean;
         lastProcessedSeq?: number;
         mode?: 'local' | 'remote';
+        providerIdentity?: ProviderIdentity;
         updatedAt: number;
       },
       reporter?: { hostPid?: number },
@@ -1916,10 +1964,14 @@ export async function startDaemon(): Promise<void> {
         pendingUserInput: trackedSession.runtime.pendingUserInput ?? false,
       });
 
+      // The record names the provider conversation once the session does (withReportedProviderIdentity).
+      const metadata = trackedSession.happySessionMetadataFromLocalWebhook;
+      const identified = metadata ? withReportedProviderIdentity(metadata, runtime.providerIdentity) : null;
+      if (identified) trackedSession.happySessionMetadataFromLocalWebhook = identified;
       // The cursor only exists in memory until something writes it. A daemon
       // killed without its clean-stop handlers takes it to the grave and the
       // session can never be resumed — see persistResumeCursorIfDue.
-      persistResumeCursorIfDue(trackedSession);
+      persistResumeCursorIfDue(trackedSession, identified !== null);
     };
 
     let resolveManagedAiCredentialEnvironment = async (
@@ -2102,6 +2154,20 @@ export async function startDaemon(): Promise<void> {
       },
       warn: (message) => logger.warn(message),
     });
+    /** Metadata of a session the daemon creates before its child starts (owned and work machine launches). */
+    const daemonCreatedSessionMetadata = (options: SpawnSessionOptions): Metadata => ({ path: options.directory, host: os.hostname(),
+      version: packageJson.version, os: os.platform(), machineId,
+      homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
+      flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now(),
+      // T4RT-03: an owned session's creator and source, as a legacy child records them.
+      ...ownedSessionAuthorship(options) });
+    const persistDaemonCreatedSession = async (session: Session) => {
+      // Rotation has already persisted its execution binding; retain that trusted resume state.
+      const prior = readPersistedSessions()[session.id];
+      return persistSessionDurably(session.id, { ...prior, encryptionKey: encodeBase64(session.encryptionKey), encryptionVariant: session.encryptionVariant,
+        seq: session.seq, metadataVersion: session.metadataVersion, agentStateVersion: session.agentStateVersion, metadata: session.metadata,
+        savedAt: Date.now(), lastProcessedSeq: 0 });
+    };
     type WorkspaceLaunchObservation = { submitted: boolean; tracked: boolean; exitObserved?: boolean;
       onObservedExit?: () => Promise<void>; onUnconfirmedExit?: () => Promise<void> };
     const spawnSessionUnchecked = async (
@@ -2551,6 +2617,18 @@ export async function startDaemon(): Promise<void> {
         // can attach a child to an existing session.
         if (preparedMachineLaunch) Object.assign(extraEnv, preparedMachineLaunch.reconnectEnvironment);
         else if (options.reconnectEnvironment) Object.assign(extraEnv, options.reconnectEnvironment);
+        else {
+          // A protected machine's child cannot create a conversation; the daemon creates it with its device credential.
+          const workMachineSession = await prepareWorkMachineNewSession({
+            protectedMachine: !!workMachine, options, credentials, metadata: daemonCreatedSessionMetadata(options),
+            persist: async session => (await persistDaemonCreatedSession(session)).status === 'committed',
+          });
+          if (workMachineSession.kind === 'refused') {
+            logger.warn(`[DAEMON RUN] ${workMachineSession.errorMessage}`);
+            return { type: 'error', errorMessage: workMachineSession.errorMessage };
+          }
+          if (workMachineSession.kind === 'created') Object.assign(extraEnv, workMachineSession.environment);
+        }
         if (options.saycodeSystemPromptEnabled !== undefined) {
           extraEnv.HAPPY_INITIAL_SAYCODE_SYSTEM_PROMPT_ENABLED = String(
             options.saycodeSystemPromptEnabled,
@@ -3139,7 +3217,7 @@ export async function startDaemon(): Promise<void> {
      * running: the persisted record keeps its start-time snapshot and resume
      * refuses with `SESSION_CURSOR_MISSING` forever.
      */
-    const persistResumeCursorIfDue = (session: TrackedSession): void => {
+    const persistResumeCursorIfDue = (session: TrackedSession, metadataChanged = false): void => {
       const sessionId = session.happySessionId;
       const metadata = session.happySessionMetadataFromLocalWebhook;
       if (!sessionId || !session.encryption || !metadata) return;
@@ -3151,6 +3229,7 @@ export async function startDaemon(): Promise<void> {
         persistedCursor: session.persistedLastProcessedSeq,
         lastPersistAt: resumeCursorPersistedAt.get(sessionId),
         now,
+        metadataChanged,
       })) return;
 
       persistSession(sessionId, {
@@ -3320,8 +3399,13 @@ export async function startDaemon(): Promise<void> {
         // 2026-07-23 incident: pin preflight and child to ONE identity.
         // A child that syncs under a different account than the session owner
         // gets identical-looking 404s and exits — never spawn that child.
-        const diskCredentials = await readCredentials();
-        const credentialDecision = decideResumeCredentials({
+        if (workMachine && (tracked.userHomeDir || tracked.encryption.encryptionVariant !== 'dataKey' || options?.automation)) {
+          return { type: 'error', code: 'SESSION_RESUME_FAILED', errorMessage: 'Work machine execution cannot resume this session binding' };
+        }
+        const diskCredentials = workMachine ? null : await readCredentials();
+        const credentialDecision = workMachine
+          ? { kind: 'daemon' as const, token: (await workMachine.device.renew(happySessionId)).token }
+          : decideResumeCredentials({
           trackedUserHomeDir: tracked.userHomeDir,
           stagedToken: tracked.userHomeDir ? await readStagedTokenFromHomeDir(tracked.userHomeDir) : null,
           daemonToken: credentials.token,
@@ -3334,7 +3418,7 @@ export async function startDaemon(): Promise<void> {
             errorMessage: `Cannot resume session ${happySessionId}: ${credentialDecision.reason}`,
           };
         }
-        if (options?.automation
+        if (options?.automation && !workMachine
             && !tokensShareIdentity(credentialDecision.token, credentials.token)) {
           return {
             type: 'error',
@@ -4837,6 +4921,7 @@ export async function startDaemon(): Promise<void> {
       });
       logger.debug(`[DAEMON RUN] Machine registered: ${machine.id}`);
     } catch (error) {
+      if (api.usesWorkMachineExecutionGrant()) throw error;
       logger.debug('[DAEMON RUN] Machine registration failed unexpectedly, starting offline', error);
       machine = api.buildOfflineMachine({
         machineId,
@@ -5462,14 +5547,16 @@ export async function startDaemon(): Promise<void> {
           if (!studioConfigUrl) throw new Error('SCRIPT_STUDIO_AUTHORIZATION_REQUIRED');
           const studioUrl = new URL(studioConfigUrl);
           if (studioUrl.protocol !== 'https:' && !(studioUrl.protocol === 'http:' && ['localhost', '127.0.0.1', '[::1]'].includes(studioUrl.hostname))) throw new Error('SCRIPT_STUDIO_HTTPS_REQUIRED');
-          const profile = await request('GET', '/v1/account/profile') as { id?: unknown };
-          if (typeof profile.id !== 'string' || !profile.id) throw new Error('SCRIPT_ACCOUNT_UNAVAILABLE');
-          const ownerId = createHash('sha256').update(JSON.stringify([configuration.serverUrl, profile.id, machineId])).digest('hex');
+          const accountId = await scriptAutomationAccountId({
+            workMachineAccountId: executionBinding?.accountId ?? null,
+            readProfile: () => request('GET', '/v1/account/profile'),
+          });
+          const ownerId = createHash('sha256').update(JSON.stringify([configuration.serverUrl, accountId, machineId])).digest('hex');
           const directory = join(configuration.happyHomeDir, 'script-automations', ownerId);
           const temporaryRoot = join(directory, 'work');
           await prepareManagedScriptRuntime({ ownerId, directory: temporaryRoot, image: resolved.image });
           await request('GET', `/v1/machines/${encodeURIComponent(machineId)}/script-automations`);
-          runtime = { image: resolved.image, accountId: profile.id, ownerId, directory, temporaryRoot, studioOrigin: studioUrl.origin };
+          runtime = { image: resolved.image, accountId, ownerId, directory, temporaryRoot, studioOrigin: studioUrl.origin };
           return resolved;
         },
         createWorker: async () => {
@@ -5605,7 +5692,9 @@ export async function startDaemon(): Promise<void> {
           journal: contextJournal, accountId: contextAccountId, happyOrigin: configuration.serverUrl,
           keys: deviceKeys, pin: companyId => deviceEnrollment!.orgPin(companyId),
         } } : {}) }) });
-    const contextAccountId = contextWorkspace && trustedStudioOrigin ? await authenticatedAccountId(credentials.token) : null;
+    // A protected daemon's device credential cannot read the account profile; its binding names the account.
+    const contextAccountId = contextWorkspace && trustedStudioOrigin
+      ? executionBinding?.accountId ?? await authenticatedAccountId(credentials.token) : null;
     const contextJournal = contextAccountId ? createAutomationContextLaunchJournal(configuration.happyHomeDir) : null;
     const contextReference = contextAccountId && contextJournal ? createAutomationContextReferenceReader({
       serverUrl: configuration.serverUrl, token: credentials.token, accountId: contextAccountId, machineId, journal: contextJournal,
@@ -5652,7 +5741,8 @@ export async function startDaemon(): Promise<void> {
       },
     }) : null;
     const questionWorker = contextHost && contextJournal && contextAccountId ? createAutomationQuestionWorker({
-      home: configuration.happyHomeDir, serverUrl: configuration.serverUrl, token: credentials.token,
+      // The current daemon credential: on a protected machine the wmx_ token, which renewals replace.
+      home: configuration.happyHomeDir, serverUrl: configuration.serverUrl, token: () => credentials.token,
       accountId: contextAccountId, machineId, journal: contextJournal, host: contextHost, runtimeStore: serverAutomationRuntimeStore,
       transport: apiMachine.serverAutomationTransport(), log: message => logger.warn(message),
       decode: question => trustedServerAutomationPayload({ automationId: question.automationId, generation: question.generation,
@@ -5711,6 +5801,11 @@ export async function startDaemon(): Promise<void> {
           allowedRoot: automationAllowedRoot,
         }),
         notifyGithubTrigger: ({ title, body, url }) => {
+          // A protected daemon's device credential cannot read the account's push tokens.
+          if (api.usesWorkMachineExecutionGrant()) {
+            logger.debug('[GITHUB TRIGGER] push skipped: work machine device credential has no account push client');
+            return;
+          }
           api.push().sendToAllDevices(title, body, { kind: 'github-trigger', url });
         },
         resolveGithubIssueProgressMarkerIdentity: (input) => resolveGithubIssueProgressMarkerIdentity({
@@ -6082,21 +6177,11 @@ export async function startDaemon(): Promise<void> {
       // The Windows trial launch carries no capability pipe, so its owned children keep the daemon-held binding.
       launchCallers: { query: raw => callerLaunches!.query(raw), currentCaller: sessionId => callerLaunches!.currentCaller(sessionId),
         available: () => !standaloneWindows && callerLaunches!.available() },
-      metadata: options => ({ path: options.directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
-        homeDir: os.homedir(), happyHomeDir: configuration.happyHomeDir, happyLibDir: projectPath(), happyToolsDir: join(projectPath(), 'tools', 'unpacked'),
-        flavor: options.agent ?? 'claude', startedFromDaemon: true, startedBy: 'daemon', lifecycleState: 'running', lifecycleStateSince: Date.now(),
-        // T4RT-03: an owned session's creator and source, as a legacy child records them.
-        ...ownedSessionAuthorship(options) }),
+      metadata: daemonCreatedSessionMetadata,
       rotation: (options, companyId) => options.agentPlan ? Promise.resolve(null) : companyId ? machineRuntimeFor(companyId) : machineRotationFor(options),
       start: (options, launch) => { if (launch) ownedMachineLaunches.set(options, launch); return ownedStartGuard.start(options, () => spawnSessionAdmitted(options)); },
       tracked: sessionId => findTrackedSessionById(sessionId) ?? sessionIdToFinishedSession.get(sessionId), live: liveLaunch,
-      persist: async session => {
-        // Rotation has already persisted its execution binding; retain that trusted resume state.
-        const prior = readPersistedSessions()[session.id];
-        return persistSessionDurably(session.id, { ...prior, encryptionKey: encodeBase64(session.encryptionKey), encryptionVariant: session.encryptionVariant,
-          seq: session.seq, metadataVersion: session.metadataVersion, agentStateVersion: session.agentStateVersion, metadata: session.metadata,
-          savedAt: Date.now(), lastProcessedSeq: 0 });
-      },
+      persist: persistDaemonCreatedSession,
     });
     if (!managedRuntimeActive && !standaloneWindows && machine.encryptionVariant === 'dataKey' && deviceKeys && deviceEnrollment && trustedStudioOrigin) {
       const enrollment = deviceEnrollment;
@@ -6244,7 +6329,8 @@ export async function startDaemon(): Promise<void> {
           const trackedSession = findTrackedSessionById(sessionId);
           if (!trackedSession?.encryption) return null;
           return createCheckpointEventPublisher({
-            token: credentials.token,
+            // A protected conversation takes only its own session credential for its events (fresh for this operation).
+            token: workMachine ? (await workMachine.device.renew(sessionId)).token : credentials.token,
             sessionId,
             encryption: trackedSession.encryption,
           });
@@ -6323,6 +6409,7 @@ export async function startDaemon(): Promise<void> {
         teardownCurrentDaemon: async () => {
           await drainWorktreeOperations();
           clearInterval(restartOnStaleVersionAndHeartbeat);
+          stopWorkMachineCredential();
           await stopUsageRecovery();
           await checkpointRetentionSchedule.stop();
 
@@ -6470,6 +6557,22 @@ export async function startDaemon(): Promise<void> {
     launchReadiness.markReady();
     // Connect to server
     apiMachine.connect();
+    if (workMachine) {
+      stopWorkMachineCredential = watchWorkMachineCredential({
+        initial: workMachine.initial,
+        renew: () => workMachine.device.renew(),
+        apply: renewed => {
+          credentials.token = renewed.token;
+          apiMachine.replaceToken(renewed.token);
+        },
+        retrying: () => logger.warn('[DAEMON RUN] Work machine credential refresh will retry'),
+        stop: reason => {
+          launchReadiness.closeForRestart(Date.now());
+          apiMachine.stopForExpiredCredential();
+          requestShutdown('exception', `Work machine execution credential ${reason}`);
+        },
+      });
+    }
     channelHost?.start();
 
     // Emit session-end events for dead sessions from previous daemon run
@@ -6480,9 +6583,13 @@ export async function startDaemon(): Promise<void> {
           removeDeferredContinuationContextFile(dead.deferredContinuationContextFile);
         }
         if (dead.happySessionId) {
-          api.postSessionEvent(dead.happySessionId, 'session-end', '').catch((error) => {
-            logger.debug(`[DAEMON RUN] Failed to emit session-end for dead session ${dead.happySessionId}: ${error}`);
-          });
+          const deadSessionId = dead.happySessionId;
+          // A protected conversation takes only its own session credential for its events.
+          (workMachine ? workMachine.device.renew(deadSessionId).then(({ token }) => token) : Promise.resolve(undefined))
+            .then(token => api.postSessionEvent(deadSessionId, 'session-end', '', token))
+            .catch((error) => {
+              logger.debug(`[DAEMON RUN] Failed to emit session-end for dead session ${deadSessionId}: ${error}`);
+            });
         }
       }
     }
@@ -6738,6 +6845,7 @@ export async function startDaemon(): Promise<void> {
       restartDrainRuntime?.dispose();
       await drainWorktreeOperations();
       logger.debug(`[DAEMON RUN] Starting proper cleanup (source: ${source}, errorMessage: ${errorMessage})...`);
+      stopWorkMachineCredential();
       await stopUsageRecovery();
       await checkpointRetentionSchedule.stop();
 
@@ -6761,13 +6869,17 @@ export async function startDaemon(): Promise<void> {
         `[lesson-host] shutdown: ${(error as Error).message}`,
       ));
 
-      // Update daemon state before shutting down
-      await apiMachine.updateDaemonState((state: DaemonState | null) => ({
-        ...state,
-        status: 'shutting-down',
-        shutdownRequestedAt: Date.now(),
-        shutdownSource: source
-      }));
+      // Update daemon state before shutting down. Best effort and bounded: the server never
+      // answers a frozen work machine generation, and the stop must still finish cleanly.
+      await Promise.race([
+        apiMachine.updateDaemonState((state: DaemonState | null) => ({
+          ...state,
+          status: 'shutting-down',
+          shutdownRequestedAt: Date.now(),
+          shutdownSource: source
+        })),
+        new Promise(resolve => setTimeout(resolve, 3_000).unref()),
+      ]);
 
       // Give time for metadata update to send
       await new Promise(resolve => setTimeout(resolve, 100));
@@ -6847,6 +6959,7 @@ export async function startDaemon(): Promise<void> {
     await cleanupAndShutdown(shutdownRequest.source, shutdownRequest.errorMessage);
   } catch (error) {
     const bashRpcsDrained = drainBashRpcs();
+    stopWorkMachineCredential();
     await stopUsageRecovery();
     await stopBrowserAttention();
     await standaloneWindows?.owner.close().catch(() => {});

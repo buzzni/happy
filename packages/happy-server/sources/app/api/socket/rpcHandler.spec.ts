@@ -9,7 +9,11 @@ beforeEach(() => sessionLookup.mockReset().mockResolvedValue(null));
 // The handler now asks the database that question before choosing a path, and
 // answering it here keeps these cases on the path they are written for.
 vi.mock('@/storage/db', () => ({
-    db: { session: { findFirst: sessionLookup }, managedSessionGrant: { findFirst: async () => null } },
+    db: {
+        session: { findFirst: sessionLookup },
+        managedSessionGrant: { findFirst: async () => null },
+        workMachineExecution: { findFirst: async () => null },
+    },
 }));
 
 class FakeSocket {
@@ -598,7 +602,7 @@ describe('protected session RPC delivery', () => {
         await caller.trigger('rpc-call', { method: 'protected:read', params: 'encrypted' }, callback);
         expect(target.timeoutCalls).toEqual([30000]);
         expect(sessionLookup).toHaveBeenCalledWith({
-            where: { id: 'protected', accountId: 'u1' }, select: { piiProtection: true },
+            where: { id: 'protected', accountId: 'u1' }, select: { piiProtection: true, workMachineId: true },
         });
         expect(callback).toHaveBeenCalledWith(expect.objectContaining({ ok: true }));
     });

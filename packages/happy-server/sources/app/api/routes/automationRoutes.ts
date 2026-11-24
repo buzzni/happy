@@ -37,6 +37,7 @@ import { inTx } from '@/storage/inTx';
 import { db } from '@/storage/db';
 import { isServerBackedAutomationEnabled } from '@/app/automation/automationRollout';
 import { emitAutomationUpdate, emitProjectAutomationUpdate } from '@/app/automation/automationUpdate';
+import { requireWorkMachineDaemonReadAuth } from '@/app/api/utils/enableAuthentication';
 import type { Fastify } from '../types';
 
 const paramsSchema = z.object({ projectId: z.string().min(1) });
@@ -151,7 +152,8 @@ export function automationRoutes(app: Fastify) {
         }
     });
     app.post('/v1/automation-runs/:runId/mcp-context', {
-        preHandler: app.authenticate,
+        // A protected machine's daemon asks with its device credential for its own machine.
+        preHandler: requireWorkMachineDaemonReadAuth(app, request => (request.body as { machineId?: string }).machineId),
         schema: { params: runParamsSchema, body: mcpContextSchema },
     }, async (request, reply) => {
         if (rejectWhenDisabled(reply)) return;

@@ -24,9 +24,12 @@ export async function resolveBrowserSyncRestPrincipal(input: {
     token: string;
     issuer: BrowserSyncTokenIssuer | null;
     now: number;
-}): Promise<{ userId: string } | null> {
+}): Promise<{ userId: string; workMachineIngress?: true } | null> {
     if (!input.token || !input.issuer) return null;
     const verified = await input.issuer.verify(input.token, input.now);
     if (!verified.ok) return null;
-    return { userId: verified.claims.accountId };
+    return {
+        userId: verified.claims.accountId,
+        ...(verified.claims.workMachineIngress ? { workMachineIngress: true } : {}),
+    };
 }

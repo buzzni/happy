@@ -315,6 +315,21 @@ describe('T4o creation ownership at the HTTP and SQL boundary', () => {
     expect((await query('company-account')).json().machine).toEqual({ machineId: 'machine-1', accountId: 'company-account' });
     expect((await query('personal-account')).json().machine).toBeNull();
   });
+
+  it('rejects an existing signed legacy create proof once its target requires device execution authority', async () => {
+    const signed = await proof();
+    const before = await client.session.count();
+    await client.workMachineExecution.create({ data: {
+      machineId: 'machine-1', accountId: 'company-account', deviceId: 'current-device', generation: 1,
+    } });
+    expect((await create(signed)).statusCode).toBe(403);
+    for (const data of [{ drainingAt: new Date() }, { frozenAt: new Date() }]) {
+      await client.workMachineExecution.update({ where: { machineId: 'machine-1' }, data });
+      expect((await create(await proof())).statusCode).toBe(403);
+    }
+    expect(await client.session.count()).toBe(before);
+    expect(await client.sessionOwnershipBinding.count()).toBe(0);
+  });
 });
 
 it('accepts bounded future ownership clock skew but never extends an expired document', () => {

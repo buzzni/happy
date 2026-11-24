@@ -4,6 +4,10 @@ import type { SetupTokenRotationState } from './types';
 import { logger } from '@/ui/logger'
 import { buildScheduledRunPrompt } from '@/utils/scheduledRunPrompt'
 import { EventEmitter } from 'node:events'
+import { watchWorkMachineCredential, type WorkMachineSessionCredentials } from '@/daemon/workMachineCredential';
+import {
+    clearWorkMachineSessionStop, createWorkMachineInputLedger, writeWorkMachineSessionStop, type WorkMachineInputLedger,
+} from '@/daemon/workMachineSessionStop';
 import { io, Socket } from 'socket.io-client'
 import { AgentState, ClientToServerEvents, FileEventMessage, FileEventMessageSchema, Metadata, ServerToClientEvents, Session, Update, UserMessage, UserMessageSchema, Usage } from './types'
 import { decodeBase64, decryptBlob, decrypt, encodeBase64, encrypt, encryptBlob } from './encryption';
@@ -419,7 +423,19 @@ export interface ApiSessionClientOptions {
 }
 
 export class ApiSessionClient extends EventEmitter {
-    private readonly token: string;
+    private token: string;
+    private disposeWorkMachineCredential?: () => void;
+    /** Asks the server whether a work machine session may start a turn now; refused while draining or frozen. */
+    private permitWorkMachineTurn?: () => Promise<void>;
+    /**
+     * The clean-stop record this process owes (aplus specs/work-machine-migration requirement 6):
+     * which routed input a started turn took, and whether a turn was running when it was told to stop.
+     */
+    private workMachineStop: {
+        path: string; ledger: WorkMachineInputLedger; turnInFlight: boolean; release: () => void;
+    } | null = null;
+    /** Server seqs of the input still in the agent loop's queue. */
+    private queuedInputSeqs: () => ReadonlySet<number> = () => new Set();
     readonly sessionId: string;
     /**
      * Identity of *this process's* attachment to the session, minted per client instance
@@ -442,8 +458,13 @@ export class ApiSessionClient extends EventEmitter {
 
     configureInputQueue<T>(queue: MessageQueue2<T>, mode: 'local' | 'remote', evidence: boolean): void {
         this.inputEvidenceSupported = evidence;
-        queue.setInputValidator(input => this.admitInput(input), input => { this.admitInput(input, true); });
+        queue.setInputValidator(input => this.admitInput(input), input => {
+            this.admitInput(input, true);
+            if (input.ref.kind === 'rest' && typeof input.ref.serverSeq === 'number') this.workMachineStop?.ledger.queued(input.ref.serverSeq);
+        });
         this.invalidateGuardedInputs = () => queue.discardInvalid();
+        this.queuedInputSeqs = () => new Set(queue.queue.flatMap(item =>
+            item.evidence?.ref.kind === 'rest' && typeof item.evidence.ref.serverSeq === 'number' ? [item.evidence.ref.serverSeq] : []));
         this.setInputMode(mode);
     }
     setInputMode(mode: 'remote' | 'local' | 'transitioning'): void {
@@ -863,6 +884,12 @@ export class ApiSessionClient extends EventEmitter {
 
                 if (data.body.t === 'new-message') {
                     if (this.shutdownReceiveSeq !== null) return;
+                    // A work machine generation that froze can still hold this socket. Its input comes
+                    // only through the read the server authorizes per request (refused once frozen).
+                    if (this.disposeWorkMachineCredential) {
+                        this.receiveSync.invalidate();
+                        return;
+                    }
                     this.receivePollDelayMs = ApiSessionClient.RECEIVE_POLL_INTERVAL_MS;
                     this.receivePollTicksRemaining = 1;
                     const messageSeq = data.body.message?.seq;
@@ -1191,6 +1218,7 @@ export class ApiSessionClient extends EventEmitter {
                 ? { ...userResult.data, serverMessageId, serverSeq }
                 : userResult.data;
             if (!this.admitInput(this.queueInput(incoming))) return;
+            if (serverSeq !== undefined) this.workMachineStop?.ledger.routed(serverSeq, 'user');
             this.inputEvidence.cancelContinuation('replaced');
             const automationRunId = incoming.meta?.sentFrom === 'automation' ? automationRunIdFromLocalKey(incoming.localKey) : null;
             const userMessage = automationRunId
@@ -1221,6 +1249,7 @@ export class ApiSessionClient extends EventEmitter {
                 return;
             }
             const ev = fileResult.data.content.data.ev;
+            if (serverSeq !== undefined) this.workMachineStop?.ledger.routed(serverSeq, 'file');
             logger.debug('[API] Received file event', {
                 size: ev.size,
                 hasMimeType: Boolean(ev.mimeType),
@@ -1252,6 +1281,14 @@ export class ApiSessionClient extends EventEmitter {
 
         const initialSeq = this.lastSeq;
         let afterSeq = this.lastSeq;
+        // aplus specs/work-machine-migration plan 5.1: drain refuses new turns but still lets the
+        // generation read. A work machine session asks once per catch-up before a user message can
+        // start a turn; refused, that message and everything after it stay for the next generation.
+        // File events carry the next message's attachments, so they wait for that decision too: held
+        // until the next row, never past the end of a catch-up.
+        let turnPermitted = !this.permitWorkMachineTurn;
+        let turnRefused = false;
+        const heldFileEvents: Array<{ body: unknown; id: string; seq: number }> = [];
         while (true) {
             const response = await axios.get<V3GetSessionMessagesResponse>(
                 `${configuration.serverUrl}/v3/sessions/${encodeURIComponent(this.sessionId)}/messages`,
@@ -1297,6 +1334,24 @@ export class ApiSessionClient extends EventEmitter {
 
                 try {
                     const body = decrypt(this.encryptionKey, this.encryptionVariant, decodeBase64(message.content.c));
+                    if (!turnPermitted && FileEventMessageSchema.safeParse(body).success) {
+                        heldFileEvents.push({ body, id: message.id, seq: message.seq });
+                        continue;
+                    }
+                    if (!turnPermitted && (heldFileEvents.length > 0 || UserMessageSchema.safeParse(body).success)) {
+                        turnPermitted = await this.permitWorkMachineTurn!().then(() => true, () => false);
+                        if (this.shutdownReceiveSeq !== null) return;
+                        if (!turnPermitted) {
+                            logger.debug('[API] Work machine turn not permitted; leaving the message for a later read', {
+                                sessionId: this.sessionId,
+                                seq: message.seq,
+                            });
+                            maxSeq = (heldFileEvents[0]?.seq ?? message.seq) - 1;
+                            turnRefused = true;
+                            break;
+                        }
+                    }
+                    for (const held of heldFileEvents.splice(0)) this.deliverInput(() => this.routeIncomingMessage(held.body, held.id, held.seq));
                     this.deliverInput(() => this.routeIncomingMessage(body, message.id, message.seq));
                 } catch (error) {
                     logger.debug('[API] Failed to decrypt fetched message', {
@@ -1307,7 +1362,8 @@ export class ApiSessionClient extends EventEmitter {
                 }
             }
 
-            this.lastSeq = Math.max(this.lastSeq, maxSeq);
+            this.lastSeq = Math.max(this.lastSeq, heldFileEvents.length > 0 ? heldFileEvents[0].seq - 1 : maxSeq);
+            if (turnRefused) break;
             const hasMore = !!response.data.hasMore;
             if (hasMore && maxSeq === afterSeq) {
                 logger.debug('[API] fetchMessages pagination stalled, stopping to avoid infinite loop', {
@@ -2246,7 +2302,9 @@ export class ApiSessionClient extends EventEmitter {
         }
         // Every runner reports its thinking state here; a turn starts on idle → thinking.
         // Observed before the archive recheck below, which only skips the send.
+        const turnWasRunning = this.turns.current() !== null;
         this.turns.observeThinking(thinking);
+        if (turnWasRunning !== (this.turns.current() !== null)) this.workMachineStop?.ledger.turnBoundary(this.queuedInputSeqs());
         // A reconnect recheck is reading the server-side `active` flag to
         // decide if we were archived while disconnected — a keepalive now
         // would set active=true and mask it. Skip; the next tick resumes.
@@ -2373,6 +2431,9 @@ export class ApiSessionClient extends EventEmitter {
             // swallows messages that arrive while the session has no process.
             lastProcessedSeq: Math.min(this.runtimeProcessedSeqCap ?? this.lastSeq, this.shutdownReceiveSeq ?? Infinity),
             mode: this.currentMode,
+            // The daemon's resume record names the provider conversation from here (a work machine export reads it).
+            ...(typeof this.metadata?.claudeSessionId === 'string' ? { claudeSessionId: this.metadata.claudeSessionId } : {}),
+            ...(typeof this.metadata?.codexThreadId === 'string' ? { codexThreadId: this.metadata.codexThreadId } : {}),
         }).then(settled, settled);
     }
 
@@ -2808,8 +2869,84 @@ export class ApiSessionClient extends EventEmitter {
         return this.options.trackShutdownStorage === true && this.storageBarrier.isCurrent(proof);
     }
 
+    bindWorkMachineCredential(credential: WorkMachineSessionCredentials, apply: (token: string) => void, permitTurn: () => Promise<void>): void {
+        if (this.disposeWorkMachineCredential || credential.sessionId !== this.sessionId
+            || credential.initial.token !== this.token) throw new Error('Work machine session authorization mismatch');
+        this.permitWorkMachineTurn = permitTurn;
+        if (credential.stopRecord) this.recordWorkMachineStopOnExit(credential.stopRecord);
+        this.disposeWorkMachineCredential = watchWorkMachineCredential({
+            initial: credential.initial,
+            renew: credential.renew,
+            apply: renewed => {
+                this.token = renewed.token;
+                apply(renewed.token);
+                this.socket.auth = { ...(this.socket.auth as Record<string, unknown>), token: renewed.token };
+                this.stopSmartReconnect();
+                if (this.socket.active) this.socket.disconnect();
+                this.startSmartReconnect();
+            },
+            retrying: () => logger.warn('[API] Work machine session credential refresh will retry'),
+            stop: reason => {
+                logger.warn(`[API] Work machine session authorization ${reason}`);
+                this.latchWorkMachineTurn();
+                this.shutdownReceiveSeq = this.lastSeq;
+                this.stopReceivePolling();
+                this.onSyncFatal('receive', new Error('Work machine session authorization lost'));
+            },
+        });
+    }
+
+    /**
+     * Removes the previous process's record now and writes this one's when the client closes or the
+     * process exits, whichever comes first. A stop signal notes a running turn before the runner's
+     * handler can abort it: a turn cut short is not a finished one.
+     */
+    private recordWorkMachineStopOnExit(path: string): void {
+        clearWorkMachineSessionStop(path);
+        const latch = () => this.latchWorkMachineTurn();
+        const onExit = () => this.finishWorkMachineStop();
+        for (const signal of ['SIGTERM', 'SIGINT'] as const) process.prependListener(signal, latch);
+        process.once('exit', onExit);
+        this.workMachineStop = {
+            path, ledger: createWorkMachineInputLedger(), turnInFlight: false,
+            release: () => {
+                for (const signal of ['SIGTERM', 'SIGINT'] as const) process.off(signal, latch);
+                process.off('exit', onExit);
+            },
+        };
+    }
+
+    private latchWorkMachineTurn(): void {
+        if (!this.workMachineStop) return;
+        this.workMachineStop.turnInFlight ||= this.turns.current() !== null || this.openToolCallIds.size > 0
+            || this.openAskUserQuestionIds.size > 0 || Object.keys(this.agentState?.requests ?? {}).length > 0;
+    }
+
+    /** Synchronous: it also runs from the process `exit` handler. */
+    private finishWorkMachineStop(): void {
+        const stop = this.workMachineStop;
+        if (!stop) return;
+        this.latchWorkMachineTurn();
+        this.workMachineStop = null;
+        stop.release();
+        const processed = Math.min(this.runtimeProcessedSeqCap ?? this.lastSeq, this.shutdownReceiveSeq ?? Infinity);
+        try {
+            writeWorkMachineSessionStop(stop.path, {
+                v: 1, sessionId: this.sessionId, cleanStop: true, stoppedAt: Date.now(), turnInFlight: stop.turnInFlight,
+                ...stop.ledger.cursor(processed),
+                ...(typeof this.metadata?.claudeSessionId === 'string' ? { claudeSessionId: this.metadata.claudeSessionId } : {}),
+                ...(typeof this.metadata?.codexThreadId === 'string' ? { codexThreadId: this.metadata.codexThreadId } : {}),
+            });
+        } catch (error) {
+            // Without the record the export refuses this session; it never signs a guessed cursor.
+            logger.warn('[API] Work machine stop record could not be written', error);
+        }
+    }
+
     async close() {
         logger.debug('[API] socket.close() called');
+        this.disposeWorkMachineCredential?.();
+        this.finishWorkMachineStop();
         await this.finishClaudeUsageExecution();
         // socket.close() 가 부를 disconnect 핸들러보다 먼저 세운다.
         this.closed = true;

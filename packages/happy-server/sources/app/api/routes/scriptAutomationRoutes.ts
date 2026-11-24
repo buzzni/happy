@@ -1,10 +1,12 @@
 import * as z from 'zod';
 import type { Prisma } from '@prisma/client';
-import type { FastifyReply } from 'fastify';
+import type { FastifyReply, FastifyRequest } from 'fastify';
 import { scriptAdmissionSchema, scriptEncryptedValueSchema, scriptRegistrationRequestSchema, scriptInvocationRequestSchema } from '@slopus/happy-wire';
 import { verifyScriptServiceToken, hashScriptManagementRequest, scriptAutomationId, type ScriptServiceOperation } from '@slopus/happy-wire/scriptServiceToken';
 import type { Fastify } from '../types';
 import { inTx } from '@/storage/inTx';
+import { lockWorkMachineWorker, permitWorkMachineExecution } from '@/app/machine/workMachineExecution';
+import { requireWorkMachineWorkerAuth } from '@/app/api/utils/enableAuthentication';
 import { projectAccess } from '@/app/automation/automationService';
 import { saveScriptAutomation } from '@/app/automation/scriptRegistrationService';
 import { createScriptArtifactService } from '@/app/automation/scriptArtifactService';
@@ -48,6 +50,32 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
   enabled: () => process.env.HAPPY_SCRIPT_AUTOMATIONS_ENABLED === '1' && !!process.env.SCRIPT_AUTOMATION_ADMISSION_SECRET,
   serviceSecret: () => process.env.SCRIPT_AUTOMATION_ADMISSION_SECRET,
 }) {
+  /**
+   * A machine under work-machine authority runs scripts only with its device
+   * daemon credential, and only for its own machine path. Each call locks the
+   * live generation: a claim is new work and stops at drain, leaving queued
+   * runs untouched, and a claim handed out records the first execution; a run
+   * already claimed keeps reporting until the freeze.
+   * Without a device credential the machine must be outside that authority.
+   */
+  const authenticateWorker = requireWorkMachineWorkerAuth(app);
+  function workerTransaction<T>(
+    request: Pick<FastifyRequest, 'workMachineDaemonGrant'> & { userId: string; params: { machineId: string } },
+    operation: (tx: Prisma.TransactionClient) => Promise<T>,
+    { newWork = false, startedWork }: { newWork?: boolean; startedWork?: (result: T) => boolean } = {},
+  ): Promise<T> {
+    const grant = request.workMachineDaemonGrant;
+    return dependencies.transaction(async tx => {
+      const worker = { accountId: request.userId, machineId: request.params.machineId };
+      if (!await lockWorkMachineWorker(tx, worker, grant, { newWork: newWork || !!startedWork })) throw new Error('MACHINE_DENIED');
+      const result = await operation(tx);
+      // A claim handed to the device is work this generation runs: it records
+      // the first execution, which closes the way back.
+      if (grant && startedWork?.(result) && !await permitWorkMachineExecution(tx, grant, new Date())) throw new Error('MACHINE_DENIED');
+      return result;
+    });
+  }
+
   function proof<T extends ScriptServiceOperation['operation']>(token: string, operation: T, scope: { projectId: string; automationId: string }) {
     const secret = dependencies.serviceSecret?.();
     if (!secret) throw new Error('SCRIPT_SERVICE_SECRET_REQUIRED');
@@ -185,8 +213,8 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
   })));
 
   app.get('/v1/machines/:machineId/script-automations', {
-    preHandler: app.authenticate, schema: { params: machineParams, querystring: z.strictObject({ after: identifier.optional() }) },
-  }, (request, reply) => handle(reply, async () => dependencies.transaction(async (tx) => {
+    preHandler: authenticateWorker, schema: { params: machineParams, querystring: z.strictObject({ after: identifier.optional() }) },
+  }, (request, reply) => handle(reply, async () => workerTransaction(request, async (tx) => {
     const rows = await tx.automation.findMany({ where: { machineAccountId: request.userId, machineId: request.params.machineId,
       payloadVersion: 3, deletedAt: null, ...(request.query.after ? { id: { gt: request.query.after } } : {}) },
       include: includes, orderBy: { id: 'asc' }, take: 100 });
@@ -197,8 +225,8 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
   })));
 
   app.get('/v1/machines/:machineId/script-automations/:automationId/artifact', {
-    preHandler: app.authenticate, schema: { params: machineAutomationParams },
-  }, (request, reply) => handle(reply, async () => dependencies.transaction(async (tx) => {
+    preHandler: authenticateWorker, schema: { params: machineAutomationParams },
+  }, (request, reply) => handle(reply, async () => workerTransaction(request, async (tx) => {
     const { row } = await validateScriptTarget(tx, request.params.automationId, request.userId, request.params.machineId);
     const revision = await tx.scriptAutomationRevision.findUniqueOrThrow({ where: {
       automationId_revision: { automationId: row.id, revision: row.revision },
@@ -211,42 +239,42 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
   })));
 
   app.post('/v1/machines/:machineId/script-automations/:automationId/ready', {
-    preHandler: app.authenticate, schema: { params: machineAutomationParams, body: z.strictObject({ revision: z.number().int().positive() }) },
-  }, (request, reply) => handle(reply, async () => dependencies.transaction(async (tx) => {
+    preHandler: authenticateWorker, schema: { params: machineAutomationParams, body: z.strictObject({ revision: z.number().int().positive() }) },
+  }, (request, reply) => handle(reply, async () => workerTransaction(request, async (tx) => {
     await markScriptReady(tx, request.userId, request.params.machineId, request.params.automationId, request.body.revision, Date.now());
     return { ok: true };
   })));
 
   app.post('/v1/machines/:machineId/script-automations/:automationId/validation-failed', {
-    preHandler: app.authenticate, schema: { params: machineAutomationParams, body: z.strictObject({ revision: z.number().int().positive() }) },
-  }, (request, reply) => handle(reply, async () => dependencies.transaction(async (tx) => {
+    preHandler: authenticateWorker, schema: { params: machineAutomationParams, body: z.strictObject({ revision: z.number().int().positive() }) },
+  }, (request, reply) => handle(reply, async () => workerTransaction(request, async (tx) => {
     await markScriptValidationFailed(tx, request.userId, request.params.machineId, request.params.automationId, request.body.revision);
     return { ok: true };
   })));
 
   app.post('/v1/machines/:machineId/script-automations/:automationId/claim', {
-    preHandler: app.authenticate, schema: { params: machineAutomationParams, body: z.strictObject({}) },
+    preHandler: authenticateWorker, schema: { params: machineAutomationParams, body: z.strictObject({}) },
   }, (request, reply) => handle(reply, async () => {
-    const existing = await dependencies.transaction(async (tx) => {
+    const existing = await workerTransaction(request, async (tx) => {
       await validateScriptTarget(tx, request.params.automationId, request.userId, request.params.machineId);
       const claim = await scriptQueueInTransaction(tx).claim(request.params.automationId, request.userId, request.params.machineId, Date.now());
       const artifact = claim ? await tx.scriptArtifact.findUniqueOrThrow({ where: { id: claim.run.snapshot.artifactId } }) : null;
       return { claim, artifact };
-    });
+    }, { startedWork: result => result.claim !== null });
     if (existing.claim) {
       try {
-        await dependencies.transaction((tx) => enqueueDueScript(tx, request.userId, request.params.machineId, request.params.automationId, Date.now()));
+        await workerTransaction(request, (tx) => enqueueDueScript(tx, request.userId, request.params.machineId, request.params.automationId, Date.now()), { newWork: true });
       } catch (error) {
       app.log.warn({ err: error, automationId: request.params.automationId }, 'Deferred due script admission after returning an existing claim');
       }
       return existing;
     }
-    return dependencies.transaction(async (tx) => {
+    return workerTransaction(request, async (tx) => {
       await enqueueDueScript(tx, request.userId, request.params.machineId, request.params.automationId, Date.now());
       const queued = await scriptQueueInTransaction(tx).claim(request.params.automationId, request.userId, request.params.machineId, Date.now());
       const artifact = queued ? await tx.scriptArtifact.findUniqueOrThrow({ where: { id: queued.run.snapshot.artifactId } }) : null;
       return { claim: queued, artifact };
-    });
+    }, { startedWork: result => result.claim !== null });
   }));
 
   async function ownedRun(tx: Prisma.TransactionClient, accountId: string, machineId: string, id: string) {
@@ -257,9 +285,9 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
     return run;
   }
   app.post('/v1/machines/:machineId/script-runs/:runId/context', {
-    preHandler: app.authenticate, schema: { params: runParams, body: claimBody },
+    preHandler: authenticateWorker, schema: { params: runParams, body: claimBody },
   }, (request, reply) => handle(reply, async () => {
-    const outcome = await dependencies.transaction(async (tx) => {
+    const outcome = await workerTransaction(request, async (tx) => {
       const run = await ownedRun(tx, request.userId, request.params.machineId, request.params.runId);
       const { row } = await validateScriptTarget(tx, run.automationId, request.userId, request.params.machineId);
       try {
@@ -275,9 +303,9 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
   }));
   for (const operation of ['start', 'heartbeat', 'abandon'] as const) {
     app.post(`/v1/machines/:machineId/script-runs/:runId/${operation}`, {
-      preHandler: app.authenticate, schema: { params: runParams, body: claimBody.extend({ executionProof: z.string().max(8192).optional() }) },
+      preHandler: authenticateWorker, schema: { params: runParams, body: claimBody.extend({ executionProof: z.string().max(8192).optional() }) },
     }, (request, reply) => handle(reply, async () => {
-      const ok = await dependencies.transaction(async (tx) => {
+      const ok = await workerTransaction(request, async (tx) => {
         const run = await ownedRun(tx, request.userId, request.params.machineId, request.params.runId);
         if (operation === 'start') {
           const { row } = await validateScriptTarget(tx, run.automationId, request.userId, request.params.machineId);
@@ -299,20 +327,20 @@ export function scriptAutomationRoutes(app: Fastify, dependencies: ScriptRouteDe
     }));
   }
   app.post('/v1/machines/:machineId/script-runs/:runId/complete', {
-    preHandler: app.authenticate, bodyLimit: 6 * 1024 * 1024,
+    preHandler: authenticateWorker, bodyLimit: 6 * 1024 * 1024,
     schema: { params: runParams, body: claimBody.extend({ exitCode: z.number().int().nullable(),
       logCiphertext: z.string().max(6 * 1024 * 1024).refine((value) => {
         try { return scriptEncryptedValueSchema.safeParse(JSON.parse(value)).success; } catch { return false; }
       }), failureCode: z.string().regex(/^[A-Z0-9_]{1,100}$/).optional() }) },
-  }, (request, reply) => handle(reply, async () => dependencies.transaction(async (tx) => {
+  }, (request, reply) => handle(reply, async () => workerTransaction(request, async (tx) => {
     const run = await ownedRun(tx, request.userId, request.params.machineId, request.params.runId);
     const receipt = await scriptQueueInTransaction(tx).complete(run.id, request.body.token, request.body, Date.now());
     return { ok: true, ...receipt };
   })));
   app.post('/v1/machines/:machineId/script-runs/:runId/fail', {
-    preHandler: app.authenticate,
+    preHandler: authenticateWorker,
     schema: { params: runParams, body: claimBody.extend({ failureCode: z.string().regex(/^[A-Z0-9_]{1,100}$/) }) },
-  }, (request, reply) => handle(reply, async () => dependencies.transaction(async (tx) => {
+  }, (request, reply) => handle(reply, async () => workerTransaction(request, async (tx) => {
     const run = await ownedRun(tx, request.userId, request.params.machineId, request.params.runId);
     await scriptQueueInTransaction(tx).failClaim(run.id, request.body.token, request.body.failureCode, Date.now());
     return { ok: true };

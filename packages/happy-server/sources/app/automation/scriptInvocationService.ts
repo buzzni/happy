@@ -27,6 +27,8 @@ export type ScriptInvocation = {
 export type ScriptEnqueueInput = Pick<ScriptInvocation,
   'automationId' | 'revision' | 'generation' | 'trigger' | 'requestedBy' | 'idempotencyKey' | 'bodyHash' | 'inputCiphertext'
 > & { projectId: string; keyId?: string; keyEpoch?: number; id?: string; scheduledFor?: number; missedCount?: number };
+/** A claimed run that has not started holds its claim this long; starting replaces the lease. */
+export const SCRIPT_CLAIM_LEASE_MS = 120000;
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
 function fail(code: string): never { throw new Error(code); }
 
@@ -170,7 +172,7 @@ export function createScriptInvocationService(database: ScriptQueueDatabase) {
         if ((await tx.query('SELECT id FROM "ScriptInvocation" WHERE "automationId"=$1 AND status IN (\'CLAIMED\',\'RUNNING\')', [automation.id])).length) return null;
         const token = randomBytes(32).toString('base64url');
         const [run] = await tx.query<ScriptInvocation>(`UPDATE "ScriptInvocation" SET status='CLAIMED', "claimHash"=$2,"leaseExpiresAt"=$3
-          WHERE id=(SELECT id FROM "ScriptInvocation" WHERE "automationId"=$1 AND status='QUEUED' ORDER BY "createdAt",id LIMIT 1) RETURNING *`, [automation.id, hash(token), now + 120000]);
+          WHERE id=(SELECT id FROM "ScriptInvocation" WHERE "automationId"=$1 AND status='QUEUED' ORDER BY "createdAt",id LIMIT 1) RETURNING *`, [automation.id, hash(token), now + SCRIPT_CLAIM_LEASE_MS]);
         return run ? { run, token } : null;
       });
     },

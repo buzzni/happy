@@ -317,5 +317,5 @@ export async function createSessionScopedTokenIssuer(input: {
  */
 export type Principal =
     | { kind: 'account'; accountId: string; extras?: unknown }
-    | { kind: 'browser-sync'; accountId: string }
+    | { kind: 'browser-sync'; accountId: string; workMachineIngress?: true }
     | { kind: 'managed-session'; claims: SessionScopedClaims };

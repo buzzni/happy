@@ -36,6 +36,20 @@ export const MAX_ASSERTION_LIFETIME_MS = 120_000;
 const CLOCK_SKEW_MS = 5_000;
 
 export type ControlOperation =
+    | 'work-machine-browser-sync'
+    | 'work-machine-execution-state'
+    | 'work-machine-mcp-admit'
+    | 'work-machine-mcp-finish'
+    | 'work-machine-mcp-execution-scope'
+    | 'work-machine-daemon-execution-scope'
+    | 'work-machine-mcp-mint-state'
+    | 'work-machine-enroll'
+    | 'work-machine-drain'
+    | 'work-machine-freeze'
+    | 'work-machine-resume'
+    | 'work-machine-replace'
+    | 'work-machine-restore'
+    | 'work-machine-mcp-reconcile'
     | 'authority-sync'
     /**
      * Reads both projections. Separate from the write op so an assertion signed
@@ -117,6 +131,16 @@ export type ControlOperation =
     | 'approval-grant-resolve';
 
 export const CONTROL_OPERATIONS: readonly ControlOperation[] = [
+    'work-machine-browser-sync',
+    'work-machine-execution-state',
+    'work-machine-mcp-admit',
+    'work-machine-mcp-finish',
+    'work-machine-mcp-execution-scope',
+    'work-machine-daemon-execution-scope',
+    'work-machine-mcp-mint-state',
+    'work-machine-enroll',
+    'work-machine-drain', 'work-machine-freeze', 'work-machine-resume',
+    'work-machine-replace', 'work-machine-restore', 'work-machine-mcp-reconcile',
     'authority-sync', 'authority-snapshot',
     'daemon-bootstrap', 'daemon-renew', 'daemon-resolve',
     'grant-mint', 'grant-renew', 'grant-resolve', 'grant-revoke',

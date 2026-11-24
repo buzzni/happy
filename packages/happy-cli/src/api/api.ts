@@ -11,6 +11,7 @@ import { SessionOwnershipProofSchema, sessionCreateBodyHash, sessionTagHash, typ
 import { HappySessionExecutionProofSchema, type HappySessionExecutionProof, type SessionExecutionCreateBody } from '@slopus/happy-wire';
 import type { createDeviceEnrollment } from '@/daemon/deviceEnrollment';
 import type { DeviceKeys } from '@/daemon/deviceKeys';
+import type { WorkMachineSessionCredentials } from '@/daemon/workMachineCredential';
 import axios from 'axios'
 import { logger } from '@/ui/logger'
 import type { AgentState, CreateSessionResponse, Metadata, Session, Machine, MachineMetadata, DaemonState } from '@/api/types'
@@ -39,6 +40,7 @@ import type { LegacyDispatchReservation } from '@/utils/workspaceTurnAdmission';
 type ApiPrincipal =
   | { kind: 'account'; credential: Credentials }
   | { kind: 'managed-session'; attachment: ManagedAttachment }
+  | { kind: 'work-machine-session'; credential: WorkMachineSessionCredentials; token: string }
   /**
    * The daemon of a managed runtime.
    *
@@ -79,6 +81,10 @@ export class ApiClient {
     return new ApiClient({ kind: 'account', credential });
   }
 
+  static workMachineSession(credential: WorkMachineSessionCredentials) {
+    return new ApiClient({ kind: 'work-machine-session', credential, token: credential.initial.token });
+  }
+
   /**
    * A client for a session this process did not create.
    *
@@ -101,9 +107,41 @@ export class ApiClient {
     // not register for the customer's notifications: its bearer is scoped to
     // this machine, and pushing from it would put runtime activity into the
     // account's notification stream as if the person had done it.
-    this.pushClient = principal.kind === 'account'
+    // A protected conversation pushes with its own (renewed) session credential: the server refuses
+    // the account bearer there. The daemon's wmx_ machine credential is not a push principal.
+    this.pushClient = principal.kind === 'account' && !this.usesWorkMachineExecutionGrant()
       ? new PushNotificationClient(principal.credential.token, configuration.serverUrl)
-      : null
+      : principal.kind === 'work-machine-session'
+        ? new PushNotificationClient(() => principal.token, configuration.serverUrl)
+        : null
+  }
+
+  usesWorkMachineExecutionGrant(): boolean {
+    return this.principal.kind === 'account' && this.principal.credential.token.startsWith('wmx_');
+  }
+
+  workMachineMcpProof() {
+    const principal = this.principal;
+    if (principal.kind !== 'work-machine-session') return undefined;
+    return { sessionId: principal.credential.sessionId, token: () => principal.token };
+  }
+
+  /**
+   * `start`: the process is starting without a turn of its own (a resume or a recovery). The server
+   * still refuses it while the machine drains or is frozen, but records no first execution: that
+   * would close the way back to the previous PC before anything ran. A turn asks again without it.
+   */
+  async permitWorkMachineSessionExecution(options: { start?: true } = {}): Promise<void> {
+    const principal = this.principal;
+    if (principal.kind !== 'work-machine-session') throw new Error('Work machine session authorization is unavailable');
+    try {
+      // A JSON object even when empty: axios sends a bodiless POST as a form, which the server's parsers refuse (415).
+      await axios.post(`${configuration.serverUrl.replace(/\/+$/, '')}/v1/sessions/${encodeURIComponent(principal.credential.sessionId)}/work-machine-permit`, options.start ? { start: true } : {}, {
+        headers: { Authorization: `Bearer ${principal.token}` }, timeout: 10_000, maxRedirects: 0,
+      });
+    } catch {
+      throw new Error('Work machine session execution was not authorized');
+    }
   }
 
   /**
@@ -162,7 +200,7 @@ export class ApiClient {
   /** The bearer this client presents, whichever principal it is. */
   private bearer(): string {
     if (this.principal.kind === 'account') return this.principal.credential.token;
-    if (this.principal.kind === 'managed-machine') return this.principal.token;
+    if (this.principal.kind === 'managed-machine' || this.principal.kind === 'work-machine-session') return this.principal.token;
     return this.principal.attachment.scopedToken;
   }
 
@@ -189,6 +227,10 @@ export class ApiClient {
       throw new Error('attaching to a registered machine needs a managed runtime credential');
     }
     const { machineId, machineKey } = this.principal;
+    return this.readRegisteredMachine(machineId, machineKey);
+  }
+
+  private async readRegisteredMachine(machineId: string, machineKey: Uint8Array): Promise<Machine> {
     const response = await axios.get(
       `${configuration.serverUrl}/v1/machines/${encodeURIComponent(machineId)}`,
       {
@@ -510,6 +552,15 @@ export class ApiClient {
     }
 
     const { encryptionKey, encryptionVariant, wrapMaterial } = this.resolveMachineEncryption();
+    if (this.usesWorkMachineExecutionGrant()) {
+      if (encryptionVariant !== 'dataKey') {
+        throw new Error('an existing work machine needs its issued data key');
+      }
+      const machine = await this.readRegisteredMachine(opts.machineId, encryptionKey);
+      return opts.daemonState
+        ? { ...machine, daemonState: { ...machine.daemonState, ...opts.daemonState } }
+        : machine;
+    }
     // aplus §6-1 B1 — 서버 서비스 공개키가 알려져 있으면 machineKey 를 서버
     // 몫으로도 wrap 한다 (이중 수신자). 세션 키는 여기 관여하지 않는다.
     const serverPublicKey = opts.serverPublicKey
@@ -862,6 +913,17 @@ export class ApiClient {
         { providerUsageStore: this.usageSpool(session) },
       );
     }
+    if (this.principal.kind === 'work-machine-session') {
+      const principal = this.principal;
+      if (principal.credential.sessionId !== session.id || session.encryptionVariant !== 'dataKey') {
+        throw new Error('Work machine session authorization mismatch');
+      }
+      applySessionUrlEnv(process.env, session.id, configuration.webappUrl);
+      const client = new ApiSessionClient(this.bearer(), session, undefined, { ...options, providerUsageStore: this.usageSpool(session) });
+      client.bindWorkMachineCredential(principal.credential, token => { principal.token = token; },
+        () => this.permitWorkMachineSessionExecution());
+      return client;
+    }
     // The session id is confirmed exactly here for every flavor (claude, codex,
     // gemini, openclaw, acp — online, reconnect-in-place, and offline→reconnect
     // all funnel through this factory before the agent loop starts), so export
@@ -882,16 +944,17 @@ export class ApiClient {
 
   /**
    * Post a session event to the durable event log on the server.
-   * Used by daemon recovery to emit session-end for dead sessions.
+   * Used by daemon recovery to emit session-end for dead sessions. `token` is a protected
+   * conversation's own session credential, which the server requires there.
    */
-  async postSessionEvent(sessionId: string, eventType: string, content: string): Promise<void> {
+  async postSessionEvent(sessionId: string, eventType: string, content: string, token?: string): Promise<void> {
     try {
       await axios.post(
         `${configuration.serverUrl}/v3/sessions/${sessionId}/events`,
         { eventType, content },
         {
           headers: {
-            'Authorization': `Bearer ${this.bearer()}`,
+            'Authorization': `Bearer ${token ?? this.bearer()}`,
             'Content-Type': 'application/json'
           },
           timeout: 10000

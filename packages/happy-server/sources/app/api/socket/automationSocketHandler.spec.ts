@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const services = vi.hoisted(() => ({
+    lockLegacyWorkMachineExecution: vi.fn(),
     ackAutomationSync: vi.fn(),
     claimAutomationRun: vi.fn(),
     heartbeatAutomationRun: vi.fn(),
@@ -29,15 +30,36 @@ vi.mock('@/app/automation/sessionFollowupUpdate', () => ({
     emitSessionFollowupMessageUpdate: services.emitSessionFollowupMessageUpdate,
 }));
 vi.mock('@/storage/inTx', () => ({ inTx: (callback: (tx: unknown) => unknown) => callback({}) }));
+vi.mock('@/app/machine/workMachineExecution', () => ({
+    // These sockets carry no device credential: the worker lock is the legacy one.
+    lockWorkMachineWorker: (tx: unknown, worker: { accountId: string; machineId: string }, device: unknown) => {
+        if (device) throw new Error('device credentials are covered by the pglite spec');
+        return services.lockLegacyWorkMachineExecution(tx, worker.accountId, worker.machineId);
+    },
+}));
 
 import { automationSocketHandler } from './automationSocketHandler';
 
 describe('automationSocketHandler', () => {
     beforeEach(() => {
         vi.clearAllMocks();
+        services.lockLegacyWorkMachineExecution.mockResolvedValue(true);
         process.env.SAYCODE_AUTOMATION_ENABLED = 'true';
     });
     afterEach(() => delete process.env.SAYCODE_AUTOMATION_ENABLED);
+
+    it('checks current authority inside the worker transaction before claiming a scheduled run', async () => {
+        const handlers = new Map<string, Function>();
+        const socket = { on: vi.fn((event: string, handler: Function) => handlers.set(event, handler)) };
+        services.lockLegacyWorkMachineExecution.mockResolvedValueOnce(false);
+        services.claimAutomationRun.mockResolvedValue({ ok: true, value: { projectId: 'p1' } });
+        automationSocketHandler('account-1', 'machine-1', socket as never);
+        const callback = vi.fn();
+        await handlers.get('automation-claim')!({ automationId: 'a1', generation: 1, scheduledFor: 0 }, callback);
+        expect(services.lockLegacyWorkMachineExecution).toHaveBeenCalledWith({}, 'account-1', 'machine-1');
+        expect(services.claimAutomationRun).not.toHaveBeenCalled();
+        expect(callback).toHaveBeenCalledWith({ ok: false, error: 'forbidden' });
+    });
 
     it.each([undefined, 0, 1, 99])('validates explicit isolation readiness on authenticated key registration (%s)', async contextIsolationVersion => {
         const handlers = new Map<string, Function>();

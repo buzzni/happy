@@ -95,8 +95,8 @@ interface LoopOptions {
     /** Called after /clear actually resets the provider context. */
     onSessionReset?: () => void
     onActiveUserInputAccepted?: (text: string) => void
-    /** Called when a queued batch is handed to the provider, with the text it carries. */
-    onUserInputDelivered?: (text: string) => void
+    /** Called when a queued batch is handed to the provider, with the text of each input it joins. */
+    onUserInputDelivered?: (texts: string[]) => void
     /**
      * Called when a collected batch's mode becomes the settings of an engine
      * query — the engine-applied boundary. Carries every client request the

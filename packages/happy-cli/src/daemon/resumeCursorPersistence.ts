@@ -28,6 +28,8 @@ export interface ResumeCursorPersistInput {
     lastPersistAt?: number;
     now: number;
     intervalMs?: number;
+    /** The record's metadata changed (a reported provider identity): written at once, like a first cursor. */
+    metadataChanged?: boolean;
 }
 
 export function decideResumeCursorPersist(input: ResumeCursorPersistInput): boolean {
@@ -36,6 +38,7 @@ export function decideResumeCursorPersist(input: ResumeCursorPersistInput): bool
 
     if (cursor === undefined) return false;
     if (!Number.isInteger(cursor) || cursor < 0) return false;
+    if (input.metadataChanged) return true;
 
     // Nothing on disk yet: this write is the difference between a resumable
     // session and one that is stranded by the next hard kill. Do not throttle.
@@ -47,4 +50,24 @@ export function decideResumeCursorPersist(input: ResumeCursorPersistInput): bool
 
     if (lastPersistAt === undefined) return true;
     return now - lastPersistAt >= intervalMs;
+}
+
+export type ProviderIdentity = { claudeSessionId?: string; codexThreadId?: string };
+
+/**
+ * The record metadata with the provider conversation a session reported, or null when it already names it.
+ *
+ * The daemon records a session's metadata when it starts, before Claude or Codex names its
+ * conversation, and only a resume refreshes it from the server. A stopped work machine's export
+ * (aplus-dev-studio specs/work-machine-migration 5.4) reads the provider identity from this record,
+ * and a frozen generation can no longer read it from the server.
+ */
+export function withReportedProviderIdentity<T extends ProviderIdentity>(metadata: T, reported: ProviderIdentity | undefined): T | null {
+    if (!reported) return null;
+    const next: T = {
+        ...metadata,
+        ...(reported.claudeSessionId ? { claudeSessionId: reported.claudeSessionId } : {}),
+        ...(reported.codexThreadId ? { codexThreadId: reported.codexThreadId } : {}),
+    };
+    return next.claudeSessionId === metadata.claudeSessionId && next.codexThreadId === metadata.codexThreadId ? null : next;
 }

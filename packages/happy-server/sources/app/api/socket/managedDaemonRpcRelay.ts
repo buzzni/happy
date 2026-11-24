@@ -24,6 +24,10 @@
  * around.
  */
 import type { Server, Socket } from 'socket.io';
+import type { WorkMachineExecutionClaims } from '@/app/auth/workMachineExecutionToken';
+import { lockWorkMachineExecution, permitWorkMachineExecution } from '@/app/machine/workMachineExecution';
+import { splitRpcMethod } from '@/app/api/socket/managed/managedRpcTarget';
+import { db } from '@/storage/db';
 
 import { managedControlRuntime, managedOutboundAllowed } from '@/app/api/socket/managedDaemonOutboundGuard';
 
@@ -64,6 +68,36 @@ export type DaemonRpcRelayDeps = {
     now?: () => number;
 };
 
+/**
+ * What an RPC to a work machine does to its execution. Reads and stopping a
+ * turn or a conversation run nothing new: drain allows them and they record no
+ * first execution. Bringing a conversation back up is refused while draining,
+ * like new work, but runs no turn either: its process asks for its own permit
+ * before a turn starts. A permission answer belongs to a turn already running,
+ * so drain allows it, but an approval lets a tool run, so it records the first
+ * execution. Every other method is new work, refused while draining.
+ */
+const workMachineRpcTiers = new Map<string, 'read' | 'turn-stop' | 'turn-answer' | 'start'>([
+    ['readFile', 'read'], ['readFileChunk', 'read'], ['listDirectory', 'read'], ['listFilesPage', 'read'],
+    ['listWorkspaceDirectory', 'read'], ['readWorkspaceFile', 'read'], ['readWorkspaceFileChunk', 'read'],
+    ['listWorkspaceDownloadDirectory', 'read'], ['closeWorkspaceDownloadDirectory', 'read'],
+    // The daemon's metadata methods: fixed-shape status answers, no command the caller chooses. A git status
+    // the web client reads through `bash` stays new work: the server cannot see which command it carries.
+    ['workspace-path-stat', 'read'], ['workspace-git-info', 'read'], ['preview-liveness', 'read'],
+    ['listening-ports', 'read'], ['container-runtime-status', 'read'], ['gh-auth-status', 'read'], ['machine-info', 'read'],
+    // What Studio reads on page open and by timer, with fixed git calls and fixed scripts instead of `bash`:
+    // git status and the branch's pull request, AI usage, agent CLI login and Codex models.
+    ['workspace-git-status', 'read'], ['workspace-current-pr', 'read'], ['machine-ai-usage', 'read'], ['agent-login-status', 'read'], ['codex-cli-status', 'read'],
+    // Status the web client polls; a poll after a switch must not close the way back.
+    ['daemon-session-state', 'read'], ['mcp-status', 'read'], ['getDirectoryTree', 'read'], ['ripgrep', 'read'],
+    ['get-port', 'read'], ['claude-list-rewind-points', 'read'], ['codex-list-rewind-points', 'read'],
+    ['checkpoint:list', 'read'], ['checkpoint:status', 'read'], ['checkpoint:diff', 'read'],
+    // The idle reaper and the user's stop end a conversation's process.
+    ['abort', 'turn-stop'], ['stop-session', 'turn-stop'], ['killSession', 'turn-stop'],
+    ['resume-happy-session', 'start'],
+    ['permission', 'turn-answer'],
+]);
+
 function defaultLocalSocket(io: Server, socketId: string): Socket | undefined {
     return io.sockets.sockets.get(socketId);
 }
@@ -94,10 +128,25 @@ export async function executeDaemonRpcLocally(input: {
         return { accepted: true, refused: true };
     }
 
-    const allowed = await (deps.allowed ?? managedOutboundAllowed)({
+    let allowed = await (deps.allowed ?? managedOutboundAllowed)({
         target: socket as never,
         managedControl: managedControlRuntime(),
     });
+    const execution = socket.data?.workMachineExecution as WorkMachineExecutionClaims | undefined;
+    if (allowed && execution) {
+        const method = splitRpcMethod(input.request.method);
+        const scopeId = method?.sessionId;
+        const tier = (method && workMachineRpcTiers.get(method.name)) ?? 'new-work';
+        const expectedScopeId = execution.purpose === 'daemon' ? execution.machineId : execution.sessionId;
+        try {
+            allowed = scopeId === expectedScopeId && now() < execution.expiresAt
+                && await (tier === 'new-work' ? permitWorkMachineExecution(db, execution, new Date(now()))
+                    : tier === 'turn-answer' ? permitWorkMachineExecution(db, execution, new Date(now()), true)
+                    : lockWorkMachineExecution(db, execution, { newWork: tier === 'start' }));
+        } catch {
+            allowed = false;
+        }
+    }
     /*
      * Checked **again after the await**, and this is the whole point of having
      * a deadline at all: the authority answer can arrive after the caller

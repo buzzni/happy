@@ -4,8 +4,23 @@ import { buildMachineActivityEphemeral, buildUpdateMachineUpdate, eventRouter } 
 import { log } from "@/utils/log";
 import { db } from "@/storage/db";
 import { Socket } from "socket.io";
+import type { Prisma } from "@prisma/client";
+import type { WorkMachineExecutionClaims } from "@/app/auth/workMachineExecutionToken";
+import { lockWorkMachineExecution } from "@/app/machine/workMachineExecution";
 import { allocateUserSeq } from "@/storage/seq";
 import { randomKeyNaked } from "@/utils/randomKeyNaked";
+
+async function updateAuthorizedMachine(socket: Socket, accountId: string, machineId: string, update: Prisma.MachineUpdateManyArgs) {
+    const grant = socket.data.workMachineExecution as WorkMachineExecutionClaims | undefined;
+    if (!grant) {
+        return db.machine.updateMany({ ...update, where: { ...update.where, workMachineExecution: { is: null } } });
+    }
+    if (grant.purpose !== 'daemon' || grant.machineId !== machineId || grant.accountId !== accountId) return null;
+    return db.$transaction(async tx => {
+        if (grant.expiresAt <= Date.now() || !await lockWorkMachineExecution(tx, grant)) return null;
+        return tx.machine.updateMany(update);
+    });
+}
 
 export function machineUpdateHandler(userId: string, socket: Socket) {
     const labels = getMetricsLabelsFromSocket(socket);
@@ -90,7 +105,7 @@ export function machineUpdateHandler(userId: string, socket: Socket) {
             }
 
             // Update metadata with atomic version check
-            const { count } = await db.machine.updateMany({
+            const updated = await updateAuthorizedMachine(socket, userId, machineId, {
                 where: {
                     accountId: userId,
                     id: machineId,
@@ -103,7 +118,11 @@ export function machineUpdateHandler(userId: string, socket: Socket) {
                 }
             });
 
-            if (count === 0) {
+            if (!updated) {
+                callback?.({ result: 'error', message: 'Work machine execution is not authorized' });
+                return;
+            }
+            if (updated.count === 0) {
                 // Re-fetch current version
                 const current = await db.machine.findFirst({
                     where: {
@@ -184,7 +203,7 @@ export function machineUpdateHandler(userId: string, socket: Socket) {
             }
 
             // Update daemon state with atomic version check
-            const { count } = await db.machine.updateMany({
+            const updated = await updateAuthorizedMachine(socket, userId, machineId, {
                 where: {
                     accountId: userId,
                     id: machineId,
@@ -198,7 +217,11 @@ export function machineUpdateHandler(userId: string, socket: Socket) {
                 }
             });
 
-            if (count === 0) {
+            if (!updated) {
+                callback?.({ result: 'error', message: 'Work machine execution is not authorized' });
+                return;
+            }
+            if (updated.count === 0) {
                 // Re-fetch current version
                 const current = await db.machine.findFirst({
                     where: {

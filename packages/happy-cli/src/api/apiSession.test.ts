@@ -2,7 +2,7 @@ import ts from 'typescript';
 import { readFileSync } from 'node:fs';
 import { createSessionScanner } from '@/claude/utils/sessionScanner';
 import { getProjectPath } from '@/claude/utils/path';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, writeFile, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { configuration } from '@/configuration';
@@ -27,6 +27,7 @@ import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
 import { RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
+import { WorkMachineRenewalError } from '@/daemon/workMachineCredential';
 
 const {
     mockIo,
@@ -2218,6 +2219,20 @@ describe('ApiSessionClient v3 messages API migration', () => {
         }));
     });
 
+    // aplus specs/work-machine-migration 5.4: a stopped work machine's export reads the provider
+    // conversation from the daemon's record, which is written before the provider names it.
+    it('reports the provider conversation identity so the daemon record can name it', () => {
+        const client = new ApiSessionClient('fake-token', { ...session, metadata: { ...session.metadata,
+            claudeSessionId: '11111111-2222-4333-8444-555555555555', codexThreadId: '019a0000-0000-7000-8000-000000000001' } });
+
+        client.keepAlive(true, 'remote');
+
+        expect(mockNotifyDaemonSessionRuntime).toHaveBeenCalledWith('test-session-id', expect.objectContaining({
+            claudeSessionId: '11111111-2222-4333-8444-555555555555',
+            codexThreadId: '019a0000-0000-7000-8000-000000000001',
+        }));
+    });
+
     // The daemon uses this as the resume skip-baseline: report the seq actually
     // delivered to the agent loop, or dead-period messages get swallowed.
     it('reports the delivered message seq as the resume skip-baseline', () => {
@@ -3091,6 +3106,277 @@ describe('ApiSessionClient v3 messages API migration', () => {
         });
         expect((client as any).lastSeq).toBe(2);
         expect(mockAxiosGet).not.toHaveBeenCalled();
+    });
+
+    describe('on a work machine session credential', () => {
+        // aplus specs/work-machine-migration plan 5.1: a frozen generation runs nothing. Its socket
+        // can stay open after the freeze, so only the server's per-request read authorization decides.
+        const bound = (permitTurn: () => Promise<void> = async () => {}) => {
+            const credential = { token: 'wmx_session_for_tests', expiresAt: Date.now() + 300_000 };
+            const client = new ApiSessionClient(credential.token, session);
+            client.bindWorkMachineCredential({ sessionId: session.id, initial: credential, renew: async () => credential }, () => {}, permitTurn);
+            const onUserMessage = vi.fn();
+            client.onUserMessage(onUserMessage);
+            (client as any).lastSeq = 1;
+            return { client, onUserMessage };
+        };
+        const userMessage = { role: 'user', content: { type: 'text', text: 'sent while the generation is frozen' } };
+        const sessionEvent = { role: 'agent', content: { type: 'event', id: 'event-2', data: { type: 'message', message: 'note' } } };
+        const fileEvent = { role: 'session', content: { type: 'session', data: {
+            id: 'file-event', time: 1000, role: 'user', ev: { t: 'file', ref: 'sessions/s/attachments/a.enc', name: 'a.png', size: 64, mimeType: 'image/png' },
+        } } };
+        /** The server's durable rows; each read returns those after the requested cursor. */
+        const serveRows = (rows: Array<{ seq: number; body: unknown }>) => mockAxiosGet.mockImplementation(async (_url: string, config: { params: { after_seq: number } }) => ({
+            data: { hasMore: false, messages: rows.filter(row => row.seq > config.params.after_seq).map(row => ({
+                id: `msg-${row.seq}`, seq: row.seq, localId: null,
+                content: { t: 'encrypted', c: encryptContent(session, row.body) }, createdAt: 1000, updatedAt: 1000,
+            })) },
+        }));
+
+        // aplus specs/work-machine-migration plan 5.1: drain refuses new turns. A still-running
+        // generation reads while draining, so a fetched user message must not start a turn here.
+        it('leaves a fetched user message and its attachments on the server while the permit to start a turn is refused', async () => {
+            const permitTurn = vi.fn<() => Promise<void>>()
+                .mockRejectedValueOnce(new Error('Work machine session execution was not authorized'))
+                .mockResolvedValue(undefined);
+            const { client, onUserMessage } = bound(permitTurn);
+            const onOtherMessage = vi.fn();
+            const onFileEvent = vi.fn();
+            client.on('message', onOtherMessage);
+            client.onFileEvent(onFileEvent);
+            serveRows([{ seq: 2, body: sessionEvent }, { seq: 3, body: fileEvent }, { seq: 4, body: userMessage }]);
+
+            await (client as any).fetchMessages();
+
+            expect(onOtherMessage).toHaveBeenCalledTimes(1);
+            expect(onFileEvent).not.toHaveBeenCalled();
+            expect(onUserMessage).not.toHaveBeenCalled();
+            expect((client as any).lastSeq).toBe(2);
+
+            await (client as any).fetchMessages();
+
+            expect(permitTurn).toHaveBeenCalledTimes(2);
+            expect(onFileEvent).toHaveBeenCalledTimes(1);
+            expect(onUserMessage).toHaveBeenCalledTimes(1);
+            expect(onUserMessage).toHaveBeenCalledWith(expect.objectContaining({ serverSeq: 4 }));
+            expect(onOtherMessage).toHaveBeenCalledTimes(1);
+            expect((client as any).lastSeq).toBe(4);
+            await client.close();
+        });
+
+        it('keeps an attachment whose message has not arrived yet on the server, then delivers both', async () => {
+            const permitTurn = vi.fn(async () => {});
+            const { client, onUserMessage } = bound(permitTurn);
+            const onFileEvent = vi.fn();
+            client.onFileEvent(onFileEvent);
+            serveRows([{ seq: 2, body: fileEvent }]);
+
+            await (client as any).fetchMessages();
+
+            expect(onFileEvent).not.toHaveBeenCalled();
+            expect((client as any).lastSeq).toBe(1);
+
+            serveRows([{ seq: 2, body: fileEvent }, { seq: 3, body: userMessage }]);
+            await (client as any).fetchMessages();
+
+            expect(onFileEvent).toHaveBeenCalledTimes(1);
+            expect(onUserMessage).toHaveBeenCalledTimes(1);
+            expect((client as any).lastSeq).toBe(3);
+            await client.close();
+        });
+
+        it('asks for the permit for an attachment followed by other rows and keeps both on refusal', async () => {
+            const permitTurn = vi.fn<() => Promise<void>>().mockRejectedValue(new Error('Work machine session execution was not authorized'));
+            const { client } = bound(permitTurn);
+            const onOtherMessage = vi.fn();
+            const onFileEvent = vi.fn();
+            client.on('message', onOtherMessage);
+            client.onFileEvent(onFileEvent);
+            serveRows([{ seq: 2, body: fileEvent }, { seq: 3, body: sessionEvent }]);
+
+            await (client as any).fetchMessages();
+
+            expect(permitTurn).toHaveBeenCalledTimes(1);
+            expect(onFileEvent).not.toHaveBeenCalled();
+            expect(onOtherMessage).not.toHaveBeenCalled();
+            expect((client as any).lastSeq).toBe(1);
+            await client.close();
+        });
+
+        it('routes a fetched user message once the permit to start a turn is granted', async () => {
+            const permitTurn = vi.fn(async () => {});
+            const { client, onUserMessage } = bound(permitTurn);
+            serveRows([{ seq: 2, body: userMessage }, { seq: 3, body: { ...userMessage, content: { type: 'text', text: 'second' } } }]);
+
+            await (client as any).fetchMessages();
+
+            expect(permitTurn).toHaveBeenCalledTimes(1);
+            expect(onUserMessage).toHaveBeenCalledTimes(2);
+            expect((client as any).lastSeq).toBe(3);
+            await client.close();
+        });
+
+        it('does not ask for a turn permit for a fetched batch without user messages', async () => {
+            const permitTurn = vi.fn(async () => {});
+            const { client } = bound(permitTurn);
+            const onOtherMessage = vi.fn();
+            client.on('message', onOtherMessage);
+            serveRows([{ seq: 2, body: sessionEvent }]);
+
+            await (client as any).fetchMessages();
+
+            expect(permitTurn).not.toHaveBeenCalled();
+            expect(onOtherMessage).toHaveBeenCalledTimes(1);
+            expect((client as any).lastSeq).toBe(2);
+            await client.close();
+        });
+
+        it('routes a fetched user message on an unprotected session without a turn permit', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            const onUserMessage = vi.fn();
+            client.onUserMessage(onUserMessage);
+            (client as any).lastSeq = 1;
+            serveRows([{ seq: 2, body: userMessage }]);
+
+            await (client as any).fetchMessages();
+
+            expect(onUserMessage).toHaveBeenCalledTimes(1);
+            expect((client as any).lastSeq).toBe(2);
+            expect(mockAxiosPost).not.toHaveBeenCalledWith(expect.stringContaining('work-machine-permit'), expect.anything(), expect.anything());
+            await client.close();
+        });
+
+        it('does not take input from a socket push the server would no longer let it read', async () => {
+            const { client, onUserMessage } = bound();
+            mockAxiosGet.mockRejectedValue(Object.assign(new Error('Request failed with status code 403'), { response: { status: 403 } }));
+
+            emitSocketEvent('update', createNewMessageUpdate(2, encryptContent(session, userMessage)));
+            await waitForCheck(() => expect(mockAxiosGet).toHaveBeenCalled());
+
+            expect(onUserMessage).not.toHaveBeenCalled();
+            expect((client as any).lastSeq).toBe(1);
+            await client.close();
+        });
+
+        describe('stop record', () => {
+            // aplus specs/work-machine-migration requirement 6: the export signs what the session
+            // process itself recorded at exit, never the daemon's last (30 s throttled) cursor.
+            let home: string;
+            beforeEach(async () => { home = await mkdtemp(join(tmpdir(), 'wm-session-stop-')); });
+            afterEach(async () => { await rm(home, { recursive: true, force: true }); });
+
+            /** A protected client whose user messages go into a real loop queue. */
+            let signalListeners: Function[];
+            beforeEach(() => { signalListeners = process.listeners('SIGTERM'); });
+            const protectedLoop = (stopRecord: string, expiresIn = 300_000, renew?: () => Promise<{ token: string; expiresAt: number }>) => {
+                const credential = { token: 'wmx_session_for_tests', expiresAt: Date.now() + expiresIn };
+                const client = new ApiSessionClient(credential.token, session);
+                client.bindWorkMachineCredential({ sessionId: session.id, initial: credential, renew: renew ?? (async () => credential), stopRecord },
+                    () => {}, async () => {});
+                const queue = new MessageQueue2<string>(mode => mode);
+                client.configureInputQueue(queue, 'remote', false);
+                client.onUserMessage(message => queue.push(message.content.text, 'default', undefined, undefined, undefined, undefined, client.queueInput(message)));
+                (client as any).lastSeq = 10;
+                return { client, queue };
+            };
+            const text = (value: string) => ({ role: 'user', content: { type: 'text', text: value } });
+            const readStop = async (path: string) => JSON.parse(await readFile(path, 'utf8'));
+
+            it('records the cursor of a message a finished turn ran after the last throttled daemon write', async () => {
+                const stopRecord = join(home, 'work-machine-sessions', `${session.id}.json`);
+                const { client, queue } = protectedLoop(stopRecord);
+                serveRows([{ seq: 11, body: text('first') }, { seq: 12, body: text('second') }]);
+                await (client as any).fetchMessages();
+                await queue.waitForMessagesAndGetAsString();
+                client.keepAlive(true, 'remote');
+                client.keepAlive(false, 'remote');
+
+                await client.close();
+
+                expect(await readStop(stopRecord)).toEqual(expect.objectContaining({
+                    sessionId: session.id, cleanStop: true, lastProcessedSeq: 12, turnInFlight: false, inputSkipped: false,
+                }));
+            });
+
+            it('lowers the cursor below a message queued behind the running turn and records the turn in flight', async () => {
+                const stopRecord = join(home, 'work-machine-sessions', `${session.id}.json`);
+                const { client, queue } = protectedLoop(stopRecord);
+                serveRows([{ seq: 11, body: text('running') }]);
+                await (client as any).fetchMessages();
+                await queue.waitForMessagesAndGetAsString();
+                client.keepAlive(true, 'remote');
+                serveRows([{ seq: 11, body: text('running') }, { seq: 12, body: text('waiting') }]);
+                await (client as any).fetchMessages();
+
+                await client.close();
+
+                expect(await readStop(stopRecord)).toEqual(expect.objectContaining({ lastProcessedSeq: 11, turnInFlight: true }));
+            });
+
+            it('records a turn that was running when the process was told to stop, even if it ended before exit', async () => {
+                const stopRecord = join(home, 'work-machine-sessions', `${session.id}.json`);
+                const { client, queue } = protectedLoop(stopRecord);
+                serveRows([{ seq: 11, body: text('running') }]);
+                await (client as any).fetchMessages();
+                await queue.waitForMessagesAndGetAsString();
+                client.keepAlive(true, 'remote');
+                // The runner's own handler (runClaude/runCodex) is there in production; it aborts the turn on the way out.
+                const runnerHandler = () => client.keepAlive(false, 'remote');
+                process.on('SIGTERM', runnerHandler);
+                try {
+                    for (const listener of process.listeners('SIGTERM').filter(listener => !signalListeners.includes(listener))) {
+                        (listener as (signal: NodeJS.Signals) => void)('SIGTERM');
+                    }
+                } finally {
+                    process.off('SIGTERM', runnerHandler);
+                }
+                await client.close();
+
+                expect(await readStop(stopRecord)).toEqual(expect.objectContaining({ lastProcessedSeq: 11, turnInFlight: true }));
+                expect(process.listeners('SIGTERM')).toEqual(signalListeners);
+            });
+
+            it('records the turn a revoked (frozen) credential stopped', async () => {
+                const stopRecord = join(home, 'work-machine-sessions', `${session.id}.json`);
+                let revoke: (() => void) | undefined;
+                // Expiring within the refresh margin: the renewal starts at once and waits for the server.
+                const { client, queue } = protectedLoop(stopRecord, 60_000,
+                    () => new Promise((_, reject) => { revoke = () => reject(new WorkMachineRenewalError(true)); }));
+                serveRows([{ seq: 11, body: text('running') }]);
+                await (client as any).fetchMessages();
+                await queue.waitForMessagesAndGetAsString();
+                client.keepAlive(true, 'remote');
+                await waitForCheck(() => expect(revoke).toBeDefined());
+                revoke!();
+                await waitForCheck(() => expect((client as any).shutdownReceiveSeq).toBe(11));
+                client.keepAlive(false, 'remote');
+                await client.close();
+
+                expect(await readStop(stopRecord)).toEqual(expect.objectContaining({ lastProcessedSeq: 11, turnInFlight: true }));
+            });
+
+            it('removes the previous process record when it binds', async () => {
+                const stopRecord = join(home, 'work-machine-sessions', `${session.id}.json`);
+                await mkdir(join(home, 'work-machine-sessions'), { recursive: true });
+                await writeFile(stopRecord, '{}');
+                const { client } = protectedLoop(stopRecord);
+
+                await expect(readFile(stopRecord)).rejects.toMatchObject({ code: 'ENOENT' });
+                await client.close();
+            });
+        });
+
+        it('delivers a pushed message once the authorized read returns it', async () => {
+            const { client, onUserMessage } = bound();
+            mockAxiosGet.mockResolvedValue({ data: { hasMore: false, messages: [{ id: 'msg-2', seq: 2, localId: null,
+                content: { t: 'encrypted', c: encryptContent(session, userMessage) }, createdAt: 1000, updatedAt: 1000 }] } });
+
+            emitSocketEvent('update', createNewMessageUpdate(2, encryptContent(session, userMessage)));
+            await waitForCheck(() => expect(onUserMessage).toHaveBeenCalledTimes(1));
+
+            expect((client as any).lastSeq).toBe(2);
+            await client.close();
+        });
     });
 
     it('routes a message once when polling and the socket deliver the same seq concurrently', async () => {

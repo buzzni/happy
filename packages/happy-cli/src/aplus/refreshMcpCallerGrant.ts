@@ -12,6 +12,7 @@
 
 import { logger } from '@/ui/logger'
 import { createSerialLock, credentialFingerprint, recoverCredential, RefreshFailure } from '@/utils/refreshRecovery'
+import { workMachineMcpHeaders, type WorkMachineMcpProof } from './workMachineMcpProof'
 
 /** 턴 시작을 오래 붙잡지 않도록 갱신 상한(45초, C-R2)보다 짧게 둔다. */
 const TIMEOUT_MS = 3000
@@ -103,7 +104,7 @@ async function readRefusalCode(res: Response): Promise<string | undefined> {
 export async function refreshMcpCallerGrantIfExpiring(
     token: string,
     machineId: string,
-    context: { projectId?: string; sessionId?: string; now?: number } = {},
+    context: { projectId?: string; sessionId?: string; now?: number; workMachineExecution?: WorkMachineMcpProof } = {},
 ): Promise<boolean> {
     const grant = process.env.HAPPY_APLUS_MCP_CALLER_GRANT
     const configUrl = process.env.HAPPY_APLUS_MCP_CONFIG_URL
@@ -113,7 +114,7 @@ export async function refreshMcpCallerGrantIfExpiring(
     // grant 는 발급 시점 scope 에 묶여 있다. 호출부가 추측하지 않고 실제 설정
     // URL 의 scope 를 그대로 쓴다.
     const projectId = context.projectId ?? readConfigProjectId(configUrl)
-    const sessionBound = Boolean(projectId && context.sessionId)
+    const sessionBound = !context.workMachineExecution && Boolean(projectId && context.sessionId)
     let refreshUrl = resolveRefreshUrl(configUrl)
     if (!refreshUrl) return false
     if (sessionBound) {
@@ -129,16 +130,20 @@ export async function refreshMcpCallerGrantIfExpiring(
         read: async () => process.env.HAPPY_APLUS_MCP_CALLER_GRANT || null,
         fingerprint,
         refresh: async (current, signal) => {
+            const proof = context.workMachineExecution
+                && workMachineMcpHeaders(exchangeUrl, context.workMachineExecution, context.sessionId)
+            if (proof === null) throw new Error('Work machine execution proof is unavailable for this grant renewal URL')
             const res = await fetch(exchangeUrl, {
                 method: 'POST',
                 redirect: 'error',
                 ...(sessionBound ? { body: JSON.stringify({ machineId, sessionId: context.sessionId, callerGrant: current }) } : {}),
                 headers: {
                     ...(sessionBound ? { 'Content-Type': 'application/json' } : {}),
-                    'Authorization': `Bearer ${token}`,
+                    'Authorization': `Bearer ${proof?.['X-Aplus-Work-Machine-Execution'] ?? token}`,
                     'X-Aplus-Machine-Id': machineId,
                     'X-Aplus-Caller-Grant': current,
                     ...(projectId ? { 'X-Aplus-Project-Id': projectId } : {}),
+                    ...proof,
                 },
                 signal,
             })

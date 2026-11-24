@@ -8,6 +8,7 @@ import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { resolve } from 'node:path';
 import { readFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import fastify from 'fastify';
 import { serializerCompiler, validatorCompiler, type ZodTypeProvider } from 'fastify-type-provider-zod';
 import type { Fastify } from '../types';
@@ -37,6 +38,7 @@ import { auth } from '@/app/auth/auth';
 import { createSessionScopedTokenIssuer } from '@/app/auth/sessionScopedToken';
 import { enableAuthentication, enableSessionScopeAuthentication } from '@/app/api/utils/enableAuthentication';
 import { sessionRoutes } from './sessionRoutes';
+import { sessionRewrapRoutes } from './sessionRewrapRoutes';
 import { accountRoutes } from './accountRoutes';
 import { accessKeysRoutes } from './accessKeysRoutes';
 import { pushRoutes } from './pushRoutes';
@@ -86,6 +88,7 @@ beforeAll(async () => {
     enableAuthentication(typed);
     enableSessionScopeAuthentication(typed, () => issuer);
     sessionRoutes(typed);
+    sessionRewrapRoutes(typed);
     accountRoutes(typed);
     accessKeysRoutes(typed);
     pushRoutes(typed);
@@ -108,6 +111,88 @@ beforeEach(async () => {
     await client.account.create({ data: { id: OTHER, publicKey: OTHER } });
 });
 afterEach(async () => { await client?.$disconnect(); await pg?.close(); });
+
+describe('work machine session message admission', () => {
+    it('accepts authenticated browser messages across a handoff and rejects old daemon writes', async () => {
+        await seed('handoff-session', T0, { dataEncryptionKey: new Uint8Array(105) });
+        await seed('regular-session', T0);
+        await client.machine.create({
+            data: { id: 'stable-machine', accountId: ACCOUNT, metadata: 'encrypted' },
+        });
+        await client.workMachineExecution.create({
+            data: { machineId: 'stable-machine', accountId: ACCOUNT, deviceId: 'new-device', generation: 2 },
+        });
+        await client.session.update({ where: { id: 'handoff-session' }, data: { workMachineId: 'stable-machine' } });
+        const now = Date.now();
+        const browser = (await auth.createBrowserSyncToken(ACCOUNT, now, undefined, true))!.token;
+        const ordinaryBrowser = (await auth.createBrowserSyncToken(ACCOUNT, now))!.token;
+        const issueAgent = (deviceId: string, generation: number) => auth.workMachineExecutionIssuer!.mint({
+            accountId: ACCOUNT, machineId: 'stable-machine', deviceId, generation, purpose: 'session',
+            sessionId: 'handoff-session', expiresAt: now + MINUTE,
+        }, now);
+        const [oldAgent, newAgent] = await Promise.all([issueAgent('old-device', 1), issueAgent('new-device', 2)]);
+        const send = (bearer: string, localId: string, sessionId = 'handoff-session') => app.inject({
+            method: 'POST', url: `/v3/sessions/${sessionId}/messages`,
+            headers: { authorization: `Bearer ${bearer}` },
+            payload: { messages: [{ content: 'encrypted-body', localId }] },
+        });
+
+        expect((await send(token, 'old-account')).statusCode).toBe(403);
+        expect((await send(ordinaryBrowser, 'ordinary-browser')).statusCode).toBe(403);
+        expect((await send(oldAgent, 'old-generation')).statusCode).toBe(403);
+        expect((await send(newAgent, 'foreign-session', 'regular-session')).statusCode).toBe(403);
+        await client.workMachineExecution.update({
+            where: { machineId: 'stable-machine' }, data: { frozenAt: new Date() },
+        });
+        expect((await send(newAgent, 'agent-during-freeze')).statusCode).toBe(403);
+        expect((await send(browser, 'customer-message')).statusCode).toBe(200);
+        expect((await send(browser, 'customer-message')).statusCode).toBe(200);
+        await client.workMachineExecution.update({
+            where: { machineId: 'stable-machine' }, data: { frozenAt: null },
+        });
+        expect((await send(newAgent, 'agent-reply')).statusCode).toBe(200);
+        expect((await send(token, 'ordinary-message', 'regular-session')).statusCode).toBe(200);
+        const history = (bearer: string, sessionId = 'handoff-session') => app.inject({
+            method: 'GET', url: `/v3/sessions/${sessionId}/messages`,
+            headers: { authorization: `Bearer ${bearer}` },
+        });
+        expect((await history(newAgent)).statusCode).toBe(200);
+        expect((await history(oldAgent)).statusCode).toBe(403);
+        expect((await history(newAgent, 'regular-session')).statusCode).toBe(403);
+        expect((await history(browser)).statusCode).toBe(200);
+        const event = await app.inject({
+            method: 'POST', url: '/v3/sessions/handoff-session/events',
+            headers: { authorization: `Bearer ${token}` },
+            payload: { eventType: 'checkpoint-snapshot', content: 'stale-agent-event' },
+        });
+        expect(event.statusCode).toBe(403);
+        expect(await client.sessionEvent.count({ where: { sessionId: 'handoff-session' } })).toBe(0);
+        for (const [method, path] of [
+            ['POST', '/v1/sessions/handoff-session/archive'],
+            ['DELETE', '/v1/sessions/handoff-session'],
+        ] as const) {
+            expect((await app.inject({
+                method, url: path, headers: { authorization: `Bearer ${token}` },
+            })).statusCode).toBe(404);
+        }
+        expect((await client.session.findUniqueOrThrow({ where: { id: 'handoff-session' } })).active).toBe(true);
+
+        const messages = await client.sessionMessage.findMany({
+            where: { sessionId: 'handoff-session' }, orderBy: { seq: 'asc' }, select: { localId: true, seq: true },
+        });
+        expect(messages.map(message => message.localId)).toEqual(['customer-message', 'agent-reply']);
+        const rewrap = await app.inject({
+            method: 'POST', url: '/v3/sessions/handoff-session/rewrap-messages',
+            headers: { authorization: `Bearer ${token}` },
+            payload: { messages: [{
+                seq: messages[0].seq,
+                expectedContentSha256: createHash('sha256').update('encrypted-body').digest('hex'),
+                newContent: Buffer.alloc(29).toString('base64'),
+            }] },
+        });
+        expect(rewrap.statusCode).toBe(404);
+    });
+});
 
 /**
  * Inserts a session and pins `updatedAt` with SQL, because Prisma's
@@ -526,6 +611,39 @@ describe('PII request-scoped visibility', () => {
         expect(supported.statusCode).toBe(200);
         expect(supported.json()).toMatchObject({ currentData: 'private-key-envelope' });
     });
+    it('refuses access-key writes with the account token for a work machine or its conversation', async () => {
+        await seed('handoff-session', T0);
+        await seed('regular-session', T0);
+        await client.machine.createMany({ data: [
+            { id: 'stable-machine', accountId: ACCOUNT, metadata: '' },
+            { id: 'regular-machine', accountId: ACCOUNT, metadata: '' },
+        ] });
+        await client.workMachineExecution.create({
+            data: { machineId: 'stable-machine', accountId: ACCOUNT, deviceId: 'device', generation: 1 },
+        });
+        await client.session.update({ where: { id: 'handoff-session' }, data: { workMachineId: 'stable-machine' } });
+        await client.accessKey.createMany({ data: [
+            { accountId: ACCOUNT, sessionId: 'handoff-session', machineId: 'regular-machine', data: 'existing' },
+            { accountId: ACCOUNT, sessionId: 'regular-session', machineId: 'stable-machine', data: 'existing' },
+        ] });
+        const headers = { authorization: `Bearer ${token}` };
+        const write = (method: 'POST' | 'PUT', sessionId: string, machineId: string) => app.inject({
+            method, url: `/v1/access-keys/${sessionId}/${machineId}`, headers,
+            payload: method === 'POST' ? { data: 'replacement' } : { data: 'replacement', expectedVersion: 1 },
+        });
+        for (const [sessionId, machineId] of [['handoff-session', 'regular-machine'], ['regular-session', 'stable-machine']]) {
+            await client.accessKey.delete({
+                where: { accountId_machineId_sessionId: { accountId: ACCOUNT, sessionId, machineId } },
+            });
+            expect((await write('POST', sessionId, machineId)).statusCode).toBe(404);
+            await client.accessKey.create({ data: { accountId: ACCOUNT, sessionId, machineId, data: 'existing' } });
+            expect((await write('PUT', sessionId, machineId)).statusCode).toBe(404);
+        }
+        expect(await client.accessKey.count({ where: { data: 'existing' } })).toBe(2);
+        expect((await write('POST', 'regular-session', 'regular-machine')).statusCode).toBe(200);
+        expect((await write('PUT', 'regular-session', 'regular-machine')).json()).toEqual({ success: true, version: 2 });
+    });
+
     it('enforces protection immutability beneath metadata writers', async () => {
         await seed('normal', Date.now());
         // The schema diff provides the column; the migration supplies the trigger.
