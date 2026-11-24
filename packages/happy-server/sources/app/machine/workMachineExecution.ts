@@ -614,6 +614,7 @@ class WorkMachineServerKeyConflict extends Error {}
  * A handoff clears the server copies of the machine key with the old key. The
  * device now current puts them back, as a registration would have: the server
  * lane key envelope and, unless the device is strict, the machine key escrow.
+ * Each wrap is randomised, so a device sends only the copies it found missing.
  *
  * Only the generation's current device, while not frozen (drain still allows
  * it: it starts no work, and drain's refusals are per request), and only while
@@ -627,7 +628,7 @@ class WorkMachineServerKeyConflict extends Error {}
 export async function fillWorkMachineServerKeyCopies(
     db: Pick<PrismaClient, '$transaction'>,
     grant: WorkMachineDeviceGrant,
-    copies: { expectedDataEncryptionKey: Uint8Array; serverRpcKeyEnvelope: Uint8Array; serverDataEncryptionKey: Uint8Array | null },
+    copies: { expectedDataEncryptionKey: Uint8Array; serverRpcKeyEnvelope: Uint8Array | null; serverDataEncryptionKey: Uint8Array | null },
 ): Promise<{ changed: boolean } | { refused: WorkMachineServerKeyRefusal }> {
     const { accountId, machineId } = grant;
     const same = (stored: Uint8Array | null | undefined, wanted: Uint8Array) => !!stored && machineDataKeyEnvelopesEqual(stored, wanted);
@@ -635,10 +636,10 @@ export async function fillWorkMachineServerKeyCopies(
         return await db.$transaction(async tx => {
             if (!await lockWorkMachineExecution(tx, grant)) return { refused: 'not-current' as const };
             const current = { id: machineId, accountId, dataEncryptionKey: new Uint8Array(copies.expectedDataEncryptionKey) };
-            const lane = await tx.machine.updateMany({
+            const lane = copies.serverRpcKeyEnvelope ? await tx.machine.updateMany({
                 where: { ...current, serverRpcKeyEnvelope: null },
                 data: { serverRpcKeyEnvelope: new Uint8Array(copies.serverRpcKeyEnvelope) },
-            });
+            }) : { count: 0 };
             const escrow = copies.serverDataEncryptionKey ? await tx.machine.updateMany({
                 where: { ...current, serverDataEncryptionKey: null },
                 data: { serverDataEncryptionKey: new Uint8Array(copies.serverDataEncryptionKey) },
@@ -650,7 +651,7 @@ export async function fillWorkMachineServerKeyCopies(
             if (!machine || !same(machine.dataEncryptionKey, copies.expectedDataEncryptionKey)) {
                 return { refused: 'data-encryption-key-conflict' as const };
             }
-            if (!same(machine.serverRpcKeyEnvelope, copies.serverRpcKeyEnvelope)
+            if ((copies.serverRpcKeyEnvelope && !same(machine.serverRpcKeyEnvelope, copies.serverRpcKeyEnvelope))
                 || (copies.serverDataEncryptionKey && !same(machine.serverDataEncryptionKey, copies.serverDataEncryptionKey))) {
                 throw new WorkMachineServerKeyConflict();
             }

@@ -448,7 +448,7 @@ export function machinesRoutes(
             params: z.object({ id: z.string() }),
             body: z.object({
                 expectedDataEncryptionKey: z.string().max(MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH),
-                serverRpcKeyEnvelope: z.string().max(MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH),
+                serverRpcKeyEnvelope: z.string().max(MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH).nullable(),
                 serverDataEncryptionKey: z.string().max(MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH).nullable(),
             }).strict(),
         },
@@ -459,9 +459,11 @@ export function machinesRoutes(
         }
         const body = request.body;
         const expectedDataEncryptionKey = decodeMachineDataKeyEnvelope(body.expectedDataEncryptionKey);
-        const serverRpcKeyEnvelope = decodeMachineDataKeyEnvelope(body.serverRpcKeyEnvelope);
+        const serverRpcKeyEnvelope = body.serverRpcKeyEnvelope === null ? null : decodeMachineDataKeyEnvelope(body.serverRpcKeyEnvelope);
         const serverDataEncryptionKey = body.serverDataEncryptionKey === null ? null : decodeMachineDataKeyEnvelope(body.serverDataEncryptionKey);
-        if (!expectedDataEncryptionKey || !serverRpcKeyEnvelope || (body.serverDataEncryptionKey !== null && !serverDataEncryptionKey)) {
+        if (!expectedDataEncryptionKey || (!serverRpcKeyEnvelope && !serverDataEncryptionKey)
+            || (body.serverRpcKeyEnvelope !== null && !serverRpcKeyEnvelope)
+            || (body.serverDataEncryptionKey !== null && !serverDataEncryptionKey)) {
             return reply.code(400).send({ error: 'invalid-data-encryption-key-envelope' });
         }
         const result = await fillWorkMachineServerKeyCopies(db, grant, { expectedDataEncryptionKey, serverRpcKeyEnvelope, serverDataEncryptionKey });

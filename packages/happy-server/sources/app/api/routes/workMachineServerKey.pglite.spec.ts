@@ -93,13 +93,13 @@ function daemonCredential(over: { deviceId?: string; generation?: number; machin
     }, now);
 }
 
-function upload(bearer: string, body: { expectedDataEncryptionKey?: Buffer; serverRpcKeyEnvelope: Buffer; serverDataEncryptionKey?: Buffer | null }, machineId = MACHINE) {
+function upload(bearer: string, body: { expectedDataEncryptionKey?: Buffer; serverRpcKeyEnvelope: Buffer | null; serverDataEncryptionKey?: Buffer | null }, machineId = MACHINE) {
     return app.inject({
         method: 'PUT', url: `/v1/machines/${machineId}/server-key-envelopes`,
         headers: { authorization: `Bearer ${bearer}` },
         payload: {
             expectedDataEncryptionKey: b64(body.expectedDataEncryptionKey ?? dataKey),
-            serverRpcKeyEnvelope: b64(body.serverRpcKeyEnvelope),
+            serverRpcKeyEnvelope: body.serverRpcKeyEnvelope ? b64(body.serverRpcKeyEnvelope) : null,
             serverDataEncryptionKey: body.serverDataEncryptionKey ? b64(body.serverDataEncryptionKey) : null,
         },
     });
@@ -139,6 +139,16 @@ describe('PUT /v1/machines/:id/server-key-envelopes with the current device cred
         const answer = await upload(await daemonCredential(), { serverRpcKeyEnvelope: lane });
         expect(answer.statusCode, answer.body).toBe(200);
         expect(await stored()).toMatchObject({ serverRpcKeyEnvelope: b64(lane), serverDataEncryptionKey: null });
+    });
+
+    it('fills only the copy the device found missing', async () => {
+        const lane = envelope();
+        await client.machine.update({ where: { id: MACHINE }, data: { serverRpcKeyEnvelope: new Uint8Array(lane) } });
+        const escrow = envelope();
+        const answer = await upload(await daemonCredential(), { serverRpcKeyEnvelope: null, serverDataEncryptionKey: escrow });
+        expect(answer.statusCode, answer.body).toBe(200);
+        expect(answer.json()).toEqual({ ok: true, changed: true });
+        expect(await stored()).toMatchObject({ serverRpcKeyEnvelope: b64(lane), serverDataEncryptionKey: b64(escrow) });
     });
 
     it('never overwrites a present copy with a different one', async () => {
@@ -209,5 +219,6 @@ describe('PUT /v1/machines/:id/server-key-envelopes with the current device cred
         const bearer = await daemonCredential();
         expect((await upload(bearer, { serverRpcKeyEnvelope: Buffer.concat([Buffer.from([1]), randomBytes(104)]) })).statusCode).toBe(400);
         expect((await upload(bearer, { serverRpcKeyEnvelope: envelope(), serverDataEncryptionKey: randomBytes(40) })).statusCode).toBe(400);
+        expect((await upload(bearer, { serverRpcKeyEnvelope: null, serverDataEncryptionKey: null })).statusCode).toBe(400);
     });
 });
