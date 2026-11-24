@@ -25,7 +25,7 @@ import { io } from 'socket.io-client';
 import tweetnacl from 'tweetnacl';
 import { bindRpcRequest, readBoundRpcResponse } from '@slopus/happy-wire';
 import { describe, expect, it } from 'vitest';
-import { decrypt, encrypt } from '@/api/encryption';
+import { decrypt, deriveServerRpcKey, encrypt } from '@/api/encryption';
 import { currentModelRequestMarker, eventually, type StoredMessage } from '@/testing/sessionWriteScopeFixture';
 import { openWorkMachineCredentials, readWorkMachineExecutionBinding } from './workMachineCredential';
 
@@ -173,6 +173,8 @@ class RehearsalStudio {
 class Rehearsal {
     readonly seed = randomBytes(32);
     readonly accountBox = tweetnacl.box.keyPair();
+    /** Studio's server service key pair: the homes wrap the server copies of their machine key to it. */
+    readonly serverBox = tweetnacl.box.keyPair();
     readonly studio = new RehearsalStudio();
     readonly cli = resolve(process.cwd());
     readonly serverDirectory = resolve(process.cwd(), '../happy-server');
@@ -336,7 +338,8 @@ class Rehearsal {
         // The same account (dataKey login) on each PC, each with a machine key of its own.
         await writeFile(join(happyHome, 'access.key'), JSON.stringify({ token: this.token, encryption: {
             publicKey: Buffer.from(this.accountBox.publicKey).toString('base64'), machineKey: randomBytes(32).toString('base64') } }), { mode: 0o600 });
-        await writeFile(join(happyHome, 'settings.json'), JSON.stringify({ serverUrl: this.serverUrl }), { mode: 0o600 });
+        await writeFile(join(happyHome, 'settings.json'), JSON.stringify({
+            serverUrl: this.serverUrl, serverPublicKey: Buffer.from(this.serverBox.publicKey).toString('base64') }), { mode: 0o600 });
         return { name, happyHome };
     }
     env(host: Host) { return { ...this.environment, HAPPY_HOME_DIR: host.happyHome }; }
@@ -399,10 +402,10 @@ class Rehearsal {
     }
 
     // ── conversations ──
-    private unwrap(wrapped: string): Buffer {
+    private unwrap(wrapped: string, recipient = this.accountBox.secretKey): Buffer {
         const bytes = Buffer.from(wrapped, 'base64');
-        const key = tweetnacl.box.open(bytes.subarray(57), bytes.subarray(33, 57), bytes.subarray(1, 33), this.accountBox.secretKey);
-        if (bytes[0] !== 0 || !key || key.length !== 32) throw new Error('The account cannot open this key envelope');
+        const key = tweetnacl.box.open(bytes.subarray(57), bytes.subarray(33, 57), bytes.subarray(1, 33), recipient);
+        if (bytes[0] !== 0 || !key || key.length !== 32) throw new Error('The recipient cannot open this key envelope');
         return Buffer.from(key);
     }
     async session(id: string) {
@@ -415,6 +418,54 @@ class Rehearsal {
         const machine = ((await this.ok('/v1/machines')) as { id: string; dataEncryptionKey: string }[]).find(value => value.id === machineId);
         if (!machine) throw new Error('Machine missing');
         return { ...machine, key: this.unwrap(machine.dataEncryptionKey) };
+    }
+    /**
+     * The server copies of the machine key, opened as Studio's server opens them
+     * (web-ui resolveMachineRpcKey): the machine key escrow and the server lane key. Null when absent.
+     */
+    async serverKeys(machineId: string) {
+        const machine = ((await this.ok('/v1/machines')) as { id: string; serverDataEncryptionKey: string | null; serverRpcKeyEnvelope: string | null }[])
+            .find(value => value.id === machineId)!;
+        return {
+            escrow: machine.serverDataEncryptionKey ? this.unwrap(machine.serverDataEncryptionKey, this.serverBox.secretKey) : null,
+            lane: machine.serverRpcKeyEnvelope ? this.unwrap(machine.serverRpcKeyEnvelope, this.serverBox.secretKey) : null,
+        };
+    }
+    /**
+     * A daemon RPC from Studio's server: sealed (unbound) with a server copy of the key, sent over the
+     * work machine ingress credential, the way its server lane reaches a protected machine.
+     */
+    async serverRpc(machineId: string, key: Buffer, method: string, params: Record<string, unknown>): Promise<any> {
+        const socket = io(this.serverUrl, { path: '/v1/updates', transports: ['websocket'], reconnection: false,
+            auth: { token: this.browserToken, clientType: 'user-scoped' } });
+        try {
+            await new Promise<void>((done, fail) => {
+                const timer = setTimeout(() => fail(new Error('Server lane socket unavailable')), 10_000);
+                socket.once('connect', () => { clearTimeout(timer); done(); });
+                socket.once('connect_error', error => { clearTimeout(timer); fail(error); });
+            });
+            const response = await socket.timeout(60_000).emitWithAck('rpc-call', { method: `${machineId}:${method}`,
+                params: Buffer.from(encrypt(key, 'dataKey', params)).toString('base64') });
+            if (!response.ok) throw new Error(`${method} server RPC failed: ${response.error}`);
+            const opened = decrypt(key, 'dataKey', Buffer.from(response.result, 'base64'));
+            if (opened === null) throw new Error(`${method} server RPC reply unreadable (sealed to another key)`);
+            return opened;
+        } finally { socket.disconnect(); }
+    }
+    /** What Studio's server lane needs after a handoff: both copies for the current key, and the daemon answering them. */
+    async expectServerLane(machineId: string) {
+        const machineKey = (await this.machine(machineId)).key;
+        const keys = await eventually(async () => {
+            const current = await this.serverKeys(machineId);
+            return current.escrow && current.lane ? current : undefined;
+        }, 'server key copies', 30_000);
+        expect(keys.escrow!.equals(machineKey), 'the escrow is the current machine key').toBe(true);
+        expect(keys.lane!.equals(Buffer.from(deriveServerRpcKey(machineKey))), 'the lane key derives from the current machine key').toBe(true);
+        // machine-info: a read on the server lane allowlist that needs no approved workspace (the project
+        // here is outside HOME, which the path reads refuse).
+        const expected = { success: true, platform: 'linux' };
+        expect(await this.serverRpc(machineId, keys.escrow!, 'machine-info', {})).toMatchObject(expected);
+        expect(await this.serverRpc(machineId, keys.lane!, 'machine-info', {})).toMatchObject(expected);
     }
     async messages(id: string): Promise<{ seq: number; decoded: any }[]> {
         const stored = (await this.ok(`/v3/sessions/${id}/messages?limit=500`)).messages as StoredMessage[];
@@ -538,6 +589,8 @@ async function protectedSource(r: Rehearsal) {
     await r.startDaemon(source);
     await r.waitConnected(source);
     await r.customer();
+    // A registered machine starts with both server copies (the baseline a handoff must restore).
+    await r.expectServerLane(machineId);
     const conversations: Conversation[] = [];
     for (const provider of providers) {
         const sessionId = await r.spawnSession(source, provider);
@@ -644,6 +697,8 @@ async function migrate(r: Rehearsal, from: Awaited<ReturnType<typeof protectedSo
     expect(await r.control(machineId, 'execution-replace', 'work-machine-replace', replaceBody)).toEqual(replaced);
     expect(await r.executionState(machineId)).toMatchObject({ deviceId: report.deviceId, generation: 2, draining: false, frozen: false, firstExecution: false });
     expect((await r.machine(machineId)).dataEncryptionKey).toBe(machineKeyAfterReplace);
+    // As in a key rotation, the server copies of the old key went with it.
+    expect(await r.serverKeys(machineId)).toEqual({ escrow: null, lane: null });
 
     r.metrics.totalBytes = manifest.totalBytes;
     r.metrics.parts = manifest.parts.length;
@@ -670,6 +725,9 @@ describe.skipIf(!rehearsal)('work machine migration rehearsal (real server, two 
             await r.waitConnected(target);
             r.metrics.targetBindAndStartMs = Date.now() - bindAt;
             r.metrics.sourceStopToTargetReadyMs = Date.now() - moved.stopAt;
+            // The target daemon put the server copies back for its key: Studio's server lane reaches it.
+            await r.customer();
+            await r.expectServerLane(machineId);
 
             // The old generation is fenced: its daemon cannot start, its credentials cannot write, its MCP admit is refused.
             r.phase = 'old-source';
@@ -780,6 +838,8 @@ describe.skipIf(!rehearsal)('work machine migration rehearsal (real server, two 
             await r.startDaemon(source);
             await r.waitConnected(source);
             await r.customer();
+            // The restored original's new key reaches Studio's server lane as well.
+            await r.expectServerLane(machineId);
             for (const conversation of conversations) {
                 expect(await r.resume(machineId, conversation.sessionId)).toBe(conversation.sessionId);
                 const pending = moved.duringFreeze.find(({ sessionId }) => sessionId === conversation.sessionId)!;

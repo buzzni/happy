@@ -431,6 +431,54 @@ export function machinesRoutes(
         return reply.send({ ok: true, changed: true, metadataVersion, daemonStateVersion });
     });
 
+    /**
+     * specs/work-machine-migration (aplus-dev-studio) — a work machine daemon
+     * puts back the server copies of its machine key that a replace or restore
+     * cleared (fillWorkMachineServerKeyCopies). Only its own `wmx_` daemon
+     * credential, never the account bearer, which a protected machine refuses
+     * for key changes and which every old device of the account still holds.
+     */
+    app.put('/v1/machines/:id/server-key-envelopes', {
+        preHandler: async (request, reply) => {
+            const grant = await verifyWorkMachineDaemonBearer(request);
+            if (!grant) return reply.code(401).send({ error: 'Work machine device credential required' });
+            request.workMachineDaemonGrant = grant;
+        },
+        schema: {
+            params: z.object({ id: z.string() }),
+            body: z.object({
+                expectedDataEncryptionKey: z.string().max(MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH),
+                serverRpcKeyEnvelope: z.string().max(MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH).nullable(),
+                serverDataEncryptionKey: z.string().max(MACHINE_DATA_KEY_ENVELOPE_BASE64_LENGTH).nullable(),
+            }).strict(),
+        },
+    }, async (request, reply) => {
+        const grant = request.workMachineDaemonGrant!;
+        if (grant.machineId !== request.params.id) {
+            return reply.code(403).send({ error: 'Work machine device authorization required' });
+        }
+        const body = request.body;
+        const expectedDataEncryptionKey = decodeMachineDataKeyEnvelope(body.expectedDataEncryptionKey);
+        const serverRpcKeyEnvelope = body.serverRpcKeyEnvelope === null ? null : decodeMachineDataKeyEnvelope(body.serverRpcKeyEnvelope);
+        const serverDataEncryptionKey = body.serverDataEncryptionKey === null ? null : decodeMachineDataKeyEnvelope(body.serverDataEncryptionKey);
+        if (!expectedDataEncryptionKey || (!serverRpcKeyEnvelope && !serverDataEncryptionKey)
+            || (body.serverRpcKeyEnvelope !== null && !serverRpcKeyEnvelope)
+            || (body.serverDataEncryptionKey !== null && !serverDataEncryptionKey)) {
+            return reply.code(400).send({ error: 'invalid-data-encryption-key-envelope' });
+        }
+        const result = await fillWorkMachineServerKeyCopies(db, grant, { expectedDataEncryptionKey, serverRpcKeyEnvelope, serverDataEncryptionKey });
+        if ('refused' in result) {
+            return result.refused === 'not-current'
+                ? reply.code(403).send({ error: 'Work machine device authorization required' })
+                : reply.code(409).send({ error: result.refused });
+        }
+        if (result.changed) {
+            log({ module: 'machines', machineId: grant.machineId, userId: grant.accountId },
+                `Work machine device restored server key copies (machine key escrow: ${serverDataEncryptionKey ? 'yes' : 'none'})`);
+        }
+        return reply.send({ ok: true, changed: result.changed });
+    });
+
     // Machines API
     app.get('/v1/machines', {
         preHandler: app.authenticate,
@@ -606,4 +654,4 @@ export function machinesRoutes(
 
 }
 import { auth } from '@/app/auth/auth';
-import { authorizeWorkMachineExecution } from '@/app/machine/workMachineExecution';
+import { authorizeWorkMachineExecution, fillWorkMachineServerKeyCopies } from '@/app/machine/workMachineExecution';
