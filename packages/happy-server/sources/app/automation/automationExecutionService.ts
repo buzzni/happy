@@ -30,7 +30,15 @@ export async function registerAutomationMachineKey(
     tx: Tx,
     accountId: string,
     machineId: string,
-    input: { expectedKeyVersion: number; publicKey: Binary; protocolVersion: number; contextIsolationVersion?: 0 | 1 },
+    input: {
+        expectedKeyVersion: number; publicKey: Binary; protocolVersion: number; contextIsolationVersion?: 0 | 1;
+        /**
+         * The caller is the current device of a work machine, checked by the worker lock this runs under. Its key file
+         * holds the version of its own first registration, not the machine's (aplus-dev-studio specs/work-machine-migration),
+         * so it replaces whatever key the machine has: the version read here, not the one it sent.
+         */
+        currentWorkMachineDevice?: true;
+    },
 ): Promise<Result<{ keyVersion: number; invalidatedProjectIds: string[]; targetChanged: boolean; contextIsolationVersion?: 1; syncFromStart?: true }>> {
     // Repeat on every registration: an earlier ACK may have been lost after capability was committed.
     const contextSync = input.contextIsolationVersion === 1 ? { contextIsolationVersion: 1 as const, syncFromStart: true as const } : {};
@@ -73,8 +81,9 @@ export async function registerAutomationMachineKey(
             },
         };
     }
+    const expectedKeyVersion = input.currentWorkMachineDevice && current ? current.automationKeyVersion : input.expectedKeyVersion;
     const changed = await tx.machine.updateMany({
-        where: { id: machineId, accountId, automationKeyVersion: input.expectedKeyVersion },
+        where: { id: machineId, accountId, automationKeyVersion: expectedKeyVersion },
         data: {
             automationPublicKey: input.publicKey,
             automationKeyVersion: { increment: 1 },
@@ -91,7 +100,7 @@ export async function registerAutomationMachineKey(
     return {
         ok: true,
         value: {
-            keyVersion: input.expectedKeyVersion + 1,
+            keyVersion: expectedKeyVersion + 1,
             invalidatedProjectIds: [...new Set(invalidated.map((followup) => followup.projectId as string))],
             targetChanged: true,
             ...contextSync,
