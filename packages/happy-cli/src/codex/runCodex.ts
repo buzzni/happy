@@ -1628,7 +1628,7 @@ export async function runCodex(opts: {
         gate: () => runtimeGate,
         reportUsage: ({ requestId, usage, model }) => {
             try {
-                session.sendProviderUsageEvent(createCodexUsageEvent({ sessionId: session.sessionId, responseId: `btw:${requestId}`, occurredAt: Date.now(), model, usage, planTier: client.aiPlanTier }));
+                session.sendProviderUsageEvent(createCodexUsageEvent({ sessionId: session.sessionId, responseId: `btw:${requestId}`, occurredAt: Date.now(), model, usage, planTier: client.aiPlanTier, rateLimits: client.aiRateLimits }));
             } catch (error) {
                 logger.warn('[Codex] Failed to report side question usage:', error);
             }
@@ -1991,6 +1991,7 @@ export async function runCodex(opts: {
                     model: currentModel,
                     usage: msg.usage as Parameters<typeof createCodexUsageEvent>[0]['usage'],
                     planTier: client.aiPlanTier,
+                    rateLimits: client.aiRateLimits,
                 }));
             } catch (error) {
                 logger.warn('[Codex] Failed to normalize provider usage data:', error);

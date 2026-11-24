@@ -7549,6 +7549,17 @@ describe('ChatGPT plan observation (aplus specs/org-member-ai-plan-usage H3)', (
 
         await notify('account/rateLimits/updated', { rateLimits: { planType: 'pro', primary: null, secondary: null } });
         expect(client.aiPlanTier).toBe('chatgpt:pro');
+        expect(client.aiRateLimits).toBeNull();
+
+        await notify('account/rateLimits/updated', { rateLimits: {
+            planType: 'pro',
+            primary: { usedPercent: 30, windowDurationMins: 300, resetsAt: 1_788_000_000 },
+            secondary: { usedPercent: 12, windowDurationMins: 10080, resetsAt: null },
+        } });
+        expect(client.aiRateLimits).toEqual({
+            fiveHour: { usedPercent: 30, resetsAt: 1_788_000_000_000 },
+            weekly: { usedPercent: 12, resetsAt: null },
+        });
 
         await notify('account/updated', { authMode: 'chatgpt', planType: 'plus' });
         expect(client.aiPlanTier).toBe('chatgpt:plus');
@@ -7567,8 +7578,9 @@ describe('ChatGPT plan observation (aplus specs/org-member-ai-plan-usage H3)', (
     it('reports nothing through an account rotation proxy — the proxy picks the payer', async () => {
         mockPrepareCodexMultiAuthProxy.mockResolvedValue({ args: ['-c', 'proxy'], env: {}, cleanup: vi.fn() });
         const { client, notify } = await connected();
-        await notify('account/rateLimits/updated', { rateLimits: { planType: 'pro' } });
+        await notify('account/rateLimits/updated', { rateLimits: { planType: 'pro', primary: { usedPercent: 5, windowDurationMins: 300, resetsAt: null } } });
         expect(client.aiPlanTier).toBeNull();
+        expect(client.aiRateLimits).toBeNull();
         await client.disconnect();
     });
 });

@@ -23,7 +23,7 @@ import { buildInitialPromptUserRecord } from '@/utils/initialPrompt';
 import { decodeBase64, decrypt, decryptBlob, encodeBase64, encrypt } from './encryption';
 import type { Metadata, Update } from './types';
 import { logger } from '@/ui/logger';
-import { createCodexUsageEvent } from '@/usage/providerUsageAdapters';
+import { createClaudeUsageEvent, createCodexUsageEvent } from '@/usage/providerUsageAdapters';
 import { RECONNECT_NOT_READY_POLL_MS } from './reconnectCadence';
 import { TRUSTED_MACHINE_RUN_PROFILE_REGISTRY } from '@/modules/common/machineRunProfile';
 import { RuntimeProducerGate } from '@/sessionDrain/runtimeProducerGate';
@@ -1799,6 +1799,21 @@ describe('ApiSessionClient v3 messages API migration', () => {
             await client.close();
         });
 
+        it('stamps a Claude event with the windows the session already holds (P10)', async () => {
+            const client = new ApiSessionClient('fake-token', session);
+            (client as unknown as { agentState: unknown }).agentState = {
+                usageLimits: { capturedAt: 1, windows: [{ id: 'five_hour', utilization: 72, resetsAt: '2026-11-24T05:00:00.000Z' }] },
+            };
+            client.sendProviderUsageEvent(createClaudeUsageEvent({
+                sessionId: 'test-session-id', occurredAt: 1_788_000_000_000, messageId: 'rl-1', transcriptUuid: 'rl-1',
+                model: 'claude-test', usage: { input_tokens: 10, output_tokens: 5 }, env: {},
+            }));
+            expect(sentEvents()[0]).toMatchObject({
+                rateLimits: { fiveHour: { usedPercent: 72, resetsAt: Date.parse('2026-11-24T05:00:00.000Z') } },
+            });
+            await client.close();
+        });
+
         it('leaves the event exactly as an older CLI sends it when no plan is known', async () => {
             const client = new ApiSessionClient('fake-token', session);
             client.setAiPlanTierSource({ current: () => null });
@@ -1809,6 +1824,8 @@ describe('ApiSessionClient v3 messages API migration', () => {
                 usage: { totalTokens: 15, inputTokens: 10, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 5, reasoningOutputTokens: 0 },
             }));
             expect(sentEvents().map((event) => 'planTier' in event)).toEqual([false, false]);
+            // A Codex event never takes Claude's session windows.
+            expect(sentEvents().map((event) => 'rateLimits' in event)).toEqual([false, false]);
             await client.close();
         });
     });

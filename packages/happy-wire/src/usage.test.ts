@@ -176,3 +176,21 @@ describe('planTier', () => {
             .toBe(false);
     });
 });
+
+// aplus specs/org-member-ai-plan-usage P10 — mirrors packages/web-ui/server/aiUsageContract.ts.
+describe('rateLimits', () => {
+    it('is optional and carries the five-hour and weekly windows', () => {
+        expect(ProviderUsageEventV1Schema.parse(providerEvent).rateLimits).toBeUndefined();
+        const rateLimits = { fiveHour: { usedPercent: 42.5, resetsAt: 1_788_000_000_000 }, weekly: { usedPercent: 10, resetsAt: null } };
+        expect(ProviderUsageEventV1Schema.parse({ ...providerEvent, rateLimits }).rateLimits).toEqual(rateLimits);
+    });
+
+    it('strips a window this build does not know instead of refusing the event', () => {
+        const parsed = ProviderUsageEventV1Schema.safeParse({
+            ...providerEvent,
+            rateLimits: { fiveHour: { usedPercent: 140, resetsAt: null }, sevenDayOpus: { usedPercent: 1, resetsAt: null } },
+        });
+        expect(parsed.success && parsed.data.rateLimits).toEqual({ fiveHour: { usedPercent: 140, resetsAt: null } });
+    });
+});
+

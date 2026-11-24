@@ -52,6 +52,17 @@ export const AiAuthReportV1Schema = z.object({
     connectionVersion: nonNegativeSafeInteger.max(2_147_483_647).nullish(),
 }).strict();
 
+/**
+ * One rate-limit window as the agent CLI already knew it when the usage was spent
+ * (aplus specs/org-member-ai-plan-usage P10): percent used (0-100) and the reset
+ * time in epoch ms. Loose on purpose and unknown keys are stripped — the ledger
+ * clamps the values, so a limit reading never costs the event its tokens.
+ */
+export const UsageRateLimitWindowV1Schema = z.object({
+    usedPercent: z.number(),
+    resetsAt: z.number().nullable(),
+});
+
 const providerUsageEventShape = {
     source: z.literal('happy-cli'),
     sourceEventId: z.string().trim().min(1).max(512),
@@ -77,6 +88,11 @@ const providerUsageEventShape = {
      * accept it **before** a CLI sends it — the receivers are strict.
      */
     planTier: z.string().trim().max(64).nullish(),
+    /** The run account's five-hour and weekly windows at that moment. Mirrors `rateLimits` in aiUsageContract.ts. */
+    rateLimits: z.object({
+        fiveHour: UsageRateLimitWindowV1Schema.nullish(),
+        weekly: UsageRateLimitWindowV1Schema.nullish(),
+    }).nullish(),
 } as const;
 
 export const ProviderUsageEventV1Schema = z.object(providerUsageEventShape).strict();
@@ -89,5 +105,7 @@ export const AiUsageEventV1Schema = z.object({
 export type UsageTokenBreakdownV1 = z.infer<typeof UsageTokenBreakdownV1Schema>;
 export type UsageCostV1 = z.infer<typeof UsageCostV1Schema>;
 export type AiAuthReportV1 = z.infer<typeof AiAuthReportV1Schema>;
+export type UsageRateLimitWindowV1 = z.infer<typeof UsageRateLimitWindowV1Schema>;
+export type UsageRateLimitsV1 = NonNullable<ProviderUsageEventV1['rateLimits']>;
 export type ProviderUsageEventV1 = z.infer<typeof ProviderUsageEventV1Schema>;
 export type AiUsageEventV1 = z.infer<typeof AiUsageEventV1Schema>;

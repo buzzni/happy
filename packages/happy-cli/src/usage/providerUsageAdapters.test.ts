@@ -114,6 +114,9 @@ describe('createCodexUsageEvent', () => {
         expect(createCodexUsageEvent({ ...base, planTier: 'chatgpt:pro' }).planTier).toBe('chatgpt:pro');
         expect('planTier' in createCodexUsageEvent({ ...base, planTier: null })).toBe(false);
         expect('planTier' in createCodexUsageEvent(base)).toBe(false);
+        const rateLimits = { fiveHour: { usedPercent: 20, resetsAt: null } };
+        expect(createCodexUsageEvent({ ...base, rateLimits }).rateLimits).toEqual(rateLimits);
+        expect('rateLimits' in createCodexUsageEvent({ ...base, rateLimits: null })).toBe(false);
     });
 
     it('rejects an invalid provider total instead of silently changing it', () => {

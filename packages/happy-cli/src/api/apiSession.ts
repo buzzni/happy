@@ -55,6 +55,7 @@ import { ClaudeRuntimeAccountPublisher } from '@/claude/claudeRuntimeAccount';
 import { ClaudeContextUsageTracker, type ClaudeContextUsageSignal, type ClaudeControlRequest } from '@/claude/claudeContextUsage';
 import { createClaudeTurnUsageEvent, createClaudeUsageEvent } from '@/usage/providerUsageAdapters';
 import type { AiPlanTierSource } from '@/usage/aiPlanTier';
+import { claudeRateLimits } from '@/usage/aiRateLimits';
 import type { ObservedAiAuthSource } from '@/claude/aiAuthObservation';
 import { createTurnSequence, registerCleanBackgroundProcessesHandler, sessionBackgroundProcesses } from '@/utils/sessionBackgroundProcesses';
 
@@ -2511,7 +2512,13 @@ export class ApiSessionClient extends EventEmitter {
 
     sendProviderUsageEvent(event: ProviderUsageEventV1) {
         const planTier = event.planTier ?? this.aiPlanTierSource?.current(event.provider) ?? null;
-        const parsed = ProviderUsageEventV1Schema.parse(planTier ? { ...event, planTier } : event);
+        // aplus specs/org-member-ai-plan-usage P10 — Claude's windows as the session already holds them; nothing is fetched.
+        const rateLimits = event.rateLimits ?? (event.provider === 'anthropic' ? claudeRateLimits(this.agentState?.usageLimits) : null);
+        const parsed = ProviderUsageEventV1Schema.parse({
+            ...event,
+            ...(planTier ? { planTier } : {}),
+            ...(rateLimits ? { rateLimits } : {}),
+        });
         this.providerUsageDelivery.send(parsed);
         if (!this.providerUsageEventIds.has(parsed.sourceEventId)) {
             this.providerUsageEventIds.add(parsed.sourceEventId);
