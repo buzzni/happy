@@ -17,7 +17,7 @@ import { logger } from '@/ui/logger'
 import type { AgentState, CreateSessionResponse, Metadata, Session, Machine, MachineMetadata, DaemonState } from '@/api/types'
 import { ApiSessionClient, type ApiSessionClientOptions } from './apiSession';
 import { ApiMachineClient } from './apiMachine';
-import { decodeBase64, encodeBase64, getRandomBytes, encrypt, decrypt, wrapDataEncryptionKey, buildMachineKeyEnvelopes } from './encryption';
+import { decodeBase64, encodeBase64, getRandomBytes, encrypt, decrypt, wrapDataEncryptionKey, buildMachineKeyEnvelopes, deriveServerRpcKey } from './encryption';
 import { PushNotificationClient } from './pushNotifications';
 import { configuration } from '@/configuration';
 import chalk from 'chalk';
@@ -279,6 +279,49 @@ export class ApiClient {
         : null,
       daemonStateVersion: raw.daemonStateVersion || 0,
     };
+  }
+
+  /**
+   * aplus-dev-studio specs/work-machine-migration — a replace or restore clears the server copies of
+   * the machine key with the old key, and nothing else sends them for a protected machine (it does
+   * not register). The device now current sends the missing ones with its own credential, as a
+   * registration would have: the server lane key always, the machine key escrow only outside strict
+   * machine control and for a key that was never kept from the server. Each copy is wrapped anew, so
+   * one already there is left alone. The server takes them only for the data key it holds now.
+   *
+   * Without them Studio's server lane falls back to a key this daemon refuses; the daemon itself
+   * still works, so a failure is logged and the next start tries again.
+   */
+  private async restoreWorkMachineServerKeyCopies(
+    row: RegisteredMachineRow,
+    machineKey: Uint8Array,
+    opts: { serverPublicKey?: string | null; machineControl?: 'compat' | 'strict' },
+  ): Promise<void> {
+    const credential = this.accountCredential();
+    const strict = opts.machineControl === 'strict' || configuration.machineControl === 'strict'
+      || (credential.encryption.type === 'dataKey' && credential.encryption.neverEscrowed === true);
+    const missingLane = !row.serverRpcKeyEnvelope;
+    const missingEscrow = !strict && !row.serverDataEncryptionKey;
+    if (!missingLane && !missingEscrow) return;
+    if (!opts.serverPublicKey || !row.dataEncryptionKey) {
+      logger.warn(`[API] Work machine server key copies are missing and cannot be restored (${opts.serverPublicKey ? 'no data key on the server' : 'no server public key in settings'}); Studio server features will not reach this machine`);
+      return;
+    }
+    const serverPublicKey = decodeBase64(opts.serverPublicKey);
+    try {
+      await axios.put(`${configuration.serverUrl}/v1/machines/${encodeURIComponent(row.id)}/server-key-envelopes`, {
+        expectedDataEncryptionKey: row.dataEncryptionKey,
+        serverRpcKeyEnvelope: missingLane ? encodeBase64(wrapDataEncryptionKey(deriveServerRpcKey(machineKey), serverPublicKey)) : null,
+        serverDataEncryptionKey: missingEscrow ? encodeBase64(wrapDataEncryptionKey(machineKey, serverPublicKey)) : null,
+      }, {
+        headers: { 'Authorization': `Bearer ${this.bearer()}`, 'X-Happy-Client': `cli-coding-session/${configuration.currentCliVersion}` },
+        timeout: 30000,
+      });
+      logger.debug(`[API] Restored work machine server key copies (lane: ${missingLane}, escrow: ${missingEscrow})`);
+    } catch (error) {
+      const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+      logger.warn(`[API] Work machine server key copies were not restored (${status ? `HTTP ${status}` : 'no answer'}); Studio server features will not reach this machine until the next start`);
+    }
   }
 
   /** Prepare once without sending a request. The daemon persists this private snapshot before commit. */
@@ -577,7 +620,9 @@ export class ApiClient {
       if (encryptionVariant !== 'dataKey') {
         throw new Error('an existing work machine needs its issued data key');
       }
-      const machine = await this.readRegisteredMachine(opts.machineId, encryptionKey);
+      const row = await this.fetchRegisteredMachineRow(opts.machineId);
+      await this.restoreWorkMachineServerKeyCopies(row, wrapMaterial!.machineKey, opts);
+      const machine = this.decodeRegisteredMachine(row, encryptionKey);
       return opts.daemonState
         ? { ...machine, daemonState: { ...machine.daemonState, ...opts.daemonState } }
         : machine;
