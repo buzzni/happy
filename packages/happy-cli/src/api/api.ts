@@ -62,6 +62,18 @@ type ApiPrincipal =
   };
 
 /** Creation response only; never session metadata, provider state or event wire. */
+/** The fields of `GET /v1/machines/:id` a registered Machine is read from (base64 where encrypted). */
+interface RegisteredMachineRow {
+  id: string;
+  metadata?: string | null;
+  metadataVersion?: number;
+  daemonState?: string | null;
+  daemonStateVersion?: number;
+  dataEncryptionKey?: string | null;
+  serverDataEncryptionKey?: string | null;
+  serverRpcKeyEnvelope?: string | null;
+}
+
 const ownershipCreatedSchema = z.object({
   sessionId: z.string().min(1), ownershipBindingId: z.string().min(1),
   registrationState: z.enum(['pending', 'confirmed']), createDigest: z.string().regex(/^[a-f0-9]{64}$/),
@@ -231,6 +243,11 @@ export class ApiClient {
   }
 
   private async readRegisteredMachine(machineId: string, machineKey: Uint8Array): Promise<Machine> {
+    return this.decodeRegisteredMachine(await this.fetchRegisteredMachineRow(machineId), machineKey);
+  }
+
+  /** The server's row for the Machine this process is, refused when it names another one. */
+  private async fetchRegisteredMachineRow(machineId: string): Promise<RegisteredMachineRow> {
     const response = await axios.get(
       `${configuration.serverUrl}/v1/machines/${encodeURIComponent(machineId)}`,
       {
@@ -245,6 +262,10 @@ export class ApiClient {
     if (!raw || raw.id !== machineId) {
       throw new Error('the server returned a different machine than this runtime is');
     }
+    return raw;
+  }
+
+  private decodeRegisteredMachine(raw: RegisteredMachineRow, machineKey: Uint8Array): Machine {
     return {
       id: raw.id,
       encryptionKey: machineKey,
