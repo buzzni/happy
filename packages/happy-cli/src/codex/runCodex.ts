@@ -154,6 +154,8 @@ import {
 import { createCodexExecTitleRunner, isOffTurnTitleEligible } from './codexOffTurnTitle';
 import { createOffTurnTitleJob, titleCoveredForTurn } from '@/utils/offTurnTitle';
 import { discoverCodexSkillCommands } from './codexSkills';
+import { CodexSkillUnavailableError, codexSkillRefSchema, resolveCodexSkill } from './codexSkillCatalog';
+import { realpath as realSkillDirectory } from 'node:fs/promises';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
 import { NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
 import { createTurnCardSwitch } from '@/claude/utils/turnCardTools';
@@ -429,6 +431,7 @@ export async function runCodex(opts: {
         linkedPullRequestTools,
     });
 
+    if (!managedStartup && !workMachine) freshMetadata.codexSkillInputVersion = 1;
     const skillCommands = await discoverCodexSkillCommands();
     if (skillCommands.length > 0) {
         freshMetadata.skills = skillCommands;
@@ -879,7 +882,14 @@ export async function runCodex(opts: {
             }
         }
 
+        const rawSkillRef = message.meta?.codexSkillRef;
+        const parsedSkillRef = codexSkillRefSchema.safeParse(rawSkillRef);
+        if (rawSkillRef !== undefined && (managedStartup || workMachine || !parsedSkillRef.success || !machineId)) {
+            for (const envelope of refusedTurnEnvelopes('선택한 Codex 스킬을 이 대화에서 사용할 수 없어요.', undefined)) session.sendSessionProtocolMessage(envelope);
+            return;
+        }
         const enhancedMode: EnhancedMode = {
+            ...(parsedSkillRef.success ? { skill: { ref: parsedSkillRef.data, messageId: randomUUID() } } : {}),
             permissionMode: messagePermissionMode || 'default',
             model: messageModel,
             appendSystemPrompt: messageAppendSystemPrompt,
@@ -901,6 +911,7 @@ export async function runCodex(opts: {
                 attendance: inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
                 // Travels beside the mode so the engine boundary below can commit
                 // this decision — and so a batch keeps every merged request's id.
+                allowClear: !parsedSkillRef.success,
                 requestIds: routed
                     ? [routed.pending.clientRequestId]
                     : localDecision ? [localDecision.clientRequestId] : undefined,
@@ -2862,7 +2873,7 @@ export async function runCodex(opts: {
                         }
                     }
 
-                    const goalCommand = parseCodexGoalCommand(message.message);
+                    const goalCommand = message.mode.skill ? null : parseCodexGoalCommand(message.message);
                     if (goalCommand && await handleCodexGoalCommand(goalCommand, activeThreadId)) {
                         latency?.finish('control');
                         continue;
@@ -2938,6 +2949,14 @@ export async function runCodex(opts: {
                     // a cancelled turn or consume its pending startup context in that case.
                     if (owningForegroundSignal.aborted) { lessonProposalTurn.cancel(); continue; }
                     if (owningReviewSignal.aborted) { lessonProposalTurn.cancel(); reviewInstruction = ''; }
+                    const skillInputs = [];
+                    if (message.mode.skill) {
+                        const cwd = await realSkillDirectory(process.cwd());
+                        const catalog = await client.listSkills(cwd).catch(() => null);
+                        const skill = resolveCodexSkill(catalog, machineId ?? '', cwd, message.mode.skill.ref);
+                        if (!skill) throw new CodexSkillUnavailableError('선택한 Codex 스킬을 다시 골라 주세요.');
+                        skillInputs.push(skill);
+                    }
                     const turnPrompt = (reviewInstruction ? `${reviewInstruction}\n\n` : '') + buildCodexTurnPrompt({
                         message: message.message,
                         mode: message.mode,
@@ -3021,7 +3040,7 @@ export async function runCodex(opts: {
                         effort: appliedRoute
                             ? (isSupportedCodexReasoningEffort(appliedRoute.effort) ? appliedRoute.effort : undefined)
                             : message.mode.effort,
-                        extraInputItems: imageInputs.inputItems,
+                        extraInputItems: [...imageInputs.inputItems, ...skillInputs],
                     }).catch(error => { memoryIngest?.onSettled(); throw error; }).finally(async () => {
                         // Recorded even after a failed turn: it may already have changed files. A
                         // missing record only makes a later restore more cautious.
@@ -3126,7 +3145,7 @@ export async function runCodex(opts: {
                         const notice = `Model at capacity — continuing automatically in ${Math.round(retry.delayMs / 1000)}s (${retry.attempt}/${retry.maxAttempts}).`;
                         messageBuffer.addMessage(notice, 'status');
                         session.sendSessionEvent({ type: 'message', message: notice });
-                        const continuationMode = { ...message.mode };
+                        const continuationMode = { ...message.mode, skill: undefined };
                         capacityContinuationModes.set(continuationMode, turnCapacityRetryGeneration);
                         capacityRetryTimer = setTimeout(() => {
                             capacityRetryTimer = null;
@@ -3164,7 +3183,8 @@ export async function runCodex(opts: {
                     // would have produced from a real turn_aborted, reusing its guard logic
                     // (harmless no-op if currentTurnId is already null).
                     logger.warn('Error in codex session:', error);
-                    const failureMessage = describeCheckpointFailure(error) ?? describeCodexAuthRecoveryFailure(error) ?? 'Process exited unexpectedly';
+                    const failureMessage = error instanceof CodexSkillUnavailableError ? error.message
+                        : describeCheckpointFailure(error) ?? describeCodexAuthRecoveryFailure(error) ?? 'Process exited unexpectedly';
                     messageBuffer.addMessage(failureMessage, 'status');
                     session.sendSessionEvent({ type: 'message', message: failureMessage });
                     // Carries the correlation in and reads it back, like the normal event path. A

@@ -304,7 +304,8 @@ export type ImageDetail = "auto" | "low" | "high";
 export type InputItem =
     | { type: "text"; text: string; text_elements?: unknown[] }
     | { type: "image"; detail?: ImageDetail; url: string }
-    | { type: "localImage"; detail?: ImageDetail; path: string };
+    | { type: "localImage"; detail?: ImageDetail; path: string }
+    | { type: "skill"; name: string; path: string };
 
 export type SandboxPolicy =
     | { type: "dangerFullAccess" }

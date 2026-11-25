@@ -34,6 +34,7 @@ export function shouldHandleCodexClear(message: { message: string; channelReques
 
 export function enqueueCodexUserText<T>(opts: {
     text: string;
+    allowClear?: boolean;
     mode: T;
     queue: CodexUserTextQueue<T>;
     attachments?: PendingAttachment[];
@@ -44,7 +45,7 @@ export function enqueueCodexUserText<T>(opts: {
     attendance?: InputAttendance;
     evidence?: QueueInputEvidence;
 }): 'clear' | 'queued' {
-    if (isCodexClearText(opts.text)) {
+    if (opts.allowClear !== false && isCodexClearText(opts.text)) {
         if (opts.evidence) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace, opts.attendance, opts.evidence);
         else if (opts.attendance) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace, opts.attendance);
         else if (opts.latencyTrace) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace);

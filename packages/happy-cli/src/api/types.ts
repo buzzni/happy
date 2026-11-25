@@ -469,6 +469,7 @@ export type Machine = {
  * Message metadata schema
  */
 export const MessageMetaSchema = z.object({
+  codexSkillRef: z.unknown().optional(),
   setupTokenCapacityActor: z.unknown().optional(),
   // Retain malformed/unknown versions for explicit rejection; never strip into ordinary input.
   hubPrompt: z.unknown().optional(),
@@ -706,6 +707,7 @@ export type Metadata = {
   acpSessionId?: string, // ACP agent session ID (OpenCode), continued with session/resume on a daemon resume
   tools?: string[],
   slashCommands?: string[],
+  codexSkillInputVersion?: 1,
   /**
    * Claude Code's live background tasks (`background_tasks_changed`), REPLACE on every publish. A turn starts
    * from `tasks: null` (no list yet; a reader that falls back to the transcript reads it from `startedAt`) unless

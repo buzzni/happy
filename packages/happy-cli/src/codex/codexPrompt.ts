@@ -13,6 +13,7 @@ import type { ReasoningEffort } from './codexAppServerTypes';
 import type { ModelOrigin } from '@/orgRequirements/resolve';
 
 export interface CodexEnhancedMode {
+    skill?: { ref: string; messageId: string };
     permissionMode: PermissionMode;
     model?: string;
     /** Happy app instructions appended to the first Codex prompt for option chips. */
@@ -49,6 +50,7 @@ export function resolveCodexSaycodePromptBlocks(
 
 export function hashCodexEnhancedMode(mode: CodexEnhancedMode): string {
     return hashObject({
+        skill: mode.skill,
         permissionMode: mode.permissionMode,
         model: mode.model,
         appendSystemPrompt: mode.appendSystemPrompt,
