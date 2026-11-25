@@ -62,16 +62,27 @@ export async function enrollWorkMachineExecution(
             if (!machine) return refuse('machine-not-ready');
             const inventory = new Set(sessionIds);
             if (inventory.size !== sessionIds.length) return refuse('invalid-inventory');
+            // A conversation launched with a session execution binding (organization
+            // account rotation) keeps its binding: the machine id does not change.
+            // It must name this machine and account for both owners.
             const launched = await tx.sessionExecutionBinding.findMany({
-                where: { machineId, machineOwnerAccountId: accountId, sessionRowId: { not: null } },
-                take: maxRefusedSessionIds, select: { sessionId: true },
+                where: { sessionId: { in: sessionIds } },
+                select: { sessionId: true, machineId: true, machineOwnerAccountId: true, sessionOwnerAccountId: true },
             });
-            if (launched.length) return refuse('session-execution-bound', launched.map(row => row.sessionId));
-            const uninventoried = await tx.sessionOwnershipBinding.findMany({
-                where: { machineId, machineAccountId: accountId, sessionRowId: { not: null }, sessionId: { notIn: sessionIds } },
-                take: maxRefusedSessionIds, select: { sessionId: true },
-            });
-            if (uninventoried.length) return refuse('uninventoried-sessions', uninventoried.map(row => row.sessionId));
+            const foreignLaunches = launched.filter(binding => binding.machineId !== machineId
+                || binding.machineOwnerAccountId !== accountId || binding.sessionOwnerAccountId !== accountId);
+            if (foreignLaunches.length) return refuse('session-execution-bound', foreignLaunches.map(row => row.sessionId));
+            const uninventoried = [
+                ...await tx.sessionOwnershipBinding.findMany({
+                    where: { machineId, machineAccountId: accountId, sessionRowId: { not: null }, sessionId: { notIn: sessionIds } },
+                    take: maxRefusedSessionIds, select: { sessionId: true },
+                }),
+                ...await tx.sessionExecutionBinding.findMany({
+                    where: { machineId, machineOwnerAccountId: accountId, sessionRowId: { not: null }, sessionId: { notIn: sessionIds } },
+                    take: maxRefusedSessionIds, select: { sessionId: true },
+                }),
+            ];
+            if (uninventoried.length) return refuse('uninventoried-sessions', [...new Set(uninventoried.map(row => row.sessionId))]);
             const bindings = await tx.sessionOwnershipBinding.findMany({
                 where: { sessionId: { in: sessionIds } },
                 select: {
@@ -95,7 +106,6 @@ export async function enrollWorkMachineExecution(
                 where: { id: { in: sessionIds }, accountId },
                 select: {
                     id: true, active: true, dataEncryptionKey: true, workMachineId: true, piiProtection: true,
-                    executionBinding: { select: { sessionId: true } },
                 },
             });
             const found = new Set(sessions.map(session => session.id));
@@ -117,8 +127,7 @@ export async function enrollWorkMachineExecution(
             const sessionRefusal = failing('active-session', sessions.filter(session => session.active).map(session => session.id))
                 ?? failing('session-attached', sessions.filter(session => session.workMachineId).map(session => session.id))
                 ?? failing('session-key-missing', sessions.filter(session => !session.dataEncryptionKey).map(session => session.id))
-                ?? failing('session-protected', sessions.filter(session => session.piiProtection).map(session => session.id))
-                ?? failing('session-execution-bound', sessions.filter(session => session.executionBinding).map(session => session.id));
+                ?? failing('session-protected', sessions.filter(session => session.piiProtection).map(session => session.id));
             if (sessionRefusal) return sessionRefusal;
             // Serializable legacy worker transactions may have started before
             // the row lock was acquired. Change its row version so they retry

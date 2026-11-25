@@ -2053,4 +2053,39 @@ describe('shared PC enrollment', () => {
         // A lost acknowledgement is answered again with the same grant.
         expect((await enroll(pc, { ownerUserIds: ['member-b', 'member-a'] }, members)).statusCode).toBe(200);
     });
+
+    it('accepts rotation conversations of this machine and account only when they are in the inventory', async () => {
+        const pc = await sharedPc();
+        await memberConversation(pc, 'rotation-member-chat', 'member-a');
+        await executionBound('rotation-chat', { machineId: pc });
+        const owners = { ownerUserIds: ['member-a'] };
+        const inventory = ['rotation-member-chat', 'rotation-chat'];
+
+        // A rotation conversation of this machine that the inventory leaves out.
+        expect(await outcome(enroll(pc, owners, ['rotation-member-chat']))).toMatchObject({
+            status: 409, body: { reason: 'uninventoried-sessions', sessionIds: ['rotation-chat'] },
+        });
+        // Bound to another machine, or naming another machine or session account.
+        await executionBound('rotation-elsewhere', { machineId: 'ordinary-machine' });
+        await executionBound('rotation-other-machine-account', { machineId: pc, machineOwnerAccountId: 'another-account' });
+        await executionBound('rotation-other-session-account', { machineId: pc, sessionOwnerAccountId: 'another-account' });
+        const foreign = ['rotation-elsewhere', 'rotation-other-machine-account', 'rotation-other-session-account'];
+        expect(await outcome(enroll(pc, owners, [...inventory, ...foreign], [...inventory, ...foreign]))).toMatchObject({
+            status: 409, body: { reason: 'session-execution-bound', sessionIds: [...foreign].sort() },
+        });
+        await db.session.deleteMany({ where: { id: { in: foreign } } });
+        // Without an ownership binding it still needs Studio's attribution.
+        expect(await outcome(enroll(pc, owners, inventory))).toMatchObject({
+            status: 409, body: { reason: 'unattributed-sessions', sessionIds: ['rotation-chat'] },
+        });
+        expect(await db.workMachineExecution.findUnique({ where: { machineId: pc } })).toBeNull();
+
+        const enrolled = await enroll(pc, owners, inventory, ['rotation-chat']);
+        expect(enrolled.statusCode).toBe(200);
+        expect(await db.session.count({ where: { id: { in: inventory }, workMachineId: pc } })).toBe(2);
+        // The execution relation stays where it was: the machine id does not change.
+        expect(await db.sessionExecutionBinding.findUniqueOrThrow({ where: { sessionId: 'rotation-chat' } }))
+            .toMatchObject({ machineId: pc, machineOwnerAccountId: company, sessionOwnerAccountId: company, sessionRowId: 'rotation-chat' });
+        expect((await enroll(pc, owners, inventory, ['rotation-chat'])).statusCode).toBe(200);
+    });
 });
