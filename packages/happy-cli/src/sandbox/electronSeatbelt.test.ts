@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import shellquote from 'shell-quote';
-import { allowElectronInSeatbelt, ELECTRON_SEATBELT_RULES } from './electronSeatbelt';
+import { allowElectronInSeatbelt, EGO_BROWSER_SEATBELT_RULES, ELECTRON_SEATBELT_RULES } from './electronSeatbelt';
 
 const PROFILE = [
     '(version 1)',
@@ -50,6 +50,24 @@ describe('allowElectronInSeatbelt', () => {
     it('is idempotent', () => {
         const once = allowElectronInSeatbelt(wrapped(PROFILE));
         expect(allowElectronInSeatbelt(once)).toBe(once);
+    });
+
+    it('adds the ego lite CLI bootstrap only when asked', () => {
+        const profileLines = (command: string) =>
+            (shellquote.parse(command, (key) => `$${key}`) as string[]).find((token) => token.startsWith('(version 1)'))!.split('\n');
+
+        const withEgo = profileLines(allowElectronInSeatbelt(wrapped(PROFILE), { egoBrowser: true }));
+        expect(withEgo.slice(2, 2 + ELECTRON_SEATBELT_RULES.length + EGO_BROWSER_SEATBELT_RULES.length))
+            .toEqual([...ELECTRON_SEATBELT_RULES, ...EGO_BROWSER_SEATBELT_RULES]);
+
+        const withoutEgo = profileLines(allowElectronInSeatbelt(wrapped(PROFILE)));
+        expect(withoutEgo.join('\n')).not.toContain('ego-browser');
+    });
+
+    it('opens only the ego lite CLI bootstrap, not app launching (runningboard)', () => {
+        expect(EGO_BROWSER_SEATBELT_RULES.filter((line) => !line.startsWith(';'))).toEqual([
+            '(allow mach-lookup (global-name "com.citrolabs.ego.lite.ego-browser"))',
+        ]);
     });
 
     it('opens only what Electron dies without: the rendezvous port and WindowServer', () => {

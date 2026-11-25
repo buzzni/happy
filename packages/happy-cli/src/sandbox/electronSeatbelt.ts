@@ -28,13 +28,25 @@ export const ELECTRON_SEATBELT_RULES: readonly string[] = [
     '(allow mach-lookup (global-name "com.apple.windowserver.active"))',
 ]
 
+/**
+ * ego-browser CLI 는 이미 떠 있는 ego lite 의 `<bundle id>.ego-browser` 부트스트랩에 붙는다. 막히면 앱이
+ * 꺼진 줄 알고 LaunchServices 로 띄우려다 runningboard 에서 또 막혀 "Connection invalid / Failed to start
+ * ego lite"(exit 4) 로 끝난다. 2026-11-25 macOS 27 에서 실제 Codex 세션 프로필에 이 한 줄만 더해
+ * `listTaskSpaces()` 가 통과함을 확인했다. 앱 실행(runningboard)은 샌드박스 밖으로 아무 앱이나 띄우는
+ * 통로라 열지 않는다 — ego lite 가 꺼져 있으면 지금처럼 실패한다.
+ */
+export const EGO_BROWSER_SEATBELT_RULES: readonly string[] = [
+    '; ego lite CLI bootstrap (happy-cli, owner-choice + open network only)',
+    '(allow mach-lookup (global-name "com.citrolabs.ego.lite.ego-browser"))',
+]
+
 const DENY_DEFAULT_LINE = /^\(deny default\b/;
 
 /**
  * `sandbox-exec -p <profile> ...` 형태의 감싼 명령이면 프로필의 `(deny default ...)` 줄 바로 뒤에
- * Electron 규칙을 끼워 넣는다. 그 형태가 아니거나 이미 들어 있으면 그대로 돌려준다.
+ * Electron 규칙(요청하면 ego lite 규칙도)을 끼워 넣는다. 그 형태가 아니거나 이미 들어 있으면 그대로 돌려준다.
  */
-export function allowElectronInSeatbelt(wrappedCommand: string): string {
+export function allowElectronInSeatbelt(wrappedCommand: string, options: { egoBrowser?: boolean } = {}): string {
     if (!wrappedCommand.includes('sandbox-exec')) return wrappedCommand;
     // env 참조는 원문 그대로 보존한다 — sandbox-runtime 이 모든 인자를 리터럴로 인용했으므로
     // 다시 인용하면 같은 리터럴이 된다.
@@ -54,7 +66,12 @@ export function allowElectronInSeatbelt(wrappedCommand: string): string {
     const quotedProfile = shellquote.quote([tokens[profileIndex]]);
     const at = wrappedCommand.indexOf(quotedProfile);
     if (at < 0) return wrappedCommand;
-    lines.splice(denyDefaultIndex + 1, 0, ...ELECTRON_SEATBELT_RULES);
+    lines.splice(
+        denyDefaultIndex + 1,
+        0,
+        ...ELECTRON_SEATBELT_RULES,
+        ...(options.egoBrowser ? EGO_BROWSER_SEATBELT_RULES : []),
+    );
     return wrappedCommand.slice(0, at)
         + shellquote.quote([lines.join('\n')])
         + wrappedCommand.slice(at + quotedProfile.length);

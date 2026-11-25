@@ -147,6 +147,38 @@ describe('sandbox manager', () => {
         expect(wrapped).toContain('com.apple.windowserver.active');
     });
 
+    // ego lite 는 사용자 로그인 세션이 있는 브라우저다. 네트워크를 막거나 도메인을 제한한
+    // 샌드박스에서 열면 그 제한을 브라우저로 우회하게 되므로, 네트워크가 열린 경우에만 연다.
+    it.each([
+        ['allowed', true],
+        ['blocked', false],
+        ['custom', false],
+    ] as const)('wrapCommand opens the ego lite CLI bootstrap only for open network (%s)', async (networkMode, expected) => {
+        const profile = '(version 1)\n(deny default (with message "tag"))\n(allow process-exec)';
+        mockWrapWithSandbox.mockResolvedValue(
+            shellquote.quote(['env', 'SANDBOX_RUNTIME=1', 'sandbox-exec', '-p', profile, '/bin/zsh', '-c', 'ego-browser skill']),
+        );
+        const cleanup = await initializeSandbox({ networkMode } as SandboxConfig, '/workspace/session');
+
+        expect((await wrapCommand('ego-browser skill')).includes('com.citrolabs.ego.lite.ego-browser')).toBe(expected);
+
+        await cleanup();
+        expect(await wrapCommand('ego-browser skill')).not.toContain('com.citrolabs.ego.lite.ego-browser');
+    });
+
+    // 조직이 관리하는(mandatory) 머신에서는 로그인된 브라우저를 승인 없이 넘기지 않는다.
+    it('wrapCommand keeps the ego lite CLI bootstrap closed on mandatory machines even with open network', async () => {
+        const profile = '(version 1)\n(deny default (with message "tag"))\n(allow process-exec)';
+        mockWrapWithSandbox.mockResolvedValue(
+            shellquote.quote(['env', 'SANDBOX_RUNTIME=1', 'sandbox-exec', '-p', profile, '/bin/zsh', '-c', 'ego-browser skill']),
+        );
+        const cleanup = await initializeSandbox({ networkMode: 'allowed' } as SandboxConfig, '/workspace/session', 'mandatory');
+
+        expect(await wrapCommand('ego-browser skill')).not.toContain('com.citrolabs.ego.lite.ego-browser');
+
+        await cleanup();
+    });
+
     it('wrapForMcpTransport returns sh -c wrapped command', async () => {
         mockWrapWithSandbox.mockResolvedValue('sandbox codex command');
 
