@@ -73,6 +73,13 @@ export function machineSessionOwnerRoutes(app: Fastify) {
         requireWorkMachineDaemonReadAuth(app, request => (request.body as { machineId?: string }).machineId),
         async (request: FastifyRequest, reply: FastifyReply) => request.workMachineDaemonGrant ? undefined : requireAccountPrincipal(request, reply),
     ];
+    // The machine row a caller may ask about. The account bearer only reaches a machine
+    // without work-machine authority, as the legacy lock does: an old PC still holding
+    // the account token must not vouch for the protected machine's sessions.
+    const askedMachine = (request: FastifyRequest, machineId: string) => ({
+        id: machineId, accountId: request.userId,
+        ...(request.workMachineDaemonGrant ? {} : { workMachineExecution: { is: null } }),
+    });
 
     // Execution relation only. This grants neither session ownership nor message access.
     app.post('/v1/machine-sessions/:sessionId/execution-owner', {
@@ -88,7 +95,7 @@ export function machineSessionOwnerRoutes(app: Fastify) {
         const binding = await db.sessionExecutionBinding.findFirst({ where: {
             sessionId, companyId, machineId, launchId, initialNonce,
             machineOwnerAccountId: request.userId,
-            machine: { is: { id: machineId, accountId: request.userId } },
+            machine: { is: askedMachine(request, machineId) },
             session: { is: { id: sessionId, ...(request.workMachineDaemonGrant ? { workMachineId: machineId } : {}) } },
         } });
         if (!binding) return reply.send({ owner: null });
@@ -119,7 +126,7 @@ export function machineSessionOwnerRoutes(app: Fastify) {
             where: {
                 companyId, machineId, launchId, initialNonce,
                 machineOwnerAccountId: request.userId, sessionOwnerAccountId: request.userId,
-                machine: { is: { id: machineId, accountId: request.userId } },
+                machine: { is: askedMachine(request, machineId) },
                 session: { is: {
                     ...piiSessionVisibility(request), accountId: request.userId,
                     ...(request.workMachineDaemonGrant ? { workMachineId: machineId } : {}),

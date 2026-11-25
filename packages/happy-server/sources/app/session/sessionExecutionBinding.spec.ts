@@ -386,7 +386,7 @@ describe('execution-bound creation on a protected work machine', () => {
     await unchanged();
   });
 
-  it('answers the execution owner to the current device credential of that machine, and to the account bearer', async () => {
+  it('answers the execution owner only to the current device credential of that machine, not to the account bearer', async () => {
     const token = await daemon(), proof = await signed(undefined, own);
     const sessionId = (await createOnDevice(token, { executionProof: proof })).json().session.id;
     const t = proof.ticket.body;
@@ -397,7 +397,8 @@ describe('execution-bound creation on a protected work machine', () => {
     const answered = await ask(token);
     expect(answered.statusCode, answered.body).toBe(200);
     expect(answered.json()).toEqual({ owner: relation });
-    expect((await owner(sessionId)).json()).toEqual({ owner: relation });
+    // An old PC still holding the account token cannot vouch for the protected machine's sessions.
+    expect((await owner(sessionId)).json()).toEqual({ owner: null });
     // Another machine's credential, whether it names this machine or its own.
     const other = await daemon({ ...grant, machineId: 'machine-2' });
     expect((await ask(other)).statusCode).toBe(403);
@@ -425,7 +426,8 @@ describe('execution-bound creation on a protected work machine', () => {
       id: created.id, seq: created.seq, metadata: created.metadata, metadataVersion: created.metadataVersion,
       agentState: created.agentState, agentStateVersion: created.agentStateVersion, dataEncryptionKey: created.dataEncryptionKey,
     } });
-    expect((await lookup({ 'x-test-account': 'company-account' }, {}, proof.ticket.body)).json().session.id).toBe(created.id);
+    // The account bearer reads nothing on a protected machine.
+    expect((await lookup({ 'x-test-account': 'company-account' }, {}, proof.ticket.body)).json()).toEqual({ session: null });
     for (const change of [{ launchId: 'launch-2' }, { companyId: 'company-2' }, { initialNonce: rotationBase64url(new Uint8Array(32).fill(8)) }]) {
       expect((await lookup(device, change, proof.ticket.body)).json()).toEqual({ session: null });
     }
@@ -441,5 +443,13 @@ describe('execution-bound creation on a protected work machine', () => {
     await client.workMachineExecution.delete({ where: { machineId: grant.machineId } });
     expect((await create(await signed())).statusCode).toBe(200);
     expect((await lookup({ 'x-test-account': 'company-account' })).json()).toEqual({ session: null });
+  });
+
+  it('answers the account bearer for its own session on an unprotected machine', async () => {
+    await client.workMachineExecution.delete({ where: { machineId: grant.machineId } });
+    const proof = await signed(undefined, own);
+    const created = await create(proof, undefined, 'company-account');
+    expect(created.statusCode, created.body).toBe(200);
+    expect((await lookup({ 'x-test-account': 'company-account' }, {}, proof.ticket.body)).json().session.id).toBe(created.json().session.id);
   });
 });
