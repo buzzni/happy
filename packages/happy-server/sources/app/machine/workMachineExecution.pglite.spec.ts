@@ -2088,4 +2088,16 @@ describe('shared PC enrollment', () => {
             .toMatchObject({ machineId: pc, machineOwnerAccountId: company, sessionOwnerAccountId: company, sessionRowId: 'rotation-chat' });
         expect((await enroll(pc, owners, inventory, ['rotation-chat'])).statusCode).toBe(200);
     });
+
+    it('refuses a rotation conversation of this machine for another session account as execution-bound, not uninventoried', async () => {
+        const pc = await sharedPc();
+        await memberConversation(pc, 'member-chat', 'member-a');
+        // A staged personal account's conversation: it can never be in this account's inventory.
+        await executionBound('staged-rotation-chat', { machineId: pc, sessionOwnerAccountId: 'staged-personal-account' });
+
+        expect(await outcome(enroll(pc, { ownerUserIds: ['member-a'] }, ['member-chat']))).toMatchObject({
+            status: 409, body: { reason: 'session-execution-bound', sessionIds: ['staged-rotation-chat'] },
+        });
+        expect(await db.workMachineExecution.findUnique({ where: { machineId: pc } })).toBeNull();
+    });
 });

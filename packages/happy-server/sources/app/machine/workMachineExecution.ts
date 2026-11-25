@@ -64,9 +64,14 @@ export async function enrollWorkMachineExecution(
             if (inventory.size !== sessionIds.length) return refuse('invalid-inventory');
             // A conversation launched with a session execution binding (organization
             // account rotation) keeps its binding: the machine id does not change.
-            // It must name this machine and account for both owners.
+            // It must name this machine and account for both owners. One of this
+            // machine for another session account (a staged personal account) can
+            // never be in this account's inventory, so it is refused the same way.
             const launched = await tx.sessionExecutionBinding.findMany({
-                where: { sessionId: { in: sessionIds } },
+                where: { OR: [
+                    { sessionId: { in: sessionIds } },
+                    { machineId, machineOwnerAccountId: accountId, sessionRowId: { not: null }, sessionOwnerAccountId: { not: accountId } },
+                ] },
                 select: { sessionId: true, machineId: true, machineOwnerAccountId: true, sessionOwnerAccountId: true },
             });
             const foreignLaunches = launched.filter(binding => binding.machineId !== machineId
