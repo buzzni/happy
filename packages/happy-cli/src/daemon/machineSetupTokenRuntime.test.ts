@@ -17,12 +17,15 @@ import { createMachineSetupTokenJournal, type MachineRotationJournalRecord } fro
 import { createOwnedSpawnJournal } from './ownedSpawnJournal'
 import { isMachineSetupTokenBinding, readSetupTokenResumeSelection, formatSetupTokenBinding, SETUP_TOKEN_BINDING_ENV } from './sessionEnv'
 import type { TrackedSession } from './types'
+import { logger } from '@/ui/logger'
 
 vi.mock('axios', () => ({ default: { post: vi.fn() } }))
 const NOW = 1800000000000, companyId = 'company', machineId = 'machine', studioOrigin = 'https://studio.test', happyOrigin = 'https://happy.test'
 const originalOwner = 'staged-personal-account', machineOwner = 'company-owner'
 const refusal = { observedAt: NOW, reason: 'rate-limited' as const, retryAt: null, windows: [] }
-async function setup(expectedRefusal: 'account_limit' | 'authentication_failed' = 'account_limit') {
+async function setup(expectedRefusal: 'account_limit' | 'authentication_failed' = 'account_limit', { workMachine = false }: { workMachine?: boolean } = {}) {
+  // A protected machine's daemon creates with its device credential, for the machine account itself.
+  const createBearer = workMachine ? 'wmx_device-daemon' : 'original-staged-bearer', sessionOwner = workMachine ? machineOwner : originalOwner
   const keys = { signing: nacl.sign.keyPair(), recipient: nacl.box.keyPair() }, studio = nacl.sign.keyPair()
   const keyId = await rotationSha256(studio.publicKey), deviceKeyId = await rotationSha256(keys.signing.publicKey)
   const config = { companyId, machineId, studioOrigin, happyOrigin, studioPublicKey: Buffer.from(studio.publicKey).toString('base64url') }
@@ -34,7 +37,7 @@ async function setup(expectedRefusal: 'account_limit' | 'authentication_failed' 
   const operations = new Map<string, MachineRotationResult>(), bindings = new Map<string, MachineSetupTokenBindingV2>()
   const relations = new Map<string, string>(), sessions = new Map<string, TrackedSession>(), acknowledged = new Map<string, string>()
   let invalidTicket: 'owner' | 'device' | 'body' | undefined
-  let loseCreate = false, loseIssue = false, issueBeforeSend = false
+  let loseCreate = false, loseIssue = false, issueBeforeSend = false, drainCreate = false
   let denyInitialQuery = false, refuseStartBudget = false, unreachable = 0;
   let deny = false, saveFailure = false, crashAfterRebind = false, commitTimeout = false, claimTimeout = false, count = 0
   const journal = { read: async (id: string) => structuredClone(disk.get(id) ?? null), write: vi.fn(async (record: MachineRotationJournalRecord) => {
@@ -103,7 +106,7 @@ async function setup(expectedRefusal: 'account_limit' | 'authentication_failed' 
   const sessionEnvironment = vi.fn(async (_agent, _selection, binding) => {
     steps.push('token'); return { CLAUDE_CODE_OAUTH_TOKEN: `SYNTHETIC-${binding.managedAccountId}`, [SETUP_TOKEN_BINDING_ENV]: formatSetupTokenBinding(binding) }
   })
-  const build = (allowInitialIssue = true) => createMachineSetupTokenRuntime({ allowInitialIssue: () => allowInitialIssue, protocol, journal: { ...journal, list: async () => [...disk.keys()] }, sessionEnvironment, persist, findSession: id => sessions.get(id),
+  const build = (allowInitialIssue = true) => createMachineSetupTokenRuntime({ ...(workMachine ? { workMachine: { accountId: machineOwner } } : {}), allowInitialIssue: () => allowInitialIssue, protocol, journal: { ...journal, list: async () => [...disk.keys()] }, sessionEnvironment, persist, findSession: id => sessions.get(id),
     savePrepared: async (id, _hash, draft) => { drafts.set(id, draft); return { status: 'committed' } },
     loadPrepared: async id => drafts.get(id),
     discoverSession: async (state, _snapshot, proof) => {
@@ -114,21 +117,25 @@ async function setup(expectedRefusal: 'account_limit' | 'authentication_failed' 
   })
   vi.mocked(axios.post).mockImplementation(async (_url, value, options) => {
     steps.push('create')
-    expect(options?.headers?.Authorization).toBe('Bearer original-staged-bearer')
+    expect(options?.headers?.Authorization).toBe(`Bearer ${createBearer}`)
+    if (drainCreate) throw Object.assign(new Error('Request failed with status code 409'), { response: { status: 409, data: { error: 'Work machine is draining', reason: 'work-machine-draining' } } })
     const { executionProof, ...body } = value as Record<string, unknown> & { executionProof: HappySessionExecutionProof }
     expect(body.tag).toBeTypeOf('string')
     await verifyRotationDocument(executionProof.deviceProof, keys.signing.publicKey)
     expect(executionProof.ticket.body.sessionCreateBodyHash).toBe(await sessionCreateBodyHash(body as never))
     expect(executionProof.deviceProof.body.sessionTagHash).toBe(await sessionTagHash(String(body.tag)))
-    expect(executionProof.ticket.body.sessionOwnerAccountId).toBe(originalOwner)
+    expect(executionProof.ticket.body.sessionOwnerAccountId).toBe(sessionOwner)
     const sessionId = `session-${relations.size + 1}`; relations.set(executionProof.ticket.body.launchId, sessionId)
     const raw = { id: sessionId, seq: 0, metadata: body.metadata, metadataVersion: 1, agentState: body.agentState, agentStateVersion: 1 }
     createdSessions.set(executionProof.ticket.body.launchId, raw)
     if (loseCreate) { loseCreate = false; throw new Error('response lost after create') }
     return { data: { session: raw } }
   })
-  const api = await ApiClient.create({ token: 'original-staged-bearer', encryption: { type: 'legacy', secret: new Uint8Array(32) } })
-  const input = { metadata: { path: '/project', host: 'box' } as Metadata, ownerAccountId: originalOwner, machineOwnerAccountId: machineOwner, userHomeDir: '/staged-home',
+  const api = await ApiClient.create({ token: createBearer, encryption: workMachine
+    ? { type: 'dataKey', publicKey: nacl.box.keyPair().publicKey, machineKey: new Uint8Array(32).fill(7) }
+    : { type: 'legacy', secret: new Uint8Array(32) } })
+  const input = { metadata: { path: '/project', host: 'box' } as Metadata, ownerAccountId: sessionOwner, machineOwnerAccountId: machineOwner,
+    ...(workMachine ? {} : { userHomeDir: '/staged-home' }),
     createSession: (input: Parameters<typeof api.getOrCreateSession>[0]) => api.getOrCreateSession(input) }
   const attach = (environment: Record<string, string>) => {
     const binding = readSetupTokenResumeSelection({ [SETUP_TOKEN_BINDING_ENV]: environment[SETUP_TOKEN_BINDING_ENV] })!.binding
@@ -139,7 +146,7 @@ async function setup(expectedRefusal: 'account_limit' | 'authentication_failed' 
   }
   return { denyInitialQuery: () => { denyInitialQuery = true }, refuseStartBudget: () => { refuseStartBudget = true }, unreachable: (requests: number) => { unreachable = requests }, advance: (ms: number) => { clock += ms }, build, input, attach, requests, steps, disk, sessions, operations, persist, sessionEnvironment, journal,
     invalidTicket: (value: typeof invalidTicket) => { invalidTicket = value },
-    loseCreate: () => { loseCreate = true }, loseIssue: (before = false) => { if (before) issueBeforeSend = true; else loseIssue = true }, drafts,
+    loseCreate: () => { loseCreate = true }, drainCreate: () => { drainCreate = true }, loseIssue: (before = false) => { if (before) issueBeforeSend = true; else loseIssue = true }, drafts,
     failSave: (value: boolean) => { saveFailure = value }, deny: () => { deny = true }, crashRebind: () => { crashAfterRebind = true }, loseCommit: () => { commitTimeout = true }, loseClaim: () => { claimTimeout = true } }
 }
 describe('machine-v2 actual launch and control consumer transaction', () => {
@@ -487,4 +494,49 @@ it('preserves authentication failure in the signed machine observation and resum
  expect(env.CLAUDE_CODE_OAUTH_TOKEN).toBe('SYNTHETIC-account-b')
  const request = t.requests.find(r => r.action === 'rebind')
  expect(request).toMatchObject({ observation: { accountWideRefusal: 'authentication_failed', managedAccountId: 'account-a', credentialGeneration: 1 } })
+})
+
+describe('organization account rotation on a protected work machine', () => {
+  it('creates the session with the device credential for the machine account, sealed with a session data key', async () => {
+    const t = await setup(undefined, { workMachine: true }), prepared = await t.build().prepareLaunch(t.input)
+    expect(t.steps).toEqual(['journal', 'issue', 'journal', 'create', 'journal', 'persist', 'claim', 'persist', 'commit', 'journal', 'token'])
+    expect(t.requests.find(r => r.action === 'issue')).toMatchObject({ sessionOwnerAccountId: machineOwner })
+    expect(prepared.session.encryptionVariant).toBe('dataKey')
+    expect(t.persist.mock.calls[0][0].userHomeDir).toBeUndefined()
+  })
+  it('refuses a staged user home or another session owner before issuing anything', async () => {
+    const t = await setup(undefined, { workMachine: true }), runtime = t.build()
+    await expect(runtime.prepareLaunch({ ...t.input, userHomeDir: '/staged-home' })).rejects.toThrow('WORK_MACHINE_STAGED_HOME')
+    await expect(runtime.prepareLaunch({ ...t.input, ownerAccountId: originalOwner })).rejects.toThrow('FORBIDDEN')
+    await expect(runtime.prepareLaunch({ ...t.input, machineOwnerAccountId: originalOwner })).rejects.toThrow('FORBIDDEN')
+    expect(t.requests).toHaveLength(0); expect(t.disk.size).toBe(0)
+  })
+  it('refuses a legacy-encrypted session body before issuing', async () => {
+    const t = await setup(undefined, { workMachine: true })
+    const createSession: typeof t.input.createSession = async ({ tag, executionProof }) => {
+      await executionProof!({ tag, metadata: 'encrypted', agentState: null, dataEncryptionKey: null }, { encryptionKey: new Uint8Array(32), encryptionVariant: 'legacy' })
+      return null
+    }
+    await expect(t.build().prepareLaunch({ ...t.input, createSession })).rejects.toThrow('FORBIDDEN')
+    expect(t.requests.some(r => r.action === 'issue')).toBe(false)
+  })
+  it('abandons a launch the draining work machine refused and pauses it as migrating', async () => {
+    const t = await setup(undefined, { workMachine: true }); t.drainCreate()
+    const debug = vi.spyOn(logger, 'debug')
+    try {
+      await expect(t.build().prepareLaunch(t.input)).rejects.toThrow('WORK_MACHINE_DRAINING')
+      expect([...t.disk.values()]).toEqual([{ version: 1, launchId: expect.any(String), abandoned: true }])
+      expect(debug).toHaveBeenCalledWith(expect.stringContaining('paused while this work machine is migrated'))
+      expect(t.sessionEnvironment).not.toHaveBeenCalled()
+      const requests = t.requests.length
+      await t.build().recoverLaunches()
+      expect(t.requests).toHaveLength(requests)
+    } finally { debug.mockRestore() }
+  })
+  it('leaves a legacy launch pending when its create is refused, as before', async () => {
+    const t = await setup(); t.drainCreate()
+    await expect(t.build().prepareLaunch(t.input)).rejects.toThrow('Execution-bound session creation failed')
+    expect([...t.disk.values()][0]).toMatchObject({ pending: { request: { action: 'issue' } } })
+    expect([...t.disk.values()][0].abandoned).toBeUndefined()
+  })
 })

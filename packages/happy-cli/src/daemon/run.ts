@@ -2423,9 +2423,10 @@ export async function startDaemon(): Promise<void> {
             : credentials;
           if (!ownerCredentials) throw new MachineRotationError('FORBIDDEN');
           const ownerApi = await ApiClient.create(ownerCredentials);
-          const [ownerAccountId, machineOwnerAccountId] = await Promise.all([
-            authenticatedAccountId(ownerCredentials.token), authenticatedAccountId(credentials.token),
-          ]);
+          // A protected machine's daemon holds its device credential, not an account bearer: the binding names the account.
+          const [ownerAccountId, machineOwnerAccountId] = executionBinding
+            ? [executionBinding.accountId, executionBinding.accountId]
+            : await Promise.all([authenticatedAccountId(ownerCredentials.token), authenticatedAccountId(credentials.token)]);
           preparedMachineLaunch = await machineRotationRuntime.prepareLaunch({ ownerAccountId, machineOwnerAccountId, userHomeDir: stagedUserHomeDir,
             metadata: { path: directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
               homeDir: os.homedir(), happyHomeDir: stagedUserHomeDir ?? configuration.happyHomeDir, happyLibDir: projectPath(),
@@ -5452,6 +5453,7 @@ export async function startDaemon(): Promise<void> {
       env: process.env, machineId, happyOrigin: new URL(configuration.serverUrl).origin, studioOrigin: trustedStudioOrigin,
       bearer: () => credentials.token,
       createRuntime: config => createMachineSetupTokenRuntime({
+        ...(executionBinding ? { workMachine: { accountId: executionBinding.accountId } } : {}),
         allowInitialIssue: () => machineRotation?.newIssuesAllowed() ?? false,
         protocol: createMachineSetupTokenProtocol({ config, keys: rotationKeys, pin: companyId => rotationEnrollment.orgPin(companyId), bearer: () => credentials.token }),
         journal: createMachineSetupTokenJournal(configuration.happyHomeDir),

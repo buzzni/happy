@@ -3,6 +3,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { rotationDigest, rotationIsFresh, rotationDecodeBinary, rotationSha256, verifyRotationDocument, sessionTagHash, sessionCreateBodyHash,
   type HappySessionCreateProofBody, type DaemonRotationRequestBody, type HappySessionExecutionProof, type SessionExecutionCreateBody, type RotationObservation } from '@slopus/happy-wire'
 import type { Metadata, Session } from '@/api/types'
+import { ExecutionSessionCreationError } from '@/api/api'
 import { type SessionPersistenceResult, type PersistedSession } from '@/persistence'
 import { encodeBase64, decodeBase64, decrypt } from '@/api/encryption'
 import { buildReconnectSessionEnvironment, RECONNECT_FRESH_LAUNCH_ENV } from './reconnectSessionEnv'
@@ -16,6 +17,12 @@ import { logger } from '@/ui/logger'
 
 export function createMachineSetupTokenRuntime(deps: {
   allowInitialIssue?(): boolean;
+  /**
+   * The daemon runs under a work-machine execution binding (a protected machine). Its launches create the session
+   * with the device credential for the machine account itself, sealed with a session data key, and a drain refusal
+   * abandons the launch instead of leaving it to recovery.
+   */
+  workMachine?: { accountId: string };
   protocol: MachineSetupTokenProtocol; journal: MachineRotationJournal;
   sessionEnvironment(agent: string, selection: AiAuthSelection, binding: SetupTokenBinding): Promise<Record<string, string>>;
   persist(session: TrackedSession, binding: string): SessionPersistenceResult | Promise<SessionPersistenceResult>;
@@ -136,10 +143,11 @@ export function createMachineSetupTokenRuntime(deps: {
     signal?.throwIfAborted();
     return environment(current)
   }
-  async function abandonOwnedLaunch(launchId: string) {
+  /** `refusedByDrain`: the work machine refused this launch's create while draining, so no session exists for it. */
+  async function abandonOwnedLaunch(launchId: string, { refusedByDrain = false }: { refusedByDrain?: boolean } = {}) {
     const state = await journal.read(launchId);
     if (!state || state.abandoned || state.current) return;
-    if (!state.pending?.ownershipManaged) throw new MachineRotationError('NOT_BOUND');
+    if (!state.pending?.ownershipManaged && !refusedByDrain) throw new MachineRotationError('NOT_BOUND');
     await journal.write({ version: 1, launchId, abandoned: true });
   }
   async function recoverLaunches() {
@@ -223,6 +231,12 @@ export function createMachineSetupTokenRuntime(deps: {
       ownershipPreparation?: { launchId: string; tag: string };
       createSession(input: { tag: string; metadata: Metadata; state: { controlledByUser: false }; executionProof(body: Readonly<SessionExecutionCreateBody>, encryption: { encryptionKey: Uint8Array; encryptionVariant: 'legacy' | 'dataKey' }): Promise<HappySessionExecutionProof> }): Promise<Session | null>;
     }) {
+      const workMachine = deps.workMachine
+      if (workMachine) {
+        // A staged personal home holds another account's bearer; the device credential creates only for its own account.
+        if (input.userHomeDir) throw new MachineRotationError('WORK_MACHINE_STAGED_HOME')
+        if (input.ownerAccountId !== workMachine.accountId || input.machineOwnerAccountId !== workMachine.accountId) throw new MachineRotationError('FORBIDDEN')
+      }
       await protocol.checkPublicKey()
       const launchId = input.ownershipPreparation?.launchId ?? randomUUID(), tag = input.ownershipPreparation?.tag ?? randomUUID()
       if (activeLaunches.has(launchId)) throw new MachineRotationError('LAUNCH_IN_PROGRESS')
@@ -232,6 +246,7 @@ export function createMachineSetupTokenRuntime(deps: {
       if (state?.abandoned) throw new MachineRotationError('LAUNCH_ABANDONED');
       const metadata = { ...input.metadata, setupTokenRotation: { version: 1 as const, principalType: 'machine' as const, bindingVersion: 2 as const } }
       const session = await input.createSession({ tag, metadata, state: { controlledByUser: false }, executionProof: async (body, encryption) => {
+        if (workMachine && encryption.encryptionVariant !== 'dataKey') throw new MachineRotationError('FORBIDDEN')
         const hashes = { sessionTagHash: await sessionTagHash(body.tag), sessionCreateBodyHash: await sessionCreateBodyHash(body) }
         if (state && (!state.pending?.ownershipManaged || state.pending.request.action !== 'issue' || state.pending.request.sessionCreateBodyHash !== hashes.sessionCreateBodyHash
           || state.pending.request.sessionTagHash !== hashes.sessionTagHash || state.pending.request.sessionOwnerAccountId !== input.ownerAccountId
@@ -261,7 +276,13 @@ export function createMachineSetupTokenRuntime(deps: {
         state.pending = { ...state.pending!, binding, bindingDigest: await rotationDigest(issued.binding), createProofBody }
         await journal.write(state)
         return { ticket: issued.executionTicket, deviceProof: await protocol.sign(createProofBody) }
-      } })
+      } }).catch(async (error: unknown) => {
+        if (!workMachine || !(error instanceof ExecutionSessionCreationError) || error.reason !== 'work-machine-draining') throw error
+        // The refusal is definite: the server created nothing, so no recovery can find a session for this launch.
+        await abandonOwnedLaunch(launchId, { refusedByDrain: true })
+        logger.debug('[machine-rotation] new launch paused while this work machine is migrated')
+        throw new MachineRotationError('WORK_MACHINE_DRAINING')
+      })
       if (!session || !state?.pending?.binding || state.pending.request.action !== 'issue') throw new MachineRotationError('REQUEST_FAILED')
       const binding: MachineSetupTokenBindingRecord = { ...state.pending.binding, execution: { sessionId: session.id, initialNonce: state.pending.binding.nonce,
         issueOperationId: state.pending.request.operationId, sessionOwnerAccountId: input.ownerAccountId, machineOwnerAccountId: input.machineOwnerAccountId } }
