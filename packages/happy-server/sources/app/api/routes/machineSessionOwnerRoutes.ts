@@ -90,6 +90,7 @@ export function machineSessionOwnerRoutes(app: Fastify) {
             response: { 200: ExecutionOwnerResponseSchema },
         },
     }, async (request, reply) => {
+        reply.header('Cache-Control', 'no-store');
         const { companyId, machineId, launchId, initialNonce } = request.body;
         const sessionId = request.params.sessionId;
         const binding = await db.sessionExecutionBinding.findFirst({ where: {
@@ -121,6 +122,8 @@ export function machineSessionOwnerRoutes(app: Fastify) {
             }).nullable() }) },
         },
     }, async (request, reply) => {
+        // The answer carries the session's wrapped data key.
+        reply.header('Cache-Control', 'no-store');
         const { companyId, machineId, launchId, initialNonce } = request.body;
         const binding = await db.sessionExecutionBinding.findFirst({
             where: {

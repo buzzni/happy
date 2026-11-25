@@ -397,6 +397,7 @@ describe('execution-bound creation on a protected work machine', () => {
     const answered = await ask(token);
     expect(answered.statusCode, answered.body).toBe(200);
     expect(answered.json()).toEqual({ owner: relation });
+    expect(answered.headers['cache-control']).toBe('no-store');
     // An old PC still holding the account token cannot vouch for the protected machine's sessions.
     expect((await owner(sessionId)).json()).toEqual({ owner: null });
     // Another machine's credential, whether it names this machine or its own.
@@ -422,6 +423,8 @@ describe('execution-bound creation on a protected work machine', () => {
     const created = (await createOnDevice(token, { executionProof: proof })).json().session;
     const found = await lookup(device, {}, proof.ticket.body);
     expect(found.statusCode, found.body).toBe(200);
+    // The answer carries the session's wrapped key.
+    expect(found.headers['cache-control']).toBe('no-store');
     expect(found.json()).toEqual({ session: {
       id: created.id, seq: created.seq, metadata: created.metadata, metadataVersion: created.metadataVersion,
       agentState: created.agentState, agentStateVersion: created.agentStateVersion, dataEncryptionKey: created.dataEncryptionKey,
