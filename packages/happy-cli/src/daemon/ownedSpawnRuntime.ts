@@ -427,7 +427,9 @@ export function createOwnedSpawnRuntime(deps: OwnedSpawnRuntimeDependencies): Ow
                 && !!deps.env.HAPPY_SESSION_OWNERSHIP_ISSUER && deps.env.HAPPY_SESSION_OWNERSHIP_AUDIENCE === deps.happyOrigin;
             const supported = spawnOk && configured;
             // Capability discovery says which registration check is implemented. Authorization is checked on each operation.
-            return { ownedSpawnPrepareV1: supported, ...(supported ? { ownedSpawnRegistrationV1: true as const } : {}),
+            // The directory report flag tells Desktop the start answers additionalDirectories as the legacy RPC does (.436/.437 dropped it).
+            return { ownedSpawnPrepareV1: supported,
+                ...(supported ? { ownedSpawnRegistrationV1: true as const, ownedSpawnAdditionalDirectoriesReportV1: true as const } : {}),
                 ...(hostCallers() ? { ownedChildOwnerContactV1: supported } : {}) };
         },
         async launchLineage(sessionId) {
