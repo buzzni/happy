@@ -14,7 +14,7 @@ import { drainWorktreeOperations } from './worktreeOps';
 import { drainBashRpcs } from '@/modules/common/bashRpcScheduler';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
-import { discoverMachineSetupTokenSession } from './machineSetupTokenRecovery';
+import { discoverMachineSetupTokenSession, discoverWorkMachineSetupTokenSession } from './machineSetupTokenRecovery';
 import { createMachineSetupTokenJournal } from './machineSetupTokenJournal';
 import { createMachineSetupTokenRuntime, type MachineSetupTokenRuntime } from './machineSetupTokenRuntime';
 import { createDeviceOrgPinStore, migrateLegacyDeviceState } from './deviceOrgPinStore';
@@ -5459,6 +5459,10 @@ export async function startDaemon(): Promise<void> {
         journal: createMachineSetupTokenJournal(configuration.happyHomeDir),
         savePrepared: persistPreparedMachineLaunch, loadPrepared: recoverPreparedMachineLaunch,
         discoverSession: async (state, snapshot, executionProof) => {
+          if (executionBinding) {
+            if (snapshot.userHomeDir) throw new MachineRotationError('WORK_MACHINE_STAGED_HOME');
+            return discoverWorkMachineSetupTokenSession({ happyOrigin: config.happyOrigin, state, executionProof, machineBearer: credentials.token });
+          }
           const ownerCredentials = snapshot.userHomeDir ? parseCredentials(JSON.parse(await fs.readFile(join(snapshot.userHomeDir, 'access.key'), 'utf8'))) : credentials;
           if (!ownerCredentials) throw new MachineRotationError('FORBIDDEN');
           return discoverMachineSetupTokenSession({ happyOrigin: config.happyOrigin, state, executionProof, ownerBearer: ownerCredentials.token, machineBearer: credentials.token });

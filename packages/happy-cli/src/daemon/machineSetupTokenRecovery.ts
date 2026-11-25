@@ -50,3 +50,26 @@ export async function discoverMachineSetupTokenSession(input: {
     cursors.add(page.nextCursor); cursor = page.nextCursor
   }
 }
+
+/**
+ * Recovery on a protected work machine. Its daemon holds the device credential (`wmx_`), which reads no account
+ * profile or session list, so the launch's session is found through the non-creating execution lookup. With the
+ * original proof still fresh it replays the exact create through the device path, then confirms the result through
+ * the lookup. The device creates only for the machine account itself.
+ */
+export async function discoverWorkMachineSetupTokenSession(input: {
+  happyOrigin: string; machineBearer: string; state: MachineRotationJournalRecord; executionProof?: HappySessionExecutionProof; fetch?: typeof fetch;
+}) {
+  const { state } = input, pending = state.pending, request = pending?.request, body: SessionExecutionCreateBody | undefined = pending?.createBody
+  if (!pending?.binding || request?.action !== 'issue' || !body || !pending.machineOwnerAccountId) throw new MachineRotationError('PERSISTENCE_FAILED')
+  if (request.sessionOwnerAccountId !== pending.machineOwnerAccountId) throw new MachineRotationError('FORBIDDEN')
+  const json = (path: string, payload: unknown) => happyJson(input.fetch ?? fetch, input.happyOrigin, path, input.machineBearer, payload)
+  const lookup = async () => z.object({ session: rawSession.nullable() }).parse(await json('/v1/machine-sessions/execution-lookup',
+    { companyId: request.companyId, machineId: request.machineId, launchId: state.launchId, initialNonce: pending.binding!.nonce })).session
+  const found = await lookup()
+  if (found || !input.executionProof) return found
+  const created = z.object({ session: rawSession }).parse(await json('/v1/sessions', { ...body, executionProof: input.executionProof })).session
+  const confirmed = await lookup()
+  if (confirmed?.id !== created.id) throw new MachineRotationError('FORBIDDEN')
+  return confirmed
+}
