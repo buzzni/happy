@@ -85,6 +85,7 @@ import {
     resolveMcpFloorServerNames,
 } from '@/aplus/fetchAplusMcpServers';
 import { buildConnectorToolGuidance, listExpectedMcpServices } from '@/aplus/connectorToolGuidance';
+import { createMcpServerInstructionsReader } from '@/aplus/mcpServerInstructions';
 import { bridgeAplusMcpServers } from '@/aplus/mergeAplusMcpServers';
 import { codexLaunchMcpServers, consumeLaunchMcpServersSeed, launchMcpServersBeside } from '@/aplus/launchMcpServers';
 import { MessageBuffer } from "@/ui/ink/messageBuffer";
@@ -2336,6 +2337,8 @@ export async function runCodex(opts: {
         listExternalServices(mcpServers),
         { connectorPlatformConfigured: isConnectorPlatformConfigured() },
     );
+    // Codex leaves MCP server instructions out of the prompt, and the skill catalogs arrive only that way.
+    const mcpServerInstructionsReader = createMcpServerInstructionsReader();
     let currentDeveloperInstructions: string | undefined = buildConnectorGuidance({
         ...baseMcpServers,
         ...initialAplusMcpServers,
@@ -2778,12 +2781,14 @@ export async function runCodex(opts: {
                     turnCards.set(isSaycodePromptBlockEnabled('nextSteps', message.mode.saycodePromptBlocks, message.mode.saycodeSystemPromptEnabled));
                     // A capability of this turn's client, not under the Saycode instructions switch.
                     turnCards.setArchives(message.mode.saycodePromptBlocks?.archiveRequest === true);
+                    const mcpServerInstructions = await mcpServerInstructionsReader.read(mcpConfigSynchronizer.aplusServers);
                     const mcpSync = await measure('mcp-sync', () => mcpConfigSynchronizer.sync({
                         threadId: client.threadId,
                         resumeThread: client.threadId
                             ? async ({ threadId, mcpServers }) => {
                                 const nextDeveloperInstructions = buildCodexDeveloperInstructions({
                                     connectorGuidance: buildConnectorGuidance(mcpServers),
+                                    mcpServerInstructions,
                                     checkpointGuidance,
                                     agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
                                     nextStepsPrompt: NEXT_STEPS_PROMPT,
@@ -2803,6 +2808,7 @@ export async function runCodex(opts: {
 
                     const nextDeveloperInstructions = buildCodexDeveloperInstructions({
                         connectorGuidance: buildConnectorGuidance(mcpSync.mcpServers),
+                        mcpServerInstructions,
                         checkpointGuidance,
                         agentOrchestrationPrompt: AGENT_ORCHESTRATION_SYSTEM_PROMPT,
                         nextStepsPrompt: NEXT_STEPS_PROMPT,

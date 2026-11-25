@@ -71,6 +71,11 @@ export class CodexMcpConfigSynchronizer {
         return this.currentMcpServers;
     }
 
+    /** The Saycode servers as the config route sent them (address and headers), before bridging. */
+    get aplusServers(): AplusMcpServersMap {
+        return this.currentAplusServers;
+    }
+
     async sync(input: {
         threadId?: string | null;
         resumeThread?: ResumeThread;
