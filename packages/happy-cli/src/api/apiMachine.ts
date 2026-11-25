@@ -1134,7 +1134,7 @@ export class ApiMachineClient {
         this.allowedRoot = allowedRoot;
         this.approvedRoots = resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir);
         const skillMachineType = createMachineTypeMarker({ home: configuration.happyHomeDir, machineId: this.machine.id });
-        this.rpcHandlerManager.registerHandler('codex-skill:list', createCodexSkillListHandler({
+        if (this.machine.encryptionVariant === 'dataKey') this.rpcHandlerManager.registerHandler('codex-skill:list', createCodexSkillListHandler({
             machineId: this.machine.id, allowedRoot, approvedRoots: () => this.approvedRoots?.() ?? [],
             isOrganizationMachine: async () => await skillMachineType.read() !== null,
             createClient: () => new CodexAppServerClient(),

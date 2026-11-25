@@ -1,12 +1,13 @@
 import { realpath } from 'node:fs/promises'
+import { join, resolve, sep } from 'node:path'
 import { describe, expect, it, vi } from 'vitest'
 import { catalogCodexSkills, createCodexSkillListHandler, resolveCodexSkill } from './codexSkillCatalog'
 
-const cwd = '/project'
+const cwd = resolve('/project')
 const skills = [
-    { name: 'new', description: 'Project version', path: '/project/.agents/skills/new/SKILL.md', scope: 'repo', enabled: true },
-    { name: 'new', description: 'Plugin version', path: '/home/user/.codex/plugins/cache/personal/osk/v1/skills/new/SKILL.md', scope: 'user', enabled: true, pluginId: 'osk@personal' },
-    { name: 'disabled', path: '/home/user/.agents/skills/disabled/SKILL.md', scope: 'user', enabled: false },
+    { name: 'new', description: 'Project version', path: join(cwd, '.agents/skills/new/SKILL.md'), scope: 'repo', enabled: true },
+    { name: 'new', description: 'Plugin version', path: resolve('/home/user/.codex/plugins/cache/personal/osk/v1/skills/new/SKILL.md'), scope: 'user', enabled: true, pluginId: 'osk@personal' },
+    { name: 'disabled', path: resolve('/home/user/.agents/skills/disabled/SKILL.md'), scope: 'user', enabled: false },
 ]
 const response = { data: [{ cwd, skills }] }
 
@@ -29,11 +30,11 @@ describe('Codex skill references', () => {
     })
 
     it('distinguishes same-name project skills at different folder levels without absolute paths', () => {
-        const nested = '/project/packages/app'
-        const nestedSkills = [skills[0], { ...skills[0], path: nested + '/.agents/skills/new/SKILL.md' },
-            { ...skills[0], path: '/private/outside/.agents/skills/new/SKILL.md' }]
+        const nested = join(cwd, 'packages/app')
+        const nestedSkills = [skills[0], { ...skills[0], path: join(nested, '.agents/skills/new/SKILL.md') },
+            { ...skills[0], path: resolve('/private/outside/.agents/skills/new/SKILL.md') }]
         const entries = catalogCodexSkills({ data: [{ cwd: nested, skills: nestedSkills }] }, 'pc', nested)
-        expect(entries).toMatchObject([{ sourceHint: '../.. #1' }, { sourceHint: '. #2' }, { sourceHint: '#3' }])
+        expect(entries).toMatchObject([{ sourceHint: `..${sep}.. #1` }, { sourceHint: '. #2' }, { sourceHint: '#3' }])
         expect(JSON.stringify(entries)).not.toContain('/project')
         expect(JSON.stringify(entries)).not.toContain('outside')
     })

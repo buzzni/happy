@@ -898,7 +898,7 @@ export async function runCodex(opts: {
             effort: messageEffort,
             orgModelOrigin: messageModelOrigin,
         };
-        const deferredTurn = deferredContinuation.prepare(message.content.text);
+        const deferredTurn = deferredContinuation.prepare(message.content.text, { literalText: parsedSkillRef.success });
         let enqueueResult: ReturnType<typeof enqueueCodexUserText>;
         try {
             enqueueResult = enqueueCodexUserText({
