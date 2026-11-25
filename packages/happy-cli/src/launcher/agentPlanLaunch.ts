@@ -22,7 +22,11 @@ import { readTrustedStudioOrigin } from '@/daemon/setupTokenBindingProof'
 export const AGENT_PLAN_CAPABILITY = {
     version: 1 as const,
     claude: 1 as const,
-    claudeModels:['deepseek/deepseek-v4.1-flash-eco','moonshotai/kimi-k3.1-pro'],
+    claudeModels: [
+        'deepseek/deepseek-v4.1-flash-eco',
+        'moonshotai/kimi-k3.1-pro',
+        'deepseek/deepseek-v4.1-flash-ultrafast',
+    ],
     codexModels: ['gpt-6-luna', 'gpt-6.1-terra', 'gpt-6.1-sol', 'gpt-6-astra', 'gpt-6.2-sol', 'gpt-6.2-astra'],
 }
 
@@ -49,6 +53,7 @@ export const AGENT_PLAN_DESCRIPTOR_VERSION = 1
 const AGENT_PLAN_MODEL_CONTEXT = {
     'moonshotai/kimi-k3.1-pro': {contextWindow:200000,autoCompactTokenLimit:150000},
     'deepseek/deepseek-v4.1-flash-eco': { contextWindow: 200000, autoCompactTokenLimit: 150000 },
+    'deepseek/deepseek-v4.1-flash-ultrafast': { contextWindow: 200000, autoCompactTokenLimit: 150000 },
     'gpt-6-luna': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
     'gpt-6.1-terra': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
     'gpt-6.1-sol': { contextWindow: 1050000, autoCompactTokenLimit: 900000 },
@@ -195,7 +200,7 @@ export function agentPlanCodexArgs(descriptor: AgentPlanDescriptor, proxyBaseUrl
 }
 
 export function agentPlanAgent(model: AgentPlanModel): 'codex' | 'claude' {
-    return model === 'deepseek/deepseek-v4.1-flash-eco' || model === 'moonshotai/kimi-k3.1-pro' ? 'claude' : 'codex'
+    return (AGENT_PLAN_CAPABILITY.claudeModels as readonly string[]).includes(model) ? 'claude' : 'codex'
 }
 export function agentPlanGatewayUrl(descriptor: AgentPlanDescriptor): string {
     return `${descriptor.origin}/api/agent-plan/v1/${agentPlanAgent(descriptor.model) === 'claude' ? 'messages' : 'responses'}`

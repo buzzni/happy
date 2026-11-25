@@ -5,6 +5,7 @@ import {
     AgentPlanLaunchError,
     agentPlanAgent,
     agentPlanCodexArgs,
+    agentPlanGatewayUrl,
     agentPlanGatewayResponsesUrl,
     agentPlanSessionKeysUrl,
     buildAgentPlanDescriptor,
@@ -35,6 +36,13 @@ describe('buildAgentPlanDescriptor', () => {
         const descriptor = buildAgentPlanDescriptor({ origin: ORIGIN, grantId: GRANT, model: 'deepseek/deepseek-v4.1-flash-eco' })
         expect(descriptor).toMatchObject({ model: 'deepseek/deepseek-v4.1-flash-eco', contextWindow: 200000, autoCompactTokenLimit: 150000 })
         expect(readAgentPlanDescriptor(serializeAgentPlanDescriptor(descriptor!), ORIGIN)).toEqual(descriptor)
+    })
+    it('advertises UltraFast and restores it as a Claude Messages descriptor', () => {
+        const model = 'deepseek/deepseek-v4.1-flash-ultrafast'
+        expect(AGENT_PLAN_CAPABILITY.claudeModels).toContain(model)
+        const descriptor = readAgentPlanDescriptor(serialized(model), ORIGIN)
+        expect(descriptor).toMatchObject({ model, contextWindow: 200000, autoCompactTokenLimit: 150000 })
+        expect(agentPlanGatewayUrl(descriptor!)).toBe(ORIGIN + '/api/agent-plan/v1/messages')
     })
     it('fixes the per-model context settings from the grant model (spec §6.3-2)', () => {
         expect(buildAgentPlanDescriptor({ origin: ORIGIN, grantId: GRANT, model: 'gpt-6-luna' })).toMatchObject({
