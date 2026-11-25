@@ -1,6 +1,6 @@
 import { createHash } from 'node:crypto'
 import { realpath, stat } from 'node:fs/promises'
-import { isAbsolute } from 'node:path'
+import { dirname, isAbsolute, relative, sep } from 'node:path'
 import { z } from 'zod'
 import { validatePath } from '@/modules/common/pathSecurity'
 import type { CodexAppServerClient } from './codexAppServerClient'
@@ -19,7 +19,9 @@ const nativeSkill = z.object({
     enabled: z.literal(true),
     pluginId: z.string().nullish(),
 })
-const nativeCatalog = z.object({ data: z.array(z.object({ cwd: z.string(), skills: z.array(z.unknown()) })) })
+const nativeCatalog = z.object({ data: z.array(z.object({
+    cwd: z.string(), skills: z.array(z.unknown()), errors: z.array(z.unknown()).optional(),
+})) })
 
 function enabledSkills(response: unknown, cwd: string) {
     const catalog = nativeCatalog.safeParse(response)
@@ -36,14 +38,36 @@ function skillRef(skill: z.infer<typeof nativeSkill>, machineId: string, cwd: st
 }
 
 export function catalogCodexSkills(response: unknown, machineId: string, cwd: string, userOnly = false) {
-    return enabledSkills(response, cwd).filter(skill => !userOnly || skill.scope !== 'repo').map(skill => ({
-        ref: skillRef(skill, machineId, cwd),
-        name: skill.name,
-        label: (skill.interface?.displayName || skill.name).slice(0, 256),
-        description: (skill.interface?.shortDescription || skill.shortDescription || skill.description || '').slice(0, 500),
-        plugin: skill.pluginId?.split('@')[0]?.slice(0, 150) ?? null,
-        scope: skill.scope,
-    }))
+    const entries = enabledSkills(response, cwd).filter(skill => !userOnly || skill.scope !== 'repo')
+        .map(skill => ({
+            path: skill.path,
+            ref: skillRef(skill, machineId, cwd),
+            name: skill.name,
+            label: (skill.interface?.displayName || skill.name).slice(0, 256),
+            description: (skill.interface?.shortDescription || skill.shortDescription || skill.description || '').slice(0, 500),
+            plugin: skill.pluginId?.slice(0, 150) ?? null,
+            scope: skill.scope,
+        }))
+    const sourceKey = (skill: Pick<typeof entries[number], 'label' | 'plugin' | 'scope'>) => JSON.stringify([skill.label, skill.plugin ?? skill.scope])
+    const counts = new Map<string, number>()
+    const indexes = new Map<string, number>()
+    for (const entry of entries) {
+        const key = sourceKey(entry)
+        counts.set(key, (counts.get(key) ?? 0) + 1)
+    }
+    return entries.map(({ path, ...entry }) => {
+        const key = sourceKey(entry)
+        if (counts.get(key) === 1) return entry
+        const index = (indexes.get(key) ?? 0) + 1
+        indexes.set(key, index)
+        const parts = dirname(path).split(sep)
+        const marker = parts.lastIndexOf('.agents')
+        const folder = entry.scope === 'repo' && marker > 0 ? relative(cwd, parts.slice(0, marker).join(sep) || sep) || '.' : null
+        const segments = folder?.split(sep) ?? []
+        const outside = segments.includes('..') && segments.some(segment => segment !== '..')
+        const localFolder = folder && !isAbsolute(folder) && !outside ? folder : null
+        return { ...entry, sourceHint: [localFolder, `#${index}`].filter(Boolean).join(' ').slice(-150) }
+    })
 }
 
 export function resolveCodexSkill(response: unknown, machineId: string, cwd: string, ref: string) {
@@ -55,13 +79,13 @@ export function createCodexSkillListHandler(deps: {
     machineId: string
     allowedRoot: string
     approvedRoots: () => readonly string[]
-    isShared: () => Promise<boolean>
+    isOrganizationMachine: () => Promise<boolean>
     createClient: () => Pick<CodexAppServerClient, 'connect' | 'disconnect' | 'listSkills'>
 }) {
     let busy = false
     return async (payload: unknown) => {
         const input = rpcInput.safeParse(payload)
-        if (!input.success || await deps.isShared()) return { status: 'unavailable' }
+        if (!input.success || await deps.isOrganizationMachine().catch(() => true)) return { status: 'unavailable' }
         if (busy) return { status: 'failed' }
         busy = true
         try {
@@ -76,8 +100,12 @@ export function createCodexSkillListHandler(deps: {
             try {
                 await client.connect()
                 const result = await client.listSkills(cwd)
-                if (!nativeCatalog.safeParse(result).success) return { status: 'unsupported' }
-                return { version: 1, status: 'ready', skills: catalogCodexSkills(result, deps.machineId, cwd, input.data.cwd === null) }
+                const catalog = nativeCatalog.safeParse(result)
+                if (!catalog.success) return { status: 'unsupported' }
+                const row = catalog.data.data.find(entry => entry.cwd === cwd)
+                const skills = catalogCodexSkills(result, deps.machineId, cwd, input.data.cwd === null)
+                if (!row || (!skills.length && row.errors?.length)) return { status: 'failed' }
+                return { version: 1, status: 'ready', skills }
             } finally {
                 await client.disconnect()
             }

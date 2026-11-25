@@ -30,6 +30,7 @@ import { MANAGED_STOP_CLEAN } from '@/managed/managedControlChannel';
 const CODEX_END_INPUT_BUDGET_MS = 10_000;
 import React from "react";
 import { ApiClient } from '@/api/api';
+import { createMachineTypeMarker } from '@/daemon/machineTypeMarker';
 import { openWorkMachineSessionCredentials } from '@/daemon/workMachineCredential';
 import { startsNewWorkMachineConversation } from '@/daemon/workMachineNewSession';
 import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidenceOption } from '@/utils/inputEvidenceSettings';
@@ -431,7 +432,6 @@ export async function runCodex(opts: {
         linkedPullRequestTools,
     });
 
-    if (!managedStartup && !workMachine) freshMetadata.codexSkillInputVersion = 1;
     const skillCommands = await discoverCodexSkillCommands();
     if (skillCommands.length > 0) {
         freshMetadata.skills = skillCommands;
@@ -1076,6 +1076,12 @@ export async function runCodex(opts: {
             }
         } : undefined,
     });
+    const skillMachineType = !managedStartup && !workMachine && machineId
+        ? createMachineTypeMarker({ home: configuration.happyHomeDir, machineId }) : null;
+    const acceptsCodexSkills = async () => !!skillMachineType && await skillMachineType.read().then(type => type === null, () => false);
+    if (!managedStartup) session.rpcHandlerManager.registerHandler('codex-skill:status', async () => ({
+        version: await acceptsCodexSkills() ? 1 : 0,
+    }));
     const initialPromptDelivered = await (runtimeGate ? runtimeGate.admit(deliverInitialPrompt) : deliverInitialPrompt());
     // A run-once marker is only valid together with the fresh prompt supplied by
     // the automation daemon. This prevents an incomplete or accidentally resumed
@@ -2674,9 +2680,10 @@ export async function runCodex(opts: {
                 await measure('auth', () => authRecovery.beginTurn());
                 if (shouldExit) { authRecovery.endTurn(); break; }
                 // A blocked session recovers before /clear is decided; otherwise a recovered one sends "/clear" to Codex.
-                const clearRecoveryError = shouldHandleCodexClear(message) && authRecovery.status().state === 'failed'
+                const clearTurn = shouldHandleCodexClear(message);
+                const clearRecoveryError = clearTurn && authRecovery.status().state === 'failed'
                     ? await Promise.resolve(measure('auth', () => authRecovery.prepareTurn())).then(() => undefined, (error: unknown) => error) : undefined;
-                if (shouldHandleCodexClear(message) && authRecovery.status().state !== 'failed') {
+                if (clearTurn && authRecovery.status().state !== 'failed') {
                     latency?.finish('control');
                     authRecovery.endTurn();
                     logger.debug('[Codex] Handling /clear command - resetting Codex thread state');
@@ -2951,9 +2958,13 @@ export async function runCodex(opts: {
                     if (owningReviewSignal.aborted) { lessonProposalTurn.cancel(); reviewInstruction = ''; }
                     const skillInputs = [];
                     if (message.mode.skill) {
-                        const cwd = await realSkillDirectory(process.cwd());
-                        const catalog = await client.listSkills(cwd).catch(() => null);
-                        const skill = resolveCodexSkill(catalog, machineId ?? '', cwd, message.mode.skill.ref);
+                        const cwd = await acceptsCodexSkills()
+                            ? await Promise.resolve().then(() => realSkillDirectory(process.cwd())).catch(() => null) : null;
+                        if (owningForegroundSignal.aborted) { lessonProposalTurn.cancel(); continue; }
+                        const catalog = cwd ? await client.listSkills(cwd).catch(() => null) : null;
+                        if (owningForegroundSignal.aborted) { lessonProposalTurn.cancel(); continue; }
+                        if (owningReviewSignal.aborted) { lessonProposalTurn.cancel(); reviewInstruction = ''; }
+                        const skill = cwd && resolveCodexSkill(catalog, machineId ?? '', cwd, message.mode.skill.ref);
                         if (!skill) throw new CodexSkillUnavailableError('선택한 Codex 스킬을 다시 골라 주세요.');
                         skillInputs.push(skill);
                     }
@@ -3017,6 +3028,10 @@ export async function runCodex(opts: {
                     latestCodexFailure = null;
                     const result = await client.sendTurnAndWait(turnPrompt, {
                         beforeDispatch: () => {
+                            if (message.mode.skill && owningForegroundSignal.aborted) {
+                                inputInvalidated = true;
+                                throw new Error('Codex skill turn was cancelled before dispatch');
+                            }
                             const valid = messageQueue.revalidateBatch(message);
                             if (valid !== message) {
                                 if (valid?.items) messageQueue.queue.unshift(...valid.items);
@@ -3169,6 +3184,16 @@ export async function runCodex(opts: {
                 } catch (error) {
                     latency?.finish('failed');
                     preemptLessonReview();
+                    if (error instanceof CodexSkillUnavailableError) {
+                        session.setPendingInputEvidence({ inputs: message.inputs ?? [], inputCount: message.inputCount, continuation: message.continuation });
+                        session.inputEvidence.commitPending();
+                        const [start, , end] = refusedTurnEnvelopes(error.message, message.channelRequestId);
+                        session.sendSessionProtocolMessage(start);
+                        session.sendSessionEvent({ type: 'message', message: `Codex error: ${error.message}`, isError: true });
+                        session.sendSessionProtocolMessage(end);
+                        messageBuffer.addMessage(error.message, 'status');
+                        continue;
+                    }
                     if (!dispatchedWithoutStart) session.inputEvidence?.cancelPendingDispatch();
                     if (inputInvalidated) continue;
                     // Only actual errors reach here (process crash, connection failure, etc.)
@@ -3183,8 +3208,7 @@ export async function runCodex(opts: {
                     // would have produced from a real turn_aborted, reusing its guard logic
                     // (harmless no-op if currentTurnId is already null).
                     logger.warn('Error in codex session:', error);
-                    const failureMessage = error instanceof CodexSkillUnavailableError ? error.message
-                        : describeCheckpointFailure(error) ?? describeCodexAuthRecoveryFailure(error) ?? 'Process exited unexpectedly';
+                    const failureMessage = describeCheckpointFailure(error) ?? describeCodexAuthRecoveryFailure(error) ?? 'Process exited unexpectedly';
                     messageBuffer.addMessage(failureMessage, 'status');
                     session.sendSessionEvent({ type: 'message', message: failureMessage });
                     // Carries the correlation in and reads it back, like the normal event path. A

@@ -1,3 +1,4 @@
+import { realpath } from 'node:fs/promises'
 import { describe, expect, it, vi } from 'vitest'
 import { catalogCodexSkills, createCodexSkillListHandler, resolveCodexSkill } from './codexSkillCatalog'
 
@@ -13,7 +14,7 @@ describe('Codex skill references', () => {
     it('returns only enabled entries, without paths, and resolves the selected duplicate', () => {
         const entries = catalogCodexSkills(response, 'pc', cwd)
         expect(entries).toHaveLength(2)
-        expect(entries[1]).toMatchObject({ name: 'new', plugin: 'osk', description: 'Plugin version' })
+        expect(entries[1]).toMatchObject({ name: 'new', plugin: 'osk@personal', description: 'Plugin version' })
         expect(JSON.stringify(entries)).not.toContain('/home')
         expect(resolveCodexSkill(response, 'pc', cwd, entries[1].ref)).toEqual({ type: 'skill', name: 'new', path: skills[1].path })
         expect(resolveCodexSkill(response, 'another-pc', cwd, entries[1].ref)).toBeNull()
@@ -27,12 +28,38 @@ describe('Codex skill references', () => {
         expect(catalogCodexSkills(response, 'pc', cwd, true)).toEqual([entries[1]])
     })
 
-    it('rejects shared PCs and out-of-scope directories before opening app-server', async () => {
+    it('distinguishes same-name project skills at different folder levels without absolute paths', () => {
+        const nested = '/project/packages/app'
+        const nestedSkills = [skills[0], { ...skills[0], path: nested + '/.agents/skills/new/SKILL.md' },
+            { ...skills[0], path: '/private/outside/.agents/skills/new/SKILL.md' }]
+        const entries = catalogCodexSkills({ data: [{ cwd: nested, skills: nestedSkills }] }, 'pc', nested)
+        expect(entries).toMatchObject([{ sourceHint: '../.. #1' }, { sourceHint: '. #2' }, { sourceHint: '#3' }])
+        expect(JSON.stringify(entries)).not.toContain('/project')
+        expect(JSON.stringify(entries)).not.toContain('outside')
+    })
+
+    it('distinguishes a native load failure from an empty catalog without returning native paths', async () => {
+        const realCwd = await realpath(process.cwd())
+        const listSkills = vi.fn()
+        const handler = createCodexSkillListHandler({
+            machineId: 'pc', allowedRoot: realCwd, approvedRoots: () => [],
+            isOrganizationMachine: async () => false,
+            createClient: () => ({ connect: vi.fn(), disconnect: vi.fn(), listSkills }),
+        })
+        listSkills.mockResolvedValueOnce({ data: [{ cwd: realCwd, skills: [], errors: [{ path: '/private/SKILL.md', message: 'invalid' }] }] })
+        expect(await handler({ cwd: realCwd })).toEqual({ status: 'failed' })
+        listSkills.mockResolvedValueOnce({ data: [] })
+        expect(await handler({ cwd: realCwd })).toEqual({ status: 'failed' })
+        listSkills.mockResolvedValueOnce({ data: [{ cwd: realCwd, skills: [] }] })
+        expect(await handler({ cwd: realCwd })).toEqual({ status: 'ready', version: 1, skills: [] })
+    })
+
+    it('rejects organization PCs and out-of-scope directories before opening app-server', async () => {
         const createClient = vi.fn()
         const deps = { machineId: 'pc', allowedRoot: cwd, approvedRoots: () => [], createClient }
-        const shared = createCodexSkillListHandler({ ...deps, isShared: async () => true })
+        const shared = createCodexSkillListHandler({ ...deps, isOrganizationMachine: async () => true })
         expect(await shared({ cwd })).toEqual({ status: 'unavailable' })
-        const personal = createCodexSkillListHandler({ ...deps, isShared: async () => false })
+        const personal = createCodexSkillListHandler({ ...deps, isOrganizationMachine: async () => false })
         expect(await personal({ cwd: '/unapproved' })).toEqual({ status: 'unavailable' })
         expect(createClient).not.toHaveBeenCalled()
     })

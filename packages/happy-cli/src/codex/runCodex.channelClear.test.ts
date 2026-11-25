@@ -10,6 +10,9 @@
  * real acceptance and approval, the real gate. Only the things that would reach the network, a
  * process, or a provider are faked (Saycode specs/desktop-messenger-channels — R1/R5).
  */
+import { realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { catalogCodexSkills } from './codexSkillCatalog';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ExecSyncOptions } from 'node:child_process';
 import { logger } from '@/ui/logger';
@@ -59,6 +62,7 @@ vi.mock('@/utils/MessageQueue2', async (importOriginal) => {
 const clientLog: string[] = [];
 let threadId: string | null = 'thread-before';
 let onConnect: (() => Promise<void>) | null = null;
+let onListSkills: ((cwd: string) => Promise<unknown>) | null = null;
 let turnsSent: { text: string }[] = [];
 
 vi.mock('@/codex/codexAppServerClient', () => ({
@@ -72,6 +76,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({
         hasActiveThread = () => threadId !== null;
         readThread = vi.fn(async () => ({ thread: { id: threadId ?? 'thread-x', turns: [] } }));
         async connect() { await onConnect?.(); }
+        async listSkills(cwd: string) { return onListSkills?.(cwd); }
         async resumeThread() { clientLog.push('resumeThread'); return { threadId, model: 'test-model' }; }
         async startThread() { threadId = 'thread-after'; clientLog.push('startThread'); return { threadId, model: 'test-model' }; }
         clearThreadState = vi.fn(() => { clientLog.push('clearThreadState'); threadId = null; });
@@ -157,7 +162,7 @@ function sessionStub() {
 describe('the real Codex consumer loop', () => {
     beforeEach(() => {
         queues.length = 0; clientLog.length = 0; protocolMessages.length = 0; sessionEvents.length = 0;
-        turnsSent = []; rpc.clear(); threadId = 'thread-before'; onConnect = null;
+        turnsSent = []; rpc.clear(); threadId = 'thread-before'; onConnect = null; onListSkills = null;
         sessionMetadata = { path: '/workspace/project', codexThreadId: 'thread-before' };
         vi.mocked(logger.warn).mockClear();
         for (const key of Object.keys(process.env)) {
@@ -167,11 +172,11 @@ describe('the real Codex consumer loop', () => {
     });
     afterEach(() => { vi.unstubAllEnvs(); });
 
-    async function run(seed: () => Promise<void>) {
+    async function run(seed: () => Promise<void>, cwd = '/workspace/project') {
         const { runCodex } = await import('@/codex/runCodex');
         const { ApiClient } = await import('@/api/api');
         const stub = sessionStub();
-        const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue('/workspace/project');
+        const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(cwd);
         const createSpy = vi.spyOn(ApiClient, 'create').mockResolvedValue({
             getOrCreateMachine: vi.fn(async () => ({ id: 'machine-test' })),
             getOrCreateSession: vi.fn(async () => ({
@@ -282,6 +287,38 @@ describe('the real Codex consumer loop', () => {
      * S2 — the control. "clearThreadState was not called" means nothing unless a local `/clear`
      * does call it through this same harness.
      */
+    it('does not reset the thread when a selected skill on /clear cannot be resolved', async () => {
+        await run(async () => {
+            expect(await rpc.get('codex-skill:status')?.({})).toEqual({ version: 1 });
+            const queue = queues[0]!;
+            queue.pushIsolated('/clear', { permissionMode: 'default', skill: { ref: 'a'.repeat(64), messageId: 'selected' } } as never);
+            queue.close();
+        });
+        expect(clientLog).not.toContain('clearThreadState');
+        expect(turnsSent).toHaveLength(0);
+        expect(sessionEvents).toContainEqual(expect.objectContaining({ type: 'message', isError: true }));
+        expect(protocolMessages).toContainEqual(expect.objectContaining({ ev: { t: 'turn-end', status: 'failed' } }));
+    }, 60_000);
+
+    it('does not dispatch a valid skill if Stop finishes during the native lookup', async () => {
+        const cwd = realpathSync(tmpdir());
+        const skill = { name: 'selected', path: cwd + '/.agents/skills/selected/SKILL.md', scope: 'user', enabled: true };
+        const catalog = { data: [{ cwd, skills: [skill] }] };
+        const [{ ref }] = catalogCodexSkills(catalog, 'machine-test', cwd);
+        onListSkills = async () => {
+            clientLog.push('listSkills');
+            await rpc.get('abort')?.({});
+            return catalog;
+        };
+        await run(async () => {
+            const queue = queues[0]!;
+            queue.pushIsolated('hello', { permissionMode: 'default', skill: { ref, messageId: 'selected' } } as never);
+            queue.close();
+        }, cwd);
+        expect(clientLog).toContain('listSkills');
+        expect(turnsSent).toHaveLength(0);
+    }, 60_000);
+
     it('still lets a local /clear reset the Codex thread', async () => {
         await run(async () => {
             const queue = queues[0]!;

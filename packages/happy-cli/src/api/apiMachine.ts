@@ -1136,7 +1136,7 @@ export class ApiMachineClient {
         const skillMachineType = createMachineTypeMarker({ home: configuration.happyHomeDir, machineId: this.machine.id });
         this.rpcHandlerManager.registerHandler('codex-skill:list', createCodexSkillListHandler({
             machineId: this.machine.id, allowedRoot, approvedRoots: () => this.approvedRoots?.() ?? [],
-            isShared: async () => await skillMachineType.read() === 'shared',
+            isOrganizationMachine: async () => await skillMachineType.read() !== null,
             createClient: () => new CodexAppServerClient(),
         }), { customerBound: true });
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot, {
