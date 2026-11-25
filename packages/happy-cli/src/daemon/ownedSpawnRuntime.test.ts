@@ -111,7 +111,7 @@ it('transports the signed snapshot through encrypted machine RPC and answers a m
     const f = await fixture(), runtime = f.build(), handlers = new Map<string, (raw: unknown) => Promise<any>>();
     registerOwnedSpawnRpc((name, handler) => handlers.set(name, handler), runtime);
     const rpc = (name: string, body: unknown) => handlers.get(name)!(body);
-    expect(await rpc('owned-spawn-capabilities', { spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true });
+    expect(await rpc('owned-spawn-capabilities', { spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true, ownedSpawnAdditionalDirectoriesReportV1: true });
     const p = await rpc('prepare-owned-spawn', { intent: f.intent, spawn: f.spawn });
     const c = await rpc('commit-owned-spawn', { creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof(p) });
     expect(c).toMatchObject({ sessionId: 'session', ownershipOutcome: 'pending' });
@@ -329,11 +329,11 @@ describe('owned child host custody (T1c-b2 H3)', () => {
     });
     it('advertises owned-child contact separately from owned spawn and only for a supported spawn', async () => {
         const f = await fixture();
-        expect(await f.build({ launchCallers: hostCallers() }).capabilities({ spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true, ownedChildOwnerContactV1: true });
+        expect(await f.build({ launchCallers: hostCallers() }).capabilities({ spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true, ownedSpawnAdditionalDirectoriesReportV1: true, ownedChildOwnerContactV1: true });
         expect(await f.build({ launchCallers: hostCallers() }).capabilities({ spawn: { ...f.spawn, agent: 'gemini' } }))
             .toEqual({ ownedSpawnPrepareV1: false, ownedChildOwnerContactV1: false });
         // Switch off or contact unconfigured: exactly the existing answer.
-        expect(await f.build({ launchCallers: hostCallers(false) }).capabilities({ spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true });
+        expect(await f.build({ launchCallers: hostCallers(false) }).capabilities({ spawn: f.spawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true, ownedSpawnAdditionalDirectoriesReportV1: true });
     });
     it('keeps the existing daemon-held binding when owner contact is unavailable', async () => {
         const f = await fixture(), hosts = hostCallers(false), runtime = f.build({ launchCallers: hosts });
@@ -387,6 +387,12 @@ describe('the related-project directory report survives a start confirmed later 
     const report = { version: 1, accepted: ['/related/a'], skipped: { missing: 1 } };
     const withDirectories = () => fixture({ spawn: { directory: '/project', agent: 'codex', additionalDirectories: ['/related/a', '/related/b'] },
         startExtra: { additionalDirectories: report } });
+    it('advertises the report so Desktop keeps a related-directory start off an older daemon that drops it', async () => {
+        const f = await withDirectories();
+        expect(await f.build().capabilities({ spawn: f.spawn })).toEqual({
+            ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true, ownedSpawnAdditionalDirectoriesReportV1: true,
+        });
+    });
     it('host custody: a child binding that arrives after the start is recovered through status with the report', async () => {
         const f = await withDirectories(), hosts = hostCallers(), runtime = f.build({ launchCallers: hosts, hostBindingWaitMs: 0 });
         const start = await createdSession(f, runtime);
@@ -523,7 +529,7 @@ describe('owned spawn carries the fields Desktop actually sends (T4RT-03)', () =
         const f = await fixture({ spawn: desktopSpawn }), runtime = f.build(), handlers = new Map<string, (raw: unknown) => Promise<any>>();
         registerOwnedSpawnRpc((name, handler) => handlers.set(name, handler), runtime);
         const rpc = (name: string, body: unknown) => handlers.get(name)!(body);
-        expect(await rpc('owned-spawn-capabilities', { spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true });
+        expect(await rpc('owned-spawn-capabilities', { spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true, ownedSpawnAdditionalDirectoriesReportV1: true });
         const p = await rpc('prepare-owned-spawn', { intent: f.intent, spawn: desktopSpawn });
         await rpc('commit-owned-spawn', { creationRequestId: 'creation', preparationId: p.preparationId, ownershipProof: f.proof(p) });
         await rpc('start-owned-spawn', { creationRequestId: 'creation', preparationId: p.preparationId, sessionId: 'session' });
@@ -553,15 +559,15 @@ describe('owned spawn carries the fields Desktop actually sends (T4RT-03)', () =
 
     it('drops a malformed session source as the legacy RPC does, without refusing the spawn', async () => {
         const f = await fixture();
-        expect(await f.build().capabilities({ spawn: { ...desktopSpawn, sessionSource: 'Not A Source!' } })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true });
+        expect(await f.build().capabilities({ spawn: { ...desktopSpawn, sessionSource: 'Not A Source!' } })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true, ownedSpawnAdditionalDirectoriesReportV1: true });
     });
 
     it('offers owned creation on a daemon whose only ownership trust is the pinned table (D5)', async () => {
         const f = await fixture(), env = ownershipTrustEnv({}, 'https://happy.test', { 'https://happy.test': f.trust });
         expect(await f.build({ env: {} }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: false });
-        expect(await f.build({ env }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true });
+        expect(await f.build({ env }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true, ownedSpawnAdditionalDirectoriesReportV1: true });
         // Trust is not the owner-contact switch: without host callers the child-contact capability stays absent.
-        expect(await f.build({ env, launchCallers: hostCallers(false) }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true });
+        expect(await f.build({ env, launchCallers: hostCallers(false) }).capabilities({ spawn: desktopSpawn })).toEqual({ ownedSpawnPrepareV1: true, ownedSpawnRegistrationV1: true, ownedSpawnAdditionalDirectoriesReportV1: true });
     });
 
     it('verifies an intent with the pinned key and refuses one the table does not pin (D5)', async () => {
