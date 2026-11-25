@@ -1612,6 +1612,37 @@ describe('work machine execution authority', () => {
         }
     });
 
+    // aplus-dev-studio specs/work-machine-migration: the new PC's automation key file holds a version from its own
+    // first registration, not the machine's. Without this the key never moves and automations stay sealed to the old PC.
+    it('lets the replacement device replace the automation key its previous device registered, and no one else', async () => {
+        vi.stubEnv('SAYCODE_AUTOMATION_ENABLED', 'true');
+        const previousKey = Buffer.alloc(32, 3);
+        const replacementKey = Buffer.alloc(32, 4);
+        await db.machine.update({ where: { id: machineId }, data: { automationPublicKey: previousKey, automationKeyVersion: 2 } });
+        const worker = (device: object | null) => {
+            const handlers = new Map<string, (data: unknown, callback: (result: unknown) => void) => Promise<void>>();
+            automationSocketHandler(accountId, machineId, { on: (event: string, handler: never) => handlers.set(event, handler) } as never,
+                device as never);
+            return (data: object) => new Promise<{ ok: boolean; value?: { keyVersion: number }; error?: string }>(resolve =>
+                void handlers.get('automation-key-register')!(data, resolve as never));
+        };
+        const register = { expectedKeyVersion: 1, publicKey: replacementKey.toString('base64'), protocolVersion: 2 };
+        const expiresAt = Date.now() + 60_000;
+        try {
+            expect(await freezeWorkMachineExecution(db, original)).toBe(true);
+            expect(await replaceWorkMachineExecution(db, original, replacement.deviceId)).toBe(true);
+
+            expect(await worker({ ...original, purpose: 'daemon', expiresAt })(register)).toEqual({ ok: false, error: 'forbidden' });
+            expect(await worker({ ...replacement, purpose: 'daemon', expiresAt })(register)).toMatchObject({ ok: true, value: { keyVersion: 3 } });
+            const machine = await db.machine.findUniqueOrThrow({ where: { id: machineId } });
+            expect(Buffer.from(machine.automationPublicKey!)).toEqual(replacementKey);
+            expect(machine.automationKeyVersion).toBe(3);
+        } finally {
+            await db.machine.update({ where: { id: machineId }, data: { automationPublicKey: null, automationKeyVersion: 0 } });
+            vi.unstubAllEnvs();
+        }
+    });
+
     it('serves automation questions to the current device credential only: claims stop at drain and record the first execution', async () => {
         const priorSecret = process.env.HANDY_MASTER_SECRET;
         process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
