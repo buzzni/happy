@@ -13,8 +13,9 @@ export interface ChannelTurnEnqueueDeps<T> {
             channelRequestId?: string,
         ): void;
     };
-    deferredContinuation: {
-        prepare(text: string, options?: { fromChannel?: boolean }): PreparedTurn | null;
+    /** Claude folds context at enqueue; Codex folds it in provider dispatch order. */
+    deferredContinuation?: {
+        prepare(text: string, options?: { literalText?: boolean }): PreparedTurn | null;
     };
     /**
      * Claude records the app-visible prompt when a continuation is folded in, so the row the
@@ -49,7 +50,7 @@ export function enqueueChannelTurn<T>(
     mode: () => T,
     deps: ChannelTurnEnqueueDeps<T>,
 ): void {
-    const deferredTurn = deps.deferredContinuation.prepare(input.text, { fromChannel: true });
+    const deferredTurn = deps.deferredContinuation?.prepare(input.text, { literalText: true });
     const queuedText = deferredTurn?.text ?? input.text;
     try {
         if (deferredTurn) deps.onDeferredText?.(queuedText);

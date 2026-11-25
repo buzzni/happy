@@ -128,8 +128,8 @@ describe('enqueueChannelTurn', () => {
             queue: queue(),
             deferredContinuation: { prepare },
         });
-        // Without `fromChannel`, the consumer reads `/clear` as a local reset and drops the
+        // Without `literalText`, the consumer reads `/clear` as a local reset and drops the
         // stored context — a side effect an external sender must not be able to cause.
-        expect(prepare).toHaveBeenCalledWith('/clear', { fromChannel: true });
+        expect(prepare).toHaveBeenCalledWith('/clear', { literalText: true });
     });
 });

@@ -27,13 +27,14 @@ export function isCodexClearText(text: string): boolean {
  * Named rather than written inline at the call site so the rule is one testable decision instead
  * of a condition buried in the consumer loop.
  */
-export function shouldHandleCodexClear(message: { message: string; channelRequestId?: string }): boolean {
+export function shouldHandleCodexClear(message: { message: string; channelRequestId?: string; mode?: { skill?: unknown } }): boolean {
     const fromChannel = message.channelRequestId !== undefined;
-    return !fromChannel && isCodexClearText(message.message);
+    return !fromChannel && !message.mode?.skill && isCodexClearText(message.message);
 }
 
 export function enqueueCodexUserText<T>(opts: {
     text: string;
+    allowClear?: boolean;
     mode: T;
     queue: CodexUserTextQueue<T>;
     attachments?: PendingAttachment[];
@@ -44,7 +45,7 @@ export function enqueueCodexUserText<T>(opts: {
     attendance?: InputAttendance;
     evidence?: QueueInputEvidence;
 }): 'clear' | 'queued' {
-    if (isCodexClearText(opts.text)) {
+    if (opts.allowClear !== false && isCodexClearText(opts.text)) {
         if (opts.evidence) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace, opts.attendance, opts.evidence);
         else if (opts.attendance) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace, opts.attendance);
         else if (opts.latencyTrace) opts.queue.pushIsolateAndClear(opts.text, opts.mode, opts.attachments, opts.latencyTrace);

@@ -30,6 +30,7 @@ import { MANAGED_STOP_CLEAN } from '@/managed/managedControlChannel';
 const CODEX_END_INPUT_BUDGET_MS = 10_000;
 import React from "react";
 import { ApiClient } from '@/api/api';
+import { createMachineTypeMarker } from '@/daemon/machineTypeMarker';
 import { openWorkMachineSessionCredentials } from '@/daemon/workMachineCredential';
 import { startsNewWorkMachineConversation } from '@/daemon/workMachineNewSession';
 import { consumeInputEvidenceOption, inputEvidenceMetadata, resolveInputEvidenceOption } from '@/utils/inputEvidenceSettings';
@@ -154,6 +155,8 @@ import {
 import { createCodexExecTitleRunner, isOffTurnTitleEligible } from './codexOffTurnTitle';
 import { createOffTurnTitleJob, titleCoveredForTurn } from '@/utils/offTurnTitle';
 import { discoverCodexSkillCommands } from './codexSkills';
+import { CodexSkillUnavailableError, codexSkillRefSchema, resolveCodexSkill } from './codexSkillCatalog';
+import { realpath as realSkillDirectory } from 'node:fs/promises';
 import { AGENT_ORCHESTRATION_SYSTEM_PROMPT } from '@/prompt/agentOrchestrationPrompt';
 import { NEXT_STEPS_PROMPT } from '@/prompt/nextStepsPrompt';
 import { createTurnCardSwitch } from '@/claude/utils/turnCardTools';
@@ -307,6 +310,7 @@ export async function runCodex(opts: {
     if (agentPlanLaunch && managedStartup) throw new AgentPlanLaunchError('agent_plan_managed_conflict');
 
     const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
+    const continuationInputModes = new WeakSet<CodexEnhancedMode>();
     installBroadKillShims();
     // The prompt's `happy agent` must reach this CLI however the daemon was launched.
     installHappyCommandShim();
@@ -879,7 +883,14 @@ export async function runCodex(opts: {
             }
         }
 
+        const rawSkillRef = message.meta?.codexSkillRef;
+        const parsedSkillRef = codexSkillRefSchema.safeParse(rawSkillRef);
+        if (rawSkillRef !== undefined && (managedStartup || workMachine || !parsedSkillRef.success || !machineId)) {
+            for (const envelope of refusedTurnEnvelopes('선택한 Codex 스킬을 이 대화에서 사용할 수 없어요.', undefined)) session.sendSessionProtocolMessage(envelope);
+            return;
+        }
         const enhancedMode: EnhancedMode = {
+            ...(parsedSkillRef.success ? { skill: { ref: parsedSkillRef.data, messageId: randomUUID() } } : {}),
             permissionMode: messagePermissionMode || 'default',
             model: messageModel,
             appendSystemPrompt: messageAppendSystemPrompt,
@@ -888,59 +899,52 @@ export async function runCodex(opts: {
             effort: messageEffort,
             orgModelOrigin: messageModelOrigin,
         };
-        const deferredTurn = deferredContinuation.prepare(message.content.text);
-        let enqueueResult: ReturnType<typeof enqueueCodexUserText>;
-        try {
-            enqueueResult = enqueueCodexUserText({
-                text: deferredTurn?.text ?? message.content.text,
-                mode: enhancedMode,
-                queue: messageQueue,
-                evidence: session.queueInput(message),
-                attachments: attachmentsForThisMessage,
-                latencyTrace,
-                attendance: inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
-                // Travels beside the mode so the engine boundary below can commit
-                // this decision — and so a batch keeps every merged request's id.
-                requestIds: routed
-                    ? [routed.pending.clientRequestId]
-                    : localDecision ? [localDecision.clientRequestId] : undefined,
-            });
-            deferredTurn?.commit();
-            if (routed && enqueueResult === 'queued') {
-                // Aligned to what the Codex client will actually be given — an
-                // unsupported effort is dropped above, so the decision and the
-                // engine would otherwise disagree. See runClaude for the full note.
-                const reconciled = reconcileDecisionWithAppliedSettings(
-                    routed.pending,
-                    { model: messageModel, effort: messageEffort ?? null },
-                    'codex',
-                );
-                if (reconciled) {
-                    difficultyRoutingCommitter.recordPending(routed.state);
-                    if (reconciled !== routed.pending) {
-                        difficultyRoutingCommitter.recordLocalPending(reconciled);
-                    }
-                } else {
-                    logger.debug('[Codex] Routed model was substituted into an unknown pair; no floor recorded');
+        continuationInputModes.add(enhancedMode);
+        const enqueueResult = enqueueCodexUserText({
+            text: message.content.text,
+            mode: enhancedMode,
+            queue: messageQueue,
+            evidence: session.queueInput(message),
+            attachments: attachmentsForThisMessage,
+            latencyTrace,
+            attendance: inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
+            // Travels beside the mode so the engine boundary below can commit
+            // this decision — and so a batch keeps every merged request's id.
+            allowClear: !parsedSkillRef.success,
+            requestIds: routed
+                ? [routed.pending.clientRequestId]
+                : localDecision ? [localDecision.clientRequestId] : undefined,
+        });
+        if (routed && enqueueResult === 'queued') {
+            // Aligned to what the Codex client will actually be given — an
+            // unsupported effort is dropped above, so the decision and the
+            // engine would otherwise disagree. See runClaude for the full note.
+            const reconciled = reconcileDecisionWithAppliedSettings(
+                routed.pending,
+                { model: messageModel, effort: messageEffort ?? null },
+                'codex',
+            );
+            if (reconciled) {
+                difficultyRoutingCommitter.recordPending(routed.state);
+                if (reconciled !== routed.pending) {
+                    difficultyRoutingCommitter.recordLocalPending(reconciled);
                 }
-                session.sendSessionProtocolMessage(routed.event);
-            } else if (localDecision && enqueueResult === 'queued') {
-                const reconciled = reconcileDecisionWithAppliedSettings(
-                    localDecision,
-                    { model: messageModel, effort: messageEffort ?? null },
-                    'codex',
-                );
-                if (reconciled) difficultyRoutingCommitter.recordLocalPending(reconciled);
+            } else {
+                logger.debug('[Codex] Routed model was substituted into an unknown pair; no floor recorded');
             }
-            if (enqueueResult === 'clear') {
-                // Phase one: accepted, not yet reset. See DifficultyRoutingCommitter.
-                difficultyRoutingCommitter.requestEpoch();
-            }
-        } catch (error) {
-            deferredTurn?.rollback();
-            throw error;
+            session.sendSessionProtocolMessage(routed.event);
+        } else if (localDecision && enqueueResult === 'queued') {
+            const reconciled = reconcileDecisionWithAppliedSettings(
+                localDecision,
+                { model: messageModel, effort: messageEffort ?? null },
+                'codex',
+            );
+            if (reconciled) difficultyRoutingCommitter.recordLocalPending(reconciled);
         }
         if (enqueueResult === 'clear') {
+            deferredContinuation.prepare(message.content.text);
+            // Phase one: accepted, not yet reset. See DifficultyRoutingCommitter.
+            difficultyRoutingCommitter.requestEpoch();
             logger.debug('[Codex] /clear command pushed to isolated queue');
         }
     }, (error) => {
@@ -1065,6 +1069,12 @@ export async function runCodex(opts: {
             }
         } : undefined,
     });
+    const skillMachineType = !managedStartup && !workMachine && machineId
+        ? createMachineTypeMarker({ home: configuration.happyHomeDir, machineId }) : null;
+    const acceptsCodexSkills = async () => !!skillMachineType && await skillMachineType.read().then(type => type === null, () => false);
+    if (!managedStartup) session.rpcHandlerManager.registerHandler('codex-skill:status', async () => ({
+        version: await acceptsCodexSkills() ? 1 : 0,
+    }));
     const initialPromptDelivered = await (runtimeGate ? runtimeGate.admit(deliverInitialPrompt) : deliverInitialPrompt());
     // A run-once marker is only valid together with the fresh prompt supplied by
     // the automation daemon. This prevents an incomplete or accidentally resumed
@@ -1868,7 +1878,7 @@ export async function runCodex(opts: {
                 saycodePromptBlocks: currentSaycodePromptBlocks,
                 effort: currentEffort,
                 orgModelOrigin: currentModelOrigin,
-            }), { queue: messageQueue, deferredContinuation });
+            }), { queue: messageQueue });
         },
         now: () => Date.now(),
     });
@@ -2607,6 +2617,9 @@ export async function runCodex(opts: {
             const measure = <T>(stage: CodexLatencyStage, action: () => T | Promise<T>): T | Promise<T> =>
                 latency ? latency.measure(stage, action) : action();
 
+            const canApplyContinuation = message.channelRequestId !== undefined
+                || continuationInputModes.has(message.mode)
+                || message.items?.some(item => continuationInputModes.has(item.mode));
             let inputInvalidated = false;
             try {
                 if (!isCurrentCapacityContinuation(message.mode)) continue;
@@ -2663,9 +2676,10 @@ export async function runCodex(opts: {
                 await measure('auth', () => authRecovery.beginTurn());
                 if (shouldExit) { authRecovery.endTurn(); break; }
                 // A blocked session recovers before /clear is decided; otherwise a recovered one sends "/clear" to Codex.
-                const clearRecoveryError = shouldHandleCodexClear(message) && authRecovery.status().state === 'failed'
+                const clearTurn = shouldHandleCodexClear(message);
+                const clearRecoveryError = clearTurn && authRecovery.status().state === 'failed'
                     ? await Promise.resolve(measure('auth', () => authRecovery.prepareTurn())).then(() => undefined, (error: unknown) => error) : undefined;
-                if (shouldHandleCodexClear(message) && authRecovery.status().state !== 'failed') {
+                if (clearTurn && authRecovery.status().state !== 'failed') {
                     latency?.finish('control');
                     authRecovery.endTurn();
                     logger.debug('[Codex] Handling /clear command - resetting Codex thread state');
@@ -2709,6 +2723,7 @@ export async function runCodex(opts: {
                 }
 
                 let routingApplied = false;
+                let preparedContinuation: ReturnType<typeof deferredContinuation.prepare> = null;
                 try {
                     if (clearRecoveryError) throw clearRecoveryError;
                     // Only a blocked session waits here; an extra await would let a kill land mid-preparation.
@@ -2862,7 +2877,11 @@ export async function runCodex(opts: {
                         }
                     }
 
-                    const goalCommand = parseCodexGoalCommand(message.message);
+                    const literalTurnText = !!message.mode.skill || message.channelRequestId !== undefined;
+                    if (canApplyContinuation && !literalTurnText) {
+                        preparedContinuation = deferredContinuation.prepare(message.message, { literalText: true });
+                    }
+                    const goalCommand = literalTurnText ? null : parseCodexGoalCommand(preparedContinuation?.text ?? message.message);
                     if (goalCommand && await handleCodexGoalCommand(goalCommand, activeThreadId)) {
                         latency?.finish('control');
                         continue;
@@ -2882,8 +2901,8 @@ export async function runCodex(opts: {
                             skippedCount: imageInputs.skipped,
                         });
                     }
-                    const hasUserText = message.message.trim().length > 0;
-                    if ((message.attachments?.length ?? 0) > 0 && imageInputs.inputItems.length === 0 && !hasUserText) {
+                    const hasUserTextOrSkill = !!message.mode.skill || (preparedContinuation?.text ?? message.message).trim().length > 0;
+                    if ((message.attachments?.length ?? 0) > 0 && imageInputs.inputItems.length === 0 && !hasUserTextOrSkill) {
                         session.sendSessionEvent({
                             type: 'message',
                             message: 'No supported images were available to send to Codex.',
@@ -2938,8 +2957,21 @@ export async function runCodex(opts: {
                     // a cancelled turn or consume its pending startup context in that case.
                     if (owningForegroundSignal.aborted) { lessonProposalTurn.cancel(); continue; }
                     if (owningReviewSignal.aborted) { lessonProposalTurn.cancel(); reviewInstruction = ''; }
+                    const skillInputs = [];
+                    if (message.mode.skill) {
+                        const cwd = await acceptsCodexSkills()
+                            ? await Promise.resolve().then(() => realSkillDirectory(process.cwd())).catch(() => null) : null;
+                        if (owningForegroundSignal.aborted) { lessonProposalTurn.cancel(); continue; }
+                        const catalog = cwd ? await client.listSkills(cwd).catch(() => null) : null;
+                        if (owningForegroundSignal.aborted) { lessonProposalTurn.cancel(); continue; }
+                        if (owningReviewSignal.aborted) { lessonProposalTurn.cancel(); reviewInstruction = ''; }
+                        const skill = cwd && resolveCodexSkill(catalog, machineId ?? '', cwd, message.mode.skill.ref);
+                        if (!skill) throw new CodexSkillUnavailableError('선택한 Codex 스킬을 다시 골라 주세요.');
+                        skillInputs.push(skill);
+                    }
+                    if (canApplyContinuation && literalTurnText) preparedContinuation = deferredContinuation.prepare(message.message, { literalText: true });
                     const turnPrompt = (reviewInstruction ? `${reviewInstruction}\n\n` : '') + buildCodexTurnPrompt({
-                        message: message.message,
+                        message: preparedContinuation?.text ?? message.message,
                         mode: message.mode,
                         includeAppendSystemPrompt,
                         hasTitle: titleCoveredForTurn({
@@ -2998,6 +3030,10 @@ export async function runCodex(opts: {
                     latestCodexFailure = null;
                     const result = await client.sendTurnAndWait(turnPrompt, {
                         beforeDispatch: () => {
+                            if (message.mode.skill && owningForegroundSignal.aborted) {
+                                inputInvalidated = true;
+                                throw new Error('Codex skill turn was cancelled before dispatch');
+                            }
                             const valid = messageQueue.revalidateBatch(message);
                             if (valid !== message) {
                                 if (valid?.items) messageQueue.queue.unshift(...valid.items);
@@ -3010,7 +3046,11 @@ export async function runCodex(opts: {
                                 throw new Error('Codex continuation was cancelled before dispatch');
                             }
                         },
-                        onDispatched: () => { dispatchedWithoutStart = true; },
+                        onDispatched: () => {
+                            dispatchedWithoutStart = true;
+                            preparedContinuation?.commit();
+                            preparedContinuation = null;
+                        },
                         ...(memoryRecall?.reason === 'context_returned' ? { onSubmitted: () => recallHost?.markSubmitted(activeThreadId, memoryRecall.startupIncluded === true) } : {}),
                         ...(memoryIngest ? { onCompleted: memoryIngest.onCompleted,
                             onCompletionObservationSettled: memoryIngest.onSettled } : {}),
@@ -3021,7 +3061,7 @@ export async function runCodex(opts: {
                         effort: appliedRoute
                             ? (isSupportedCodexReasoningEffort(appliedRoute.effort) ? appliedRoute.effort : undefined)
                             : message.mode.effort,
-                        extraInputItems: imageInputs.inputItems,
+                        extraInputItems: [...imageInputs.inputItems, ...skillInputs],
                     }).catch(error => { memoryIngest?.onSettled(); throw error; }).finally(async () => {
                         // Recorded even after a failed turn: it may already have changed files. A
                         // missing record only makes a later restore more cautious.
@@ -3126,7 +3166,7 @@ export async function runCodex(opts: {
                         const notice = `Model at capacity — continuing automatically in ${Math.round(retry.delayMs / 1000)}s (${retry.attempt}/${retry.maxAttempts}).`;
                         messageBuffer.addMessage(notice, 'status');
                         session.sendSessionEvent({ type: 'message', message: notice });
-                        const continuationMode = { ...message.mode };
+                        const continuationMode = { ...message.mode, skill: undefined };
                         capacityContinuationModes.set(continuationMode, turnCapacityRetryGeneration);
                         capacityRetryTimer = setTimeout(() => {
                             capacityRetryTimer = null;
@@ -3150,6 +3190,16 @@ export async function runCodex(opts: {
                 } catch (error) {
                     latency?.finish('failed');
                     preemptLessonReview();
+                    if (error instanceof CodexSkillUnavailableError) {
+                        session.setPendingInputEvidence({ inputs: message.inputs ?? [], inputCount: message.inputCount, continuation: message.continuation });
+                        session.inputEvidence.commitPending();
+                        const [start, , end] = refusedTurnEnvelopes(error.message, message.channelRequestId);
+                        session.sendSessionProtocolMessage(start);
+                        session.sendSessionEvent({ type: 'message', message: `Codex error: ${error.message}`, isError: true });
+                        session.sendSessionProtocolMessage(end);
+                        messageBuffer.addMessage(error.message, 'status');
+                        continue;
+                    }
                     if (!dispatchedWithoutStart) session.inputEvidence?.cancelPendingDispatch();
                     if (inputInvalidated) continue;
                     // Only actual errors reach here (process crash, connection failure, etc.)
@@ -3198,6 +3248,7 @@ export async function runCodex(opts: {
                         session.sendSessionProtocolMessage(envelope);
                     }
                 } finally {
+                    preparedContinuation?.rollback();
                     if (!routingApplied) {
                         difficultyRoutingCommitter.discardPending(message.requestIds ?? [], owningForegroundSignal.aborted ? 'cancelled' : 'failed');
                     }

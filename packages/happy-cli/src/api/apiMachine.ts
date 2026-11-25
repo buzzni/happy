@@ -190,6 +190,8 @@ import { stopServerProcess, StopServerError } from '@/daemon/stopServer';
 import { createPtySession } from '@/daemon/remoteTerminal';
 import { formatCwdFallbackBanner } from '@/daemon/decideTerminalCwd';
 import { validatePath } from '@/modules/common/pathSecurity';
+import { createMachineTypeMarker } from '@/daemon/machineTypeMarker';
+import { createCodexSkillListHandler } from '@/codex/codexSkillCatalog';
 import { existsSync, mkdirSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -1131,6 +1133,12 @@ export class ApiMachineClient {
         const allowedRoot = resolveDaemonAllowedRoot(process.env, homedir());
         this.allowedRoot = allowedRoot;
         this.approvedRoots = resolveDaemonApprovedRoots(process.env, configuration.happyHomeDir);
+        const skillMachineType = createMachineTypeMarker({ home: configuration.happyHomeDir, machineId: this.machine.id });
+        if (this.machine.encryptionVariant === 'dataKey') this.rpcHandlerManager.registerHandler('codex-skill:list', createCodexSkillListHandler({
+            machineId: this.machine.id, allowedRoot, approvedRoots: () => this.approvedRoots?.() ?? [],
+            isOrganizationMachine: async () => await skillMachineType.read() !== null,
+            createClient: () => new CodexAppServerClient(),
+        }), { customerBound: true });
         registerCommonHandlers(this.rpcHandlerManager, allowedRoot, {
             ...(withFilesystemMutation ? { withFilesystemMutation } : {}),
             ...(admitSubprocess ? { admitSubprocess } : {}),

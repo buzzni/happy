@@ -2099,6 +2099,10 @@ export class CodexAppServerClient {
 
     // ─── Thread management ──────────────────────────────────────
 
+    listSkills(cwd: string): Promise<unknown> {
+        return this.request('skills/list', { cwds: [cwd], forceReload: true }, 5000);
+    }
+
     async startThread(opts: {
         model?: string;
         cwd?: string;

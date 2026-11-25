@@ -127,6 +127,11 @@ describe('shouldHandleCodexClear', () => {
         expect(shouldHandleCodexClear({ message: '/clear' })).toBe(true);
     });
 
+    it('leaves /clear with a selected skill in the normal turn flow', () => {
+        const message = { message: '/clear', mode: { skill: { ref: 'selected' } } };
+        expect(shouldHandleCodexClear(message)).toBe(false);
+    });
+
     it('refuses a channel /clear — the reset an external sender must not reach', () => {
         expect(shouldHandleCodexClear({ message: '/clear', channelRequestId: 'req-1' })).toBe(false);
     });

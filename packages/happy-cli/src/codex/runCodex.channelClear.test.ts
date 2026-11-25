@@ -10,11 +10,16 @@
  * real acceptance and approval, the real gate. Only the things that would reach the network, a
  * process, or a provider are faked (Saycode specs/desktop-messenger-channels — R1/R5).
  */
+import { existsSync, mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { stageDeferredContinuationContext } from '@/utils/deferredContinuationContext';
+import { catalogCodexSkills } from './codexSkillCatalog';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ExecSyncOptions } from 'node:child_process';
 import { logger } from '@/ui/logger';
 import { buildReconnectSessionEnvironment, RECONNECT_FRESH_LAUNCH_ENV } from '@/daemon/reconnectSessionEnv';
-import type { Metadata } from '@/api/types';
+import type { Metadata, UserMessage } from '@/api/types';
 
 vi.mock('@/utils/broadKillShims', () => ({ installBroadKillShims: vi.fn() }));
 
@@ -59,6 +64,7 @@ vi.mock('@/utils/MessageQueue2', async (importOriginal) => {
 const clientLog: string[] = [];
 let threadId: string | null = 'thread-before';
 let onConnect: (() => Promise<void>) | null = null;
+let onListSkills: ((cwd: string) => Promise<unknown>) | null = null;
 let turnsSent: { text: string }[] = [];
 
 vi.mock('@/codex/codexAppServerClient', () => ({
@@ -72,6 +78,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({
         hasActiveThread = () => threadId !== null;
         readThread = vi.fn(async () => ({ thread: { id: threadId ?? 'thread-x', turns: [] } }));
         async connect() { await onConnect?.(); }
+        async listSkills(cwd: string) { return onListSkills?.(cwd); }
         async resumeThread() { clientLog.push('resumeThread'); return { threadId, model: 'test-model' }; }
         async startThread() { threadId = 'thread-after'; clientLog.push('startThread'); return { threadId, model: 'test-model' }; }
         clearThreadState = vi.fn(() => { clientLog.push('clearThreadState'); threadId = null; });
@@ -92,7 +99,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({
         prepareProtectedTurn = vi.fn(() => ({ release: vi.fn() }));
         endInputAndAwaitExit = vi.fn(async () => {});
         reconnectAndResumeThread = vi.fn(async () => ({ id: threadId }));
-        setGoal = vi.fn();
+        setGoal = vi.fn(() => { clientLog.push('setGoal'); return { goal: null }; });
         clearGoal = vi.fn();
         disconnect = vi.fn(async () => { clientLog.push('disconnect'); });
         dispose = vi.fn(async () => {});
@@ -102,6 +109,7 @@ vi.mock('@/codex/codexAppServerClient', () => ({
 const rpc = new Map<string, (params: unknown) => Promise<unknown> | unknown>();
 const protocolMessages: unknown[] = [];
 const sessionEvents: unknown[] = [];
+let receiveUserMessage: ((message: UserMessage) => void) | null = null;
 let sessionMetadata: Record<string, unknown> = { path: '/workspace/project', codexThreadId: 'thread-before' };
 
 function sessionStub() {
@@ -135,7 +143,7 @@ function sessionStub() {
         }),
         getMetadata: vi.fn(() => sessionMetadata),
         updateAgentState: vi.fn(),
-        onUserMessage: vi.fn(),
+        onUserMessage: vi.fn((handler: (message: UserMessage) => void) => { receiveUserMessage = handler; }),
         onFileEvent: vi.fn(),
         on: vi.fn(),
         hasTitle: vi.fn(() => true),
@@ -157,7 +165,7 @@ function sessionStub() {
 describe('the real Codex consumer loop', () => {
     beforeEach(() => {
         queues.length = 0; clientLog.length = 0; protocolMessages.length = 0; sessionEvents.length = 0;
-        turnsSent = []; rpc.clear(); threadId = 'thread-before'; onConnect = null;
+        turnsSent = []; rpc.clear(); threadId = 'thread-before'; onConnect = null; onListSkills = null;
         sessionMetadata = { path: '/workspace/project', codexThreadId: 'thread-before' };
         vi.mocked(logger.warn).mockClear();
         for (const key of Object.keys(process.env)) {
@@ -167,11 +175,11 @@ describe('the real Codex consumer loop', () => {
     });
     afterEach(() => { vi.unstubAllEnvs(); });
 
-    async function run(seed: () => Promise<void>) {
+    async function run(seed: () => Promise<void>, cwd = '/workspace/project') {
         const { runCodex } = await import('@/codex/runCodex');
         const { ApiClient } = await import('@/api/api');
         const stub = sessionStub();
-        const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue('/workspace/project');
+        const cwdSpy = vi.spyOn(process, 'cwd').mockReturnValue(cwd);
         const createSpy = vi.spyOn(ApiClient, 'create').mockResolvedValue({
             getOrCreateMachine: vi.fn(async () => ({ id: 'machine-test' })),
             getOrCreateSession: vi.fn(async () => ({
@@ -183,11 +191,18 @@ describe('the real Codex consumer loop', () => {
             push: vi.fn(() => ({ sendToAllDevices: vi.fn() })),
         } as never);
         onConnect = seed;
+        const signals = ['SIGTERM', 'SIGINT'] as const;
+        const initialSignalListeners = signals.map(signal => new Set(process.listeners(signal)));
         try {
             await runCodex({ principal: { kind: 'account', credentials: { token: 't', secret: new Uint8Array(32) } as never } });
         } finally {
             createSpy.mockRestore();
             cwdSpy.mockRestore();
+            signals.forEach((signal, index) => {
+                for (const listener of process.listeners(signal)) {
+                    if (!initialSignalListeners[index].has(listener)) process.removeListener(signal, listener as NodeJS.SignalsListener);
+                }
+            });
         }
         expect(vi.mocked(logger.warn).mock.calls.filter(([message]) => message === 'Error in codex session:')
             .map(([, error]) => error instanceof Error ? error.stack : error)).toEqual([]);
@@ -282,6 +297,75 @@ describe('the real Codex consumer loop', () => {
      * S2 — the control. "clearThreadState was not called" means nothing unless a local `/clear`
      * does call it through this same harness.
      */
+    it('does not reset the thread when a selected skill on /clear cannot be resolved', async () => {
+        await run(async () => {
+            expect(await rpc.get('codex-skill:status')?.({})).toEqual({ version: 1 });
+            const queue = queues[0]!;
+            queue.pushIsolated('/clear', { permissionMode: 'default', skill: { ref: 'a'.repeat(64), messageId: 'selected' } } as never);
+            queue.close();
+        });
+        expect(clientLog).not.toContain('clearThreadState');
+        expect(turnsSent).toHaveLength(0);
+        expect(sessionEvents).toContainEqual(expect.objectContaining({ type: 'message', isError: true }));
+        expect(protocolMessages).toContainEqual(expect.objectContaining({ ev: { t: 'turn-end', status: 'failed' } }));
+    }, 60_000);
+
+    it.each(['stale-then-skill', 'stale-then-plain', 'stale-then-goal', 'skill-then-plain', 'skill-then-channel'])(
+        'gives staged continuation context to the first dispatch (%s)', async scenario => {
+        const home = mkdtempSync(join(tmpdir(), 'happy-codex-skill-continuation-'));
+        try {
+            const cwd = realpathSync(home);
+            const staged = await stageDeferredContinuationContext('earlier conversation', cwd);
+            vi.stubEnv('HAPPY_DEFERRED_CONTINUATION_CONTEXT_FILE', staged.file);
+            const skill = { name: 'selected', path: join(cwd, '.agents/skills/selected/SKILL.md'), scope: 'user', enabled: true };
+            const catalog = { data: [{ cwd, skills: [skill] }] };
+            const [{ ref }] = catalogCodexSkills(catalog, 'machine-test', cwd);
+            onListSkills = async () => catalog;
+            await run(async () => {
+                const queue = queues[0]!;
+                const receive = receiveUserMessage!;
+                const validFirst = scenario.startsWith('skill-then-');
+                receive({ role: 'user', content: { type: 'text', text: validFirst ? 'first skill' : '/clear' },
+                    meta: { codexSkillRef: validFirst ? ref : 'a'.repeat(64) } });
+                if (scenario === 'skill-then-channel') {
+                    await vi.waitFor(() => expect(queue.size()).toBe(1));
+                    await sendChannelTurn('/goal continue here', 'req-after-skill');
+                } else {
+                    receive({ role: 'user', content: { type: 'text', text: scenario === 'stale-then-goal' ? '/goal continue here' : 'continue here' },
+                        ...(scenario === 'stale-then-skill' ? { meta: { codexSkillRef: ref } } : {}) });
+                }
+                await vi.waitFor(() => expect(queue.size()).toBe(2));
+                queue.close();
+            }, cwd);
+            const validFirst = scenario.startsWith('skill-then-');
+            expect(turnsSent).toHaveLength(validFirst ? 2 : 1);
+            expect(turnsSent[0].text).toContain('earlier conversation');
+            expect(turnsSent[0].text).toContain(validFirst ? 'first skill' : 'continue here');
+            if (validFirst) expect(turnsSent[1].text).not.toContain('earlier conversation');
+            expect(clientLog).not.toContain('setGoal');
+            expect(existsSync(staged.file)).toBe(false);
+        } finally { rmSync(home, { recursive: true, force: true }); }
+    }, 60_000);
+
+    it('does not dispatch a valid skill if Stop finishes during the native lookup', async () => {
+        const cwd = realpathSync(tmpdir());
+        const skill = { name: 'selected', path: cwd + '/.agents/skills/selected/SKILL.md', scope: 'user', enabled: true };
+        const catalog = { data: [{ cwd, skills: [skill] }] };
+        const [{ ref }] = catalogCodexSkills(catalog, 'machine-test', cwd);
+        onListSkills = async () => {
+            clientLog.push('listSkills');
+            await rpc.get('abort')?.({});
+            return catalog;
+        };
+        await run(async () => {
+            const queue = queues[0]!;
+            queue.pushIsolated('hello', { permissionMode: 'default', skill: { ref, messageId: 'selected' } } as never);
+            queue.close();
+        }, cwd);
+        expect(clientLog).toContain('listSkills');
+        expect(turnsSent).toHaveLength(0);
+    }, 60_000);
+
     it('still lets a local /clear reset the Codex thread', async () => {
         await run(async () => {
             const queue = queues[0]!;
