@@ -385,4 +385,27 @@ describe('execution-bound creation on a protected work machine', () => {
     expect((await authority()).firstExecutionAt).toBeNull();
     await unchanged();
   });
+
+  it('answers the execution owner to the current device credential of that machine, and to the account bearer', async () => {
+    const token = await daemon(), proof = await signed(undefined, own);
+    const sessionId = (await createOnDevice(token, { executionProof: proof })).json().session.id;
+    const t = proof.ticket.body;
+    const ask = (bearer: string, machineId = t.machineId) => app.inject({ method: 'POST', url: `/v1/machine-sessions/${sessionId}/execution-owner`,
+      headers: { authorization: `Bearer ${bearer}` }, payload: { companyId: t.companyId, machineId, launchId: t.launchId, initialNonce: t.initialNonce } });
+    const relation = { companyId: t.companyId, machineId: t.machineId, sessionId, launchId: t.launchId, initialNonce: t.initialNonce,
+      machineOwnerAccountId: 'company-account', sessionOwnerAccountId: 'company-account' };
+    const answered = await ask(token);
+    expect(answered.statusCode, answered.body).toBe(200);
+    expect(answered.json()).toEqual({ owner: relation });
+    expect((await owner(sessionId)).json()).toEqual({ owner: relation });
+    // Another machine's credential, whether it names this machine or its own.
+    const other = await daemon({ ...grant, machineId: 'machine-2' });
+    expect((await ask(other)).statusCode).toBe(403);
+    expect((await ask(other, 'machine-2')).statusCode).toBe(403);
+    // A drain still answers; a frozen generation does not.
+    await client.workMachineExecution.update({ where: { machineId: grant.machineId }, data: { drainingAt: new Date() } });
+    expect((await ask(token)).json()).toEqual({ owner: relation });
+    await client.workMachineExecution.update({ where: { machineId: grant.machineId }, data: { frozenAt: new Date() } });
+    expect((await ask(token)).statusCode).toBe(403);
+  });
 });

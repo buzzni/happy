@@ -1,4 +1,5 @@
 import { piiSessionVisibility } from "@/app/session/piiSessionVisibility";
+import type { FastifyReply, FastifyRequest } from "fastify";
 import { Fastify } from "../types";
 import { z } from "zod";
 import { db } from "@/storage/db";
@@ -66,9 +67,16 @@ export function machineSessionOwnerRoutes(app: Fastify) {
         return reply.send({ owner: { ownerAccountId: request.userId } });
     });
 
+    // An account bearer, or the current device credential of the machine the body names
+    // (a protected machine's daemon: drain still allows these reads, a frozen machine does not).
+    const accountOrMachineDaemon = [
+        requireWorkMachineDaemonReadAuth(app, request => (request.body as { machineId?: string }).machineId),
+        async (request: FastifyRequest, reply: FastifyReply) => request.workMachineDaemonGrant ? undefined : requireAccountPrincipal(request, reply),
+    ];
+
     // Execution relation only. This grants neither session ownership nor message access.
     app.post('/v1/machine-sessions/:sessionId/execution-owner', {
-        preHandler: [app.authenticate, requireAccountPrincipal],
+        preHandler: accountOrMachineDaemon,
         schema: {
             params: z.object({ sessionId: z.string().min(1).max(128) }).strict(),
             body: ExecutionOwnerRequestSchema,
@@ -81,7 +89,7 @@ export function machineSessionOwnerRoutes(app: Fastify) {
             sessionId, companyId, machineId, launchId, initialNonce,
             machineOwnerAccountId: request.userId,
             machine: { is: { id: machineId, accountId: request.userId } },
-            session: { is: { id: sessionId } },
+            session: { is: { id: sessionId, ...(request.workMachineDaemonGrant ? { workMachineId: machineId } : {}) } },
         } });
         if (!binding) return reply.send({ owner: null });
         return reply.send({ owner: {
