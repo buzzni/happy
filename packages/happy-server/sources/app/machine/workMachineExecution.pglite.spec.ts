@@ -1924,3 +1924,133 @@ describe('work machine execution authority', () => {
         }
     });
 });
+
+describe('shared PC enrollment', () => {
+    const company = 'shared-company';
+    const control = generateKeyPairSync('ed25519');
+    const kid = 'shared-enrollment-key';
+    const audience = 'shared-enrollment-happy';
+    const signingKey = generateKeyPairSync('ed25519');
+    const publicDer = signingKey.publicKey.export({ format: 'der', type: 'spki' });
+    const deviceId = createHash('sha256').update(publicDer).digest('base64url');
+    let app: ReturnType<typeof fastify>;
+    let bearer: string;
+    let priorSecret: string | undefined;
+    let pcCount = 0;
+
+    beforeAll(async () => {
+        priorSecret = process.env.HANDY_MASTER_SECRET;
+        process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+        app = fastify();
+        app.setValidatorCompiler(validatorCompiler);
+        app.setSerializerCompiler(serializerCompiler);
+        const verifier = createControlAssertionVerifier({
+            audience,
+            verifierKeys: JSON.stringify({ [kid]: control.publicKey.export({ format: 'der', type: 'spki' }).subarray(-32).toString('base64url') }),
+        });
+        await auth.init();
+        enableAuthentication(app as unknown as Fastify);
+        workMachineExecutionRoutes(app as unknown as Fastify, () => verifier);
+        await db.account.create({ data: { id: company, publicKey: company } });
+        bearer = await auth.createToken(company);
+    });
+
+    afterAll(async () => {
+        await app?.close();
+        if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET;
+        else process.env.HANDY_MASTER_SECRET = priorSecret;
+    });
+
+    /** A fresh shared PC of the company account, ready to enroll. */
+    async function sharedPc() {
+        const pc = `shared-pc-${++pcCount}`;
+        await db.machine.create({ data: { id: pc, accountId: company, metadata: 'encrypted', dataEncryptionKey: new Uint8Array(105) } });
+        return pc;
+    }
+
+    /** An idle conversation of the company account with a confirmed ownership binding for a Studio member. */
+    async function memberConversation(pc: string, id: string, member: string) {
+        await db.session.create({
+            data: { id, tag: id, accountId: company, metadata: 'encrypted', dataEncryptionKey: new Uint8Array(105), active: false },
+        });
+        await db.sessionOwnershipBinding.create({ data: {
+            sessionId: id, sessionRowId: id, bindingId: `binding-${id}`, subjectIssuer: 'studio', ownerUserId: member,
+            sessionAccountId: company, machineId: pc, machineAccountId: company, intentId: `intent-${id}`,
+            operationId: `op-${id}`, nonce: `nonce-${id}`, createDigest: 'creation', proofDigest: 'proof',
+            issuedAt: new Date(), confirmedAt: new Date(),
+        } });
+    }
+
+    /** A rotation conversation with a session execution binding. */
+    async function executionBound(id: string, binding: { machineId: string; machineOwnerAccountId?: string; sessionOwnerAccountId?: string }) {
+        await db.session.create({
+            data: { id, tag: id, accountId: company, metadata: 'encrypted', dataEncryptionKey: new Uint8Array(105), active: false },
+        });
+        await db.sessionExecutionBinding.create({ data: {
+            sessionId: id, sessionRowId: id, sessionRowOwnerAccountId: company, companyId: 'company-1',
+            machineId: binding.machineId, machineOwnerAccountId: binding.machineOwnerAccountId ?? company,
+            machineRowId: null, machineRowOwnerAccountId: null,
+            sessionOwnerAccountId: binding.sessionOwnerAccountId ?? company,
+            launchId: `launch-${id}`, initialNonce: `nonce-${id}`, operationId: `operation-${id}`, approvalId: 'approval',
+            deviceKeyId: 'device-key', sessionTagHash: 'tag', sessionCreateBodyHash: 'body', ticketDigest: 'ticket', createProofDigest: 'proof',
+        } });
+    }
+
+    function enroll(pc: string, owners: { ownerUserId?: string; ownerUserIds?: string[] }, sessionIds: string[], studioAttributedSessionIds?: string[]) {
+        const now = Date.now();
+        const proof = {
+            publicKey: publicDer.toString('base64url'), issuedAt: now,
+            signature: sign(null, Buffer.from(JSON.stringify([
+                'happy-work-machine-enrollment-v2', pc, deviceId, now, [...sessionIds].sort(),
+            ])), signingKey.privateKey).toString('base64url'),
+        };
+        const payload = { deviceId, ...owners, sessionIds, ...(studioAttributedSessionIds ? { studioAttributedSessionIds } : {}), proof };
+        const accountTokenDigest = createHash('sha256').update(bearer).digest('hex');
+        const bytes = Buffer.from(JSON.stringify({
+            kid, aud: audience, purpose: 'happy-managed-control', op: 'work-machine-enroll',
+            bodyDigest: canonicalDigest({ accountTokenDigest, machineId: pc, ...payload }),
+            iat: now, exp: now + 5000,
+        }));
+        return app.inject({
+            method: 'POST', url: `/v1/work-machines/${pc}/execution-enrollment`, payload,
+            headers: {
+                authorization: `Bearer ${bearer}`,
+                'x-happy-control-assertion': `${bytes.toString('base64url')}.${sign(null, bytes, control.privateKey).toString('base64url')}`,
+            },
+        });
+    }
+
+    async function outcome(response: Promise<{ statusCode: number; json(): unknown }>) {
+        const reply = await response;
+        return { status: reply.statusCode, body: reply.json() };
+    }
+
+    it('accepts the conversations of every member Studio names and refuses a member outside the set', async () => {
+        const pc = await sharedPc();
+        await memberConversation(pc, 'member-a-chat', 'member-a');
+        await memberConversation(pc, 'member-b-chat', 'member-b');
+        await memberConversation(pc, 'former-member-chat', 'former-member');
+        const members = ['member-a-chat', 'member-b-chat'];
+
+        expect(await outcome(enroll(pc, { ownerUserIds: ['member-a', 'member-b'] }, [...members, 'former-member-chat']))).toMatchObject({
+            status: 409, body: { reason: 'owner-mismatch', sessionIds: ['former-member-chat'] },
+        });
+        // The body names the owners exactly one way.
+        expect((await enroll(pc, { ownerUserId: 'member-a', ownerUserIds: ['member-a', 'member-b'] }, members)).statusCode).toBe(400);
+        expect((await enroll(pc, {}, members)).statusCode).toBe(400);
+        expect((await enroll(pc, { ownerUserIds: [] }, members)).statusCode).toBe(400);
+        expect(await db.workMachineExecution.findUnique({ where: { machineId: pc } })).toBeNull();
+
+        await db.session.delete({ where: { id: 'former-member-chat' } });
+        // A single owner keeps refusing every other member's conversation.
+        expect(await outcome(enroll(pc, { ownerUserId: 'member-a' }, members))).toMatchObject({
+            status: 409, body: { reason: 'owner-mismatch', sessionIds: ['member-b-chat'] },
+        });
+        const enrolled = await enroll(pc, { ownerUserIds: ['member-a', 'member-b'] }, members);
+        expect(enrolled.statusCode).toBe(200);
+        expect(enrolled.json()).toMatchObject({ machineId: pc, accountId: company, deviceId, generation: 1 });
+        expect(await db.session.count({ where: { id: { in: members }, workMachineId: pc } })).toBe(2);
+        // A lost acknowledgement is answered again with the same grant.
+        expect((await enroll(pc, { ownerUserIds: ['member-b', 'member-a'] }, members)).statusCode).toBe(200);
+    });
+});
