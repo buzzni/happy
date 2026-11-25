@@ -7,6 +7,13 @@ import { MachineRotationError } from './machineSetupTokenProtocol'
 const rawSession = z.object({ id: z.string(), seq: z.number().int().nonnegative(), metadata: z.string(), metadataVersion: z.number().int().nonnegative(),
   agentState: z.string().nullable(), agentStateVersion: z.number().int().nonnegative(), dataEncryptionKey: z.string().nullable() })
 const pageSchema = z.object({ sessions: z.array(rawSession), nextCursor: z.string().nullable(), hasNext: z.boolean() })
+/** An authenticated Happy JSON call: POST with a payload, GET without. Refusals become FORBIDDEN, other failures REQUEST_FAILED. */
+async function happyJson(fetcher: typeof fetch, happyOrigin: string, path: string, bearer: string, payload?: unknown) {
+  const response = await fetcher(happyOrigin + path, { method: payload ? 'POST' : 'GET', redirect: 'error', signal: AbortSignal.timeout(15000),
+    headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' }, ...(payload ? { body: JSON.stringify(payload) } : {}) })
+  if (!response.ok) throw new MachineRotationError(response.status === 401 || response.status === 403 ? 'FORBIDDEN' : 'REQUEST_FAILED')
+  return response.json()
+}
 export async function discoverMachineSetupTokenSession(input: {
   happyOrigin: string; ownerBearer: string; machineBearer: string; state: MachineRotationJournalRecord; executionProof?: HappySessionExecutionProof; fetch?: typeof fetch;
 }) {
@@ -14,12 +21,7 @@ export async function discoverMachineSetupTokenSession(input: {
   if (!pending?.binding || request?.action !== 'issue' || !body || !pending.machineOwnerAccountId) throw new MachineRotationError('PERSISTENCE_FAILED')
   const { companyId, machineId } = request, initialNonce = pending.binding.nonce, machineOwnerAccountId = pending.machineOwnerAccountId;
   const fetcher = input.fetch ?? fetch
-  async function json(path: string, bearer: string, payload?: unknown) {
-    const response = await fetcher(input.happyOrigin + path, { method: payload ? 'POST' : 'GET', redirect: 'error', signal: AbortSignal.timeout(15000),
-      headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json', 'Cache-Control': 'no-cache' }, ...(payload ? { body: JSON.stringify(payload) } : {}) })
-    if (!response.ok) throw new MachineRotationError(response.status === 401 || response.status === 403 ? 'FORBIDDEN' : 'REQUEST_FAILED')
-    return response.json()
-  }
+  const json = (path: string, bearer: string, payload?: unknown) => happyJson(fetcher, input.happyOrigin, path, bearer, payload)
   // Read the actual session owner, including staged personal accounts, not the daemon's account.
   const profile = z.object({ id: z.string() }).parse(await json('/v1/account/profile', input.ownerBearer))
   if (profile.id !== request.sessionOwnerAccountId) throw new MachineRotationError('FORBIDDEN')
