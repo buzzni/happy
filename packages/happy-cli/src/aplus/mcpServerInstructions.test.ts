@@ -52,6 +52,24 @@ describe('createMcpServerInstructionsReader', () => {
         expect(await reader.read(servers)).toBe('');
     });
 
+    it('asks a failed server again after a minute instead of losing its catalog for the whole session', async () => {
+        let clock = 0;
+        let failing = true;
+        const fetchImpl = vi.fn(async () => failing ? new Response('busy', { status: 503 }) : initializeResponse('# 사용 가능한 스킬'));
+        const reader = createMcpServerInstructionsReader({ fetchImpl, now: () => clock });
+        const companyOnly = { 'aplus-company': servers['aplus-company'] };
+
+        expect(await reader.read(companyOnly)).toBe('');
+        failing = false;
+        clock = 30_000;
+        expect(await reader.read(companyOnly)).toBe('');
+        expect(fetchImpl).toHaveBeenCalledTimes(1);
+
+        clock = 61_000;
+        expect(await reader.read(companyOnly)).toContain('## aplus-company\n# 사용 가능한 스킬');
+        expect(fetchImpl).toHaveBeenCalledTimes(2);
+    });
+
     it('does not call servers that are absent from the session', async () => {
         const fetchImpl = vi.fn(async () => initializeResponse('catalog'));
         const reader = createMcpServerInstructionsReader({ fetchImpl });

@@ -16,6 +16,8 @@ import type { AplusMcpServersMap } from './fetchAplusMcpServers';
 const INSTRUCTION_SERVERS = ['aplus-common', 'aplus-company'] as const;
 
 const TIMEOUT_MS = 3000;
+/** 실패한 서버는 이만큼 지나 다시 묻는다. 매 턴 3초를 기다리지 않으면서, 한 번의 일시 장애로 세션 내내 카탈로그를 잃지 않는다. */
+const RETRY_AFTER_FAILURE_MS = 60_000;
 /** 서버 하나의 상한. 카탈로그는 보통 수 KB 다. */
 const MAX_SERVER_CHARS = 20_000;
 
@@ -57,7 +59,7 @@ async function fetchInstructions(fetchImpl: FetchImpl, url: string, headers: Rec
             }),
             signal: controller.signal,
         });
-        if (!response.ok) return '';
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
         const payload = await response.json() as { result?: { instructions?: unknown } };
         const instructions = payload.result?.instructions;
         return typeof instructions === 'string' ? instructions.trim() : '';
@@ -66,10 +68,11 @@ async function fetchInstructions(fetchImpl: FetchImpl, url: string, headers: Rec
     }
 }
 
-export function createMcpServerInstructionsReader(options: { fetchImpl?: FetchImpl } = {}) {
+export function createMcpServerInstructionsReader(options: { fetchImpl?: FetchImpl; now?: () => number } = {}) {
     const fetchImpl: FetchImpl = options.fetchImpl ?? ((url, init) => fetch(url, init));
-    // 서버 이름별 마지막 설정과 그 결과. 주소나 자격이 바뀔 때만 다시 묻는다(값은 메모리에만 둔다).
-    const cache = new Map<string, { key: string; instructions: Promise<string> }>();
+    const now = options.now ?? Date.now;
+    // 서버 이름별 마지막 설정과 그 결과. 성공은 주소나 자격이 바뀔 때까지, 실패는 retryAt 까지 둔다(값은 메모리에만 둔다).
+    const cache = new Map<string, { key: string; instructions: Promise<string>; retryAt?: number }>();
 
     return {
         async read(servers: AplusMcpServersMap): Promise<string> {
@@ -79,14 +82,16 @@ export function createMcpServerInstructionsReader(options: { fetchImpl?: FetchIm
                 const headers = server.headers ?? {};
                 const key = JSON.stringify([server.url, headers]);
                 let cached = cache.get(name);
-                if (cached?.key !== key) {
-                    cached = {
+                if (cached?.key !== key || (cached.retryAt !== undefined && now() >= cached.retryAt)) {
+                    const entry: { key: string; instructions: Promise<string>; retryAt?: number } = {
                         key,
                         instructions: fetchInstructions(fetchImpl, server.url, headers).catch((error) => {
                             logger.debug(`[mcp-instructions] ${name} unavailable: ${error instanceof Error ? error.message : String(error)}`);
+                            entry.retryAt = now() + RETRY_AFTER_FAILURE_MS;
                             return '';
                         }),
                     };
+                    cached = entry;
                     cache.set(name, cached);
                 }
                 const instructions = await cached.instructions;
