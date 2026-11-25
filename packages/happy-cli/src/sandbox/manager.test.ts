@@ -166,6 +166,19 @@ describe('sandbox manager', () => {
         expect(await wrapCommand('ego-browser skill')).not.toContain('com.citrolabs.ego.lite.ego-browser');
     });
 
+    // 조직이 관리하는(mandatory) 머신에서는 로그인된 브라우저를 승인 없이 넘기지 않는다.
+    it('wrapCommand keeps the ego lite CLI bootstrap closed on mandatory machines even with open network', async () => {
+        const profile = '(version 1)\n(deny default (with message "tag"))\n(allow process-exec)';
+        mockWrapWithSandbox.mockResolvedValue(
+            shellquote.quote(['env', 'SANDBOX_RUNTIME=1', 'sandbox-exec', '-p', profile, '/bin/zsh', '-c', 'ego-browser skill']),
+        );
+        const cleanup = await initializeSandbox({ networkMode: 'allowed' } as SandboxConfig, '/workspace/session', 'mandatory');
+
+        expect(await wrapCommand('ego-browser skill')).not.toContain('com.citrolabs.ego.lite.ego-browser');
+
+        await cleanup();
+    });
+
     it('wrapForMcpTransport returns sh -c wrapped command', async () => {
         mockWrapWithSandbox.mockResolvedValue('sandbox codex command');
 

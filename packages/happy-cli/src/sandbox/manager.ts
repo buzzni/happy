@@ -28,8 +28,10 @@ function withoutRuntimeMandatoryDenies(config: SandboxRuntimeConfig, cwd: string
 }
 
 /**
- * ego lite 는 사용자 로그인 세션이 있는 브라우저라, 네트워크를 막거나 도메인을 제한한 샌드박스에서
- * 열면 그 제한을 브라우저로 우회하게 된다. 그래서 네트워크가 열린 경우에만 부트스트랩을 연다.
+ * 이 부트스트랩을 열면 샌드박스 안 에이전트가 host_tool 승인 없이 사용자 로그인 세션이 있는
+ * ego lite 브라우저를 조작한다. 무인 예약 작업에서 ego-browser 를 쓰려면 이 대가가 필요하다.
+ * - 네트워크를 막거나 도메인을 제한한 샌드박스에서 열면 그 제한을 브라우저로 우회하게 되므로 열지 않는다.
+ * - 조직이 관리하는(mandatory) 머신에서는 머신 소유자가 고른 정책이 아니므로 열지 않는다.
  * SandboxManager 가 프로세스 단위 싱글턴이므로 같은 수명으로 둔다.
  */
 let egoBrowserAllowed = false;
@@ -45,7 +47,7 @@ export async function initializeSandbox(
         process.cwd(),
     );
     await SandboxManager.initialize(runtimeConfig);
-    egoBrowserAllowed = sandboxConfig.networkMode === 'allowed';
+    egoBrowserAllowed = sandboxConfig.networkMode === 'allowed' && policyMode === 'owner-choice';
 
     return async () => {
         egoBrowserAllowed = false;

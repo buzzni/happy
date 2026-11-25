@@ -36,7 +36,7 @@ export const ELECTRON_SEATBELT_RULES: readonly string[] = [
  * 통로라 열지 않는다 — ego lite 가 꺼져 있으면 지금처럼 실패한다.
  */
 export const EGO_BROWSER_SEATBELT_RULES: readonly string[] = [
-    '; ego lite CLI bootstrap (happy-cli, open network only)',
+    '; ego lite CLI bootstrap (happy-cli, owner-choice + open network only)',
     '(allow mach-lookup (global-name "com.citrolabs.ego.lite.ego-browser"))',
 ]
 
