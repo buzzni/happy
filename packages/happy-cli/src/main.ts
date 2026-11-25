@@ -20,7 +20,7 @@ import { authAndSetupMachineIfNeeded } from './ui/auth'
 import packageJson from '../package.json'
 import { z } from 'zod'
 import { startDaemon } from './daemon/run'
-import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningCurrentlyInstalledHappyVersion, stopDaemon } from './daemon/controlClient'
+import { checkIfDaemonRunningAndCleanupStaleState, isDaemonRunningSameOrNewerHappyVersion, stopDaemon } from './daemon/controlClient'
 import { formatStopDaemonProgress, parseDaemonStopArgs, type StopDaemonProgress } from './daemon/restartDrainClient'
 import { getLatestDaemonLog } from './ui/logger'
 import { killRunawayHappyProcesses } from './daemon/doctor'
@@ -639,7 +639,7 @@ Conversation history is preserved on the server, but in-flight tool calls are in
           return
         }
         await stopDaemon({ ...parsed.options, onProgress: printProgress })
-      } else if (await isRunningDaemonOfAnotherVersion()) {
+      } else if (await isRunningDaemonOlderThanThisCli()) {
         await stopDaemon({ intent: 'restart', reason: 'user-restart', onProgress: printProgress })
       }
 
@@ -1098,10 +1098,10 @@ function createStopProgressPrinter(): (progress: StopDaemonProgress) => void {
   }
 }
 
-/** A daemon is running and it is not this CLI's version. Unverifiable health is left to start-sync. */
-async function isRunningDaemonOfAnotherVersion(): Promise<boolean> {
+/** A daemon is running on an older (or unreadable) version than this CLI; a newer one is kept. Unverifiable health is left to start-sync. */
+async function isRunningDaemonOlderThanThisCli(): Promise<boolean> {
   try {
-    return await checkIfDaemonRunningAndCleanupStaleState() && !(await isDaemonRunningCurrentlyInstalledHappyVersion())
+    return await checkIfDaemonRunningAndCleanupStaleState() && !(await isDaemonRunningSameOrNewerHappyVersion())
   } catch {
     return false
   }

@@ -25,7 +25,7 @@ vi.mock('@/ui/logger', () => ({
 }))
 
 vi.mock('./controlClient', () => ({
-  isDaemonRunningCurrentlyInstalledHappyVersion: mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion,
+  isDaemonRunningSameOrNewerHappyVersion: mocks.mockIsDaemonRunningCurrentlyInstalledHappyVersion,
   checkIfDaemonRunningAndCleanupStaleState: mocks.mockCheckIfDaemonRunningAndCleanupStaleState,
 }))
 
