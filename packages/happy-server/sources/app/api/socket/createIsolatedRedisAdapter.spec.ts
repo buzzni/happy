@@ -336,6 +336,38 @@ describe('createIsolatedRedisAdapter', () => {
         }
     });
 
+    /*
+     * 2026-11-25 prod OOM: the adapter's restoreSession XRANGEs from the
+     * client's offset to the end of the stream with no COUNT. A client whose
+     * rooms had been quiet still held a 21-minute-old offset, and one restore
+     * pulled 111k entries (1.45GB) into a single reply.
+     */
+    it('rejects an offset older than maxDisconnectionDuration without reading the stream', async () => {
+        const now = 1_795_572_244_000;
+        const wallClock = vi.spyOn(Date, 'now').mockReturnValue(now);
+        const writer = redisConnection({
+            exec: async () => [[null, null], [null, 0]],
+            xrange: async () => [],
+        });
+        const reader = redisConnection();
+        const io = new Server({
+            connectionStateRecovery: { maxDisconnectionDuration: 120_000 },
+            adapter: createIsolatedRedisAdapter(writer.client, reader.client, {}),
+        });
+        const xrange = writer.client.xrange as unknown as ReturnType<typeof vi.fn>;
+        try {
+            await expect(io.of('/').adapter.restoreSession('pid', `${now - 120_001}-0`)).rejects.toBeDefined();
+            expect(xrange).not.toHaveBeenCalled();
+            await expect(io.of('/').adapter.restoreSession('pid', `${now - 120_000}-0`)).rejects.toBe('session or offset not found');
+            expect(xrange).toHaveBeenCalled();
+        } finally {
+            wallClock.mockRestore();
+            io.of('/').adapter.close();
+            reader.client.disconnect();
+            writer.client.disconnect();
+        }
+    });
+
     it('passes a prompt restore result through unchanged', async () => {
         const writer = redisConnection({
             exec: async () => [[null, null], [null, 0]],
