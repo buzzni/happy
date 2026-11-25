@@ -372,6 +372,19 @@ describe('execution-bound creation on a protected work machine', () => {
     await unchanged();
   });
 
+  it('returns the created session to an exact replay while draining; another proof still conflicts', async () => {
+    const token = await daemon(), proof = await signed(undefined, own);
+    const sessionId = (await createOnDevice(token, { executionProof: proof })).json().session.id;
+    await client.workMachineExecution.update({ where: { machineId: grant.machineId }, data: { drainingAt: new Date() } });
+    const replay = await createOnDevice(token, { executionProof: proof });
+    expect(replay.statusCode, replay.body).toBe(200);
+    expect(replay.json().session.id).toBe(sessionId);
+    const other = await createOnDevice(token, { executionProof: await signed(undefined, { ...own, approvalId: 'approval-2' }) });
+    expect(other.statusCode).toBe(409);
+    expect(other.json()).toEqual({ error: 'Session execution binding conflict' });
+    expect(await client.sessionExecutionBinding.count()).toBe(1); expect(state.emitted).toHaveLength(1);
+  });
+
   it('refuses a ticket for another machine or account and keeps the legacy create closed on the protected machine', async () => {
     const token = await daemon();
     for (const changes of [{ ...own, machineId: 'machine-2' }, { ...own, machineOwnerAccountId: 'personal-account' }, {}]) {

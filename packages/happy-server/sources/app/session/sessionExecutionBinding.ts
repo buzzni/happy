@@ -167,8 +167,9 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
  * the work machine and records its immutable execution binding. An exact
  * replay returns the session it created; any other use of the tag, launch,
  * nonce or operation is a conflict, as is a replay of a session outside this
- * work machine. A drain is reported as `draining`, apart from every other
- * refusal, so the daemon can say new work is paused for a migration.
+ * work machine. An exact replay is answered while draining too; a genuinely
+ * new create is then reported as `draining`, apart from every other refusal,
+ * so the daemon can say new work is paused for a migration.
  */
 export async function sessionCreateExecutionBoundOnWorkMachine(grant: WorkMachineDeviceGrant, rawBody: unknown, rawProof: unknown):
   Promise<{ session: Session } | 'denied' | 'draining'> {
@@ -182,13 +183,14 @@ export async function sessionCreateExecutionBoundOnWorkMachine(grant: WorkMachin
     try {
       return await inTx(async tx => {
         fresh(proof);
-        if (!await lockWorkMachineExecution(tx, grant, { newWork: true })) {
-          return await lockWorkMachineExecution(tx, grant) ? 'draining' as const : 'denied' as const;
-        }
+        if (!await lockWorkMachineExecution(tx, grant)) return 'denied' as const;
         const machine = await tx.machine.findUnique({ where: { id: machineId } });
         if (!machine || machine.accountId !== accountId) refuse();
+        // A replay of a create that already succeeded is not new work: it gets its
+        // session even while draining, so the daemon does not abandon the launch.
         const existing = await replayedExecutionBoundSession(tx, accountId, machine, verified, session => session.workMachineId === machineId);
         if (existing) return { session: existing };
+        if (!await lockWorkMachineExecution(tx, grant, { newWork: true })) return 'draining' as const;
         if (!await permitWorkMachineExecution(tx, grant, new Date())) return 'denied' as const;
         const session = await tx.session.create({ data: {
           accountId, tag: body.tag, metadata: body.metadata, agentState: body.agentState, workMachineId: machineId,
