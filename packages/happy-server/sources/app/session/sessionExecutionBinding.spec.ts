@@ -29,6 +29,7 @@ vi.mock('@/app/session/sessionArchive', () => ({ sessionArchive: vi.fn() }));
 import { sessionRoutes } from '@/app/api/routes/sessionRoutes';
 import { machineSessionOwnerRoutes } from '@/app/api/routes/machineSessionOwnerRoutes';
 import { createExecutionBoundSession } from '@/app/session/sessionExecutionBinding';
+import { auth } from '@/app/auth/auth';
 
 const studio = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(1));
 const device = nacl.sign.keyPair.fromSeed(new Uint8Array(32).fill(2));
@@ -311,5 +312,77 @@ describe('Happy execution create / lookup boundary against isolated PostgreSQL',
     await client.session.update({ where: { id }, data: { metadata: 'new-ciphertext' } });
     const retry = await create(proof); expect(retry.statusCode).toBe(200); expect(retry.json().session.metadata).toBe('new-ciphertext');
     expect(await client.sessionExecutionBinding.count()).toBe(1);
+  });
+});
+
+describe('execution-bound creation on a protected work machine', () => {
+  const grant = { accountId: 'company-account', machineId: 'machine-1', deviceId: 'device-a', generation: 1 };
+  const own = { sessionOwnerAccountId: 'company-account' };
+  let priorSecret: string | undefined;
+  beforeAll(async () => {
+    priorSecret = process.env.HANDY_MASTER_SECRET;
+    process.env.HANDY_MASTER_SECRET = 'work-machine-loopback-test-only';
+    await auth.init();
+  });
+  afterAll(() => { if (priorSecret === undefined) delete process.env.HANDY_MASTER_SECRET; else process.env.HANDY_MASTER_SECRET = priorSecret; });
+  beforeEach(async () => { await client.workMachineExecution.create({ data: grant }); });
+  async function daemon(device: typeof grant = grant) {
+    const now = Date.now();
+    return auth.workMachineExecutionIssuer!.mint({ ...device, purpose: 'daemon', expiresAt: now + 60000 }, now);
+  }
+  function createOnDevice(token: string, extra: Record<string, unknown>, body: unknown = fixture.createBody) {
+    return app.inject({ method: 'POST', url: '/v1/sessions', headers: { authorization: `Bearer ${token}` }, payload: { ...(body as object), ...extra } });
+  }
+  const authority = () => client.workMachineExecution.findUniqueOrThrow({ where: { machineId: grant.machineId } });
+
+  it('creates the session, its execution binding and the first execution with the current device credential', async () => {
+    const token = await daemon(), proof = await signed(undefined, own);
+    const first = await createOnDevice(token, { executionProof: proof });
+    expect(first.statusCode, first.body).toBe(200);
+    const sessionId = first.json().session.id;
+    expect(await client.session.findUniqueOrThrow({ where: { id: sessionId } }))
+      .toMatchObject({ accountId: 'company-account', workMachineId: 'machine-1', metadata: fixture.createBody.metadata });
+    expect(await client.sessionExecutionBinding.findUniqueOrThrow({ where: { sessionId } })).toMatchObject({
+      sessionRowId: sessionId, machineId: 'machine-1', machineRowId: 'machine-1', machineOwnerAccountId: 'company-account',
+      sessionOwnerAccountId: 'company-account', launchId: 'launch-1', initialNonce: proof.ticket.body.initialNonce,
+    });
+    expect((await authority()).firstExecutionAt).not.toBeNull();
+    expect(state.emitted).toHaveLength(1);
+
+    // Only an exact replay returns the same session; another proof for the launch is a conflict.
+    const retry = await createOnDevice(token, { executionProof: proof });
+    expect(retry.statusCode).toBe(200); expect(retry.json().session.id).toBe(sessionId);
+    expect((await createOnDevice(token, { executionProof: await signed(undefined, { ...own, approvalId: 'approval-2' }) })).statusCode).toBe(409);
+    expect(await client.sessionExecutionBinding.count()).toBe(1); expect(state.emitted).toHaveLength(1);
+    // Ownership-bound creation stays off the device path.
+    expect((await createOnDevice(token, { ownershipProof: {} }, { ...fixture.createBody, tag: 'ownership' })).statusCode).toBe(403);
+  });
+
+  it('refuses new execution-bound work while draining, frozen or after the generation moved', async () => {
+    const token = await daemon(), proof = await signed(undefined, own);
+    await client.workMachineExecution.update({ where: { machineId: grant.machineId }, data: { drainingAt: new Date() } });
+    const drained = await createOnDevice(token, { executionProof: proof });
+    expect(drained.statusCode).toBe(409);
+    expect(drained.json()).toEqual({ error: 'Work machine is draining', reason: 'work-machine-draining' });
+    await client.workMachineExecution.update({ where: { machineId: grant.machineId }, data: { frozenAt: new Date() } });
+    expect((await createOnDevice(token, { executionProof: proof })).statusCode).toBe(403);
+    await client.workMachineExecution.update({ where: { machineId: grant.machineId }, data: { drainingAt: null, frozenAt: null, deviceId: 'device-b', generation: 2 } });
+    expect((await createOnDevice(token, { executionProof: proof })).statusCode).toBe(403);
+    expect((await authority()).firstExecutionAt).toBeNull();
+    await unchanged();
+  });
+
+  it('refuses a ticket for another machine or account and keeps the legacy create closed on the protected machine', async () => {
+    const token = await daemon();
+    for (const changes of [{ ...own, machineId: 'machine-2' }, { ...own, machineOwnerAccountId: 'personal-account' }, {}]) {
+      expect((await createOnDevice(token, { executionProof: await signed(undefined, changes) })).statusCode).toBe(403);
+    }
+    // A device credential of a machine without device authority.
+    const other = await daemon({ ...grant, machineId: 'machine-2' });
+    expect((await createOnDevice(other, { executionProof: await signed(undefined, { ...own, machineId: 'machine-2' }) })).statusCode).toBe(403);
+    // The account bearer cannot create an execution-bound session on the protected machine.
+    expect((await create(await signed(undefined, own), undefined, 'company-account')).statusCode).toBe(403);
+    expect((await authority()).firstExecutionAt).toBeNull();
+    await unchanged();
   });
 });

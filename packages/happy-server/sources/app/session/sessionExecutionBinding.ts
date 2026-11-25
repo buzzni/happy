@@ -9,7 +9,9 @@ import {
 import { inTx, afterTx } from '@/storage/inTx';
 import { eventRouter, buildNewSessionUpdate } from '@/app/events/eventRouter';
 import { randomKeyNaked } from '@/utils/randomKeyNaked';
-import { lockLegacyWorkMachineExecution } from '@/app/machine/workMachineExecution';
+import {
+  lockLegacyWorkMachineExecution, lockWorkMachineExecution, permitWorkMachineExecution, type WorkMachineDeviceGrant,
+} from '@/app/machine/workMachineExecution';
 
 export class ExecutionBindingError extends Error {
   constructor(readonly statusCode: 400 | 403 | 409 | 503, message: string) { super(message); }
@@ -143,6 +145,63 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
     } catch (error) {
       // A concurrent identical create can lose either unique constraint. Re-read,
       // reauthorize and apply the same replay predicate in a new transaction.
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002' && attempt < 2) continue;
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') conflict();
+      throw error;
+    }
+  }
+}
+
+/**
+ * An organization account rotation launch on a protected (work-machine
+ * enrolled) machine. The daemon creates the session with its device
+ * credential instead of the account bearer, so "this device is current" comes
+ * from the live grant and generation rather than the legacy lock. The rest of
+ * the execution relation is kept: the Studio-signed ticket and the device's
+ * create proof are verified as for the legacy create, the ticket must name
+ * this machine, and both the machine and the session belong to the grant's
+ * account.
+ *
+ * One transaction locks the generation as new work (refused while it drains
+ * or is frozen), records its first execution, creates the session attached to
+ * the work machine and records its immutable execution binding. An exact
+ * replay returns the session it created; any other use of the tag, launch,
+ * nonce or operation is a conflict, as is a replay of a session outside this
+ * work machine. A drain is reported as `draining`, apart from every other
+ * refusal, so the daemon can say new work is paused for a migration.
+ */
+export async function sessionCreateExecutionBoundOnWorkMachine(grant: WorkMachineDeviceGrant, rawBody: unknown, rawProof: unknown):
+  Promise<{ session: Session } | 'denied' | 'draining'> {
+  const { accountId, machineId } = grant;
+  const verified = await verifySessionExecutionCreate(accountId, rawBody, rawProof);
+  const { body, proof } = verified;
+  const ticket = proof.ticket.body;
+  if (ticket.machineId !== machineId || ticket.machineOwnerAccountId !== accountId) refuse();
+  if ((body.piiMode ?? 'none') !== 'none') refuse();
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await inTx(async tx => {
+        fresh(proof);
+        if (!await lockWorkMachineExecution(tx, grant, { newWork: true })) {
+          return await lockWorkMachineExecution(tx, grant) ? 'draining' as const : 'denied' as const;
+        }
+        const machine = await tx.machine.findUnique({ where: { id: machineId } });
+        if (!machine || machine.accountId !== accountId) refuse();
+        const existing = await replayedExecutionBoundSession(tx, accountId, machine, verified, session => session.workMachineId === machineId);
+        if (existing) return { session: existing };
+        if (!await permitWorkMachineExecution(tx, grant, new Date())) return 'denied' as const;
+        const session = await tx.session.create({ data: {
+          accountId, tag: body.tag, metadata: body.metadata, agentState: body.agentState, workMachineId: machineId,
+          dataEncryptionKey: body.dataEncryptionKey ? new Uint8Array(Buffer.from(body.dataEncryptionKey, 'base64')) : undefined,
+        } });
+        await bindSessionExecution(tx, session, accountId, machine, verified);
+        const account = await tx.account.update({ where: { id: accountId }, data: { seq: { increment: 1 } }, select: { seq: true } });
+        fresh(proof);
+        afterTx(tx, () => eventRouter.emitUpdate({ userId: accountId,
+          payload: buildNewSessionUpdate(session, account.seq, randomKeyNaked(12)), recipientFilter: { type: 'user-scoped-only' }, sessionProtection: session.piiProtection }));
+        return { session };
+      });
+    } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002' && attempt < 2) continue;
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') conflict();
       throw error;
