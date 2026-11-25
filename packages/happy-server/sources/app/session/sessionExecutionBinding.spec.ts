@@ -408,4 +408,38 @@ describe('execution-bound creation on a protected work machine', () => {
     await client.workMachineExecution.update({ where: { machineId: grant.machineId }, data: { frozenAt: new Date() } });
     expect((await ask(token)).statusCode).toBe(403);
   });
+
+  function lookup(headers: Record<string, string>, changes: Record<string, unknown> = {}, ticket = fixture.executionProof.ticket.body) {
+    return app.inject({ method: 'POST', url: '/v1/machine-sessions/execution-lookup', headers,
+      payload: { companyId: ticket.companyId, machineId: ticket.machineId, launchId: ticket.launchId, initialNonce: ticket.initialNonce, ...changes } });
+  }
+
+  it('looks up the session a launch created without creating one', async () => {
+    const token = await daemon(), proof = await signed(undefined, own);
+    const device = { authorization: `Bearer ${token}` };
+    expect((await lookup(device, {}, proof.ticket.body)).json()).toEqual({ session: null });
+    const created = (await createOnDevice(token, { executionProof: proof })).json().session;
+    const found = await lookup(device, {}, proof.ticket.body);
+    expect(found.statusCode, found.body).toBe(200);
+    expect(found.json()).toEqual({ session: {
+      id: created.id, seq: created.seq, metadata: created.metadata, metadataVersion: created.metadataVersion,
+      agentState: created.agentState, agentStateVersion: created.agentStateVersion, dataEncryptionKey: created.dataEncryptionKey,
+    } });
+    expect((await lookup({ 'x-test-account': 'company-account' }, {}, proof.ticket.body)).json().session.id).toBe(created.id);
+    for (const change of [{ launchId: 'launch-2' }, { companyId: 'company-2' }, { initialNonce: rotationBase64url(new Uint8Array(32).fill(8)) }]) {
+      expect((await lookup(device, change, proof.ticket.body)).json()).toEqual({ session: null });
+    }
+    expect((await lookup({ 'x-test-account': 'outsider' }, {}, proof.ticket.body)).json()).toEqual({ session: null });
+    // Another machine's credential, or a frozen generation.
+    expect((await lookup({ authorization: `Bearer ${await daemon({ ...grant, machineId: 'machine-2' })}` }, {}, proof.ticket.body)).statusCode).toBe(403);
+    await client.workMachineExecution.update({ where: { machineId: grant.machineId }, data: { frozenAt: new Date() } });
+    expect((await lookup(device, {}, proof.ticket.body)).statusCode).toBe(403);
+    expect(await client.session.count()).toBe(2); expect(state.emitted).toHaveLength(1);
+  });
+
+  it('does not hand the machine account a session another account owns', async () => {
+    await client.workMachineExecution.delete({ where: { machineId: grant.machineId } });
+    expect((await create(await signed())).statusCode).toBe(200);
+    expect((await lookup({ 'x-test-account': 'company-account' })).json()).toEqual({ session: null });
+  });
 });

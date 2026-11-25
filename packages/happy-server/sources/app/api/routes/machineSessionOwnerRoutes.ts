@@ -99,4 +99,41 @@ export function machineSessionOwnerRoutes(app: Fastify) {
         } });
     });
 
+    // Recovery of an initial rotation create whose answer was lost: the session the launch
+    // made, if any, of the caller's own account on the caller's own machine. It never creates
+    // one, so a protected machine's daemon can recover without its proof still being fresh.
+    // The snapshot is what the daemon needs to attach to the session; the device credential
+    // reads no other session row.
+    app.post('/v1/machine-sessions/execution-lookup', {
+        preHandler: accountOrMachineDaemon,
+        schema: {
+            body: ExecutionOwnerRequestSchema,
+            response: { 200: z.object({ session: z.object({
+                id: z.string(), seq: z.number(), metadata: z.string(), metadataVersion: z.number(),
+                agentState: z.string().nullable(), agentStateVersion: z.number(), dataEncryptionKey: z.string().nullable(),
+            }).nullable() }) },
+        },
+    }, async (request, reply) => {
+        const { companyId, machineId, launchId, initialNonce } = request.body;
+        const binding = await db.sessionExecutionBinding.findFirst({
+            where: {
+                companyId, machineId, launchId, initialNonce,
+                machineOwnerAccountId: request.userId, sessionOwnerAccountId: request.userId,
+                machine: { is: { id: machineId, accountId: request.userId } },
+                session: { is: {
+                    ...piiSessionVisibility(request), accountId: request.userId,
+                    ...(request.workMachineDaemonGrant ? { workMachineId: machineId } : {}),
+                } },
+            },
+            select: { session: true },
+        });
+        const session = binding?.session;
+        if (!session) return reply.send({ session: null });
+        return reply.send({ session: {
+            id: session.id, seq: session.seq, metadata: session.metadata, metadataVersion: session.metadataVersion,
+            agentState: session.agentState, agentStateVersion: session.agentStateVersion,
+            dataEncryptionKey: session.dataEncryptionKey ? Buffer.from(session.dataEncryptionKey).toString('base64') : null,
+        } });
+    });
+
 }
