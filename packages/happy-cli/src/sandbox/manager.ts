@@ -27,6 +27,13 @@ function withoutRuntimeMandatoryDenies(config: SandboxRuntimeConfig, cwd: string
     };
 }
 
+/**
+ * ego lite 는 사용자 로그인 세션이 있는 브라우저라, 네트워크를 막거나 도메인을 제한한 샌드박스에서
+ * 열면 그 제한을 브라우저로 우회하게 된다. 그래서 네트워크가 열린 경우에만 부트스트랩을 연다.
+ * SandboxManager 가 프로세스 단위 싱글턴이므로 같은 수명으로 둔다.
+ */
+let egoBrowserAllowed = false;
+
 export async function initializeSandbox(
     sandboxConfig: SandboxConfig,
     sessionPath: string,
@@ -38,8 +45,10 @@ export async function initializeSandbox(
         process.cwd(),
     );
     await SandboxManager.initialize(runtimeConfig);
+    egoBrowserAllowed = sandboxConfig.networkMode === 'allowed';
 
     return async () => {
+        egoBrowserAllowed = false;
         await SandboxManager.reset();
     };
 }
@@ -47,7 +56,7 @@ export async function initializeSandbox(
 export async function wrapCommand(command: string): Promise<string> {
     // macOS seatbelt 는 Electron 부팅에 필요한 mach 서비스를 닫아 둔다 — electronSeatbelt.ts 참조.
     // Linux(bwrap) 등 다른 래퍼에는 손대지 않는다.
-    return allowElectronInSeatbelt(await SandboxManager.wrapWithSandbox(command));
+    return allowElectronInSeatbelt(await SandboxManager.wrapWithSandbox(command), { egoBrowser: egoBrowserAllowed });
 }
 
 export async function wrapForMcpTransport(
