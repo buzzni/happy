@@ -261,7 +261,7 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
             return reply.code(403).send({ error: 'Work machine enrollment not authorized' });
         }
         const enrolled = await enrollWorkMachineExecution(db, {
-            machineId, accountId: request.userId, deviceId, ownerUserId, sessionIds, studioAttributedSessionIds,
+            machineId, accountId: request.userId, deviceId, ownerUserIds: [ownerUserId], sessionIds, studioAttributedSessionIds,
         });
         if ('reason' in enrolled) return reply.code(409).send({ error: 'Work machine enrollment not ready', ...enrolled });
         return reply.header('Cache-Control', 'no-store').send(enrolled);

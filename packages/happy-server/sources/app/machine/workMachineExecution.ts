@@ -38,18 +38,19 @@ function refuse(reason: WorkMachineEnrollmentRefusalReason, sessionIds?: string[
 /**
  * Makes the CLI-signed session inventory the work machine's conversations.
  * A conversation with an ownership binding must be confirmed for this machine
- * and owner. One without a binding (ownership tracking off when it was
- * created) is accepted only if Studio attributes it to this machine and owner
- * in its signed request (`studioAttributedSessionIds`) and it belongs to the
- * machine account.
+ * and one of the accepted owners. One without a binding (ownership tracking
+ * off when it was created) is accepted only if Studio attributes it to this
+ * machine and the accepted owners in its signed request
+ * (`studioAttributedSessionIds`) and it belongs to the machine account.
  */
 export async function enrollWorkMachineExecution(
     db: Pick<PrismaClient, '$transaction'>,
     input: Omit<WorkMachineDeviceGrant, 'generation'> & {
-        ownerUserId: string; sessionIds: string[]; studioAttributedSessionIds?: string[];
+        ownerUserIds: string[]; sessionIds: string[]; studioAttributedSessionIds?: string[];
     },
 ): Promise<WorkMachineDeviceGrant | WorkMachineEnrollmentRefusal> {
-    const { accountId, machineId, deviceId, ownerUserId, sessionIds } = input;
+    const { accountId, machineId, deviceId, sessionIds } = input;
+    const owners = new Set(input.ownerUserIds);
     const attributed = new Set(input.studioAttributedSessionIds ?? []);
     try {
         return await db.$transaction(async tx => {
@@ -85,7 +86,7 @@ export async function enrollWorkMachineExecution(
                 .filter(binding => binding.machineId !== machineId || binding.machineAccountId !== accountId)
                 .map(binding => binding.sessionId))
                 ?? failing('unconfirmed-binding', bindings.filter(binding => !binding.confirmedAt).map(binding => binding.sessionId))
-                ?? failing('owner-mismatch', bindings.filter(binding => binding.ownerUserId !== ownerUserId).map(binding => binding.sessionId))
+                ?? failing('owner-mismatch', bindings.filter(binding => !owners.has(binding.ownerUserId)).map(binding => binding.sessionId))
                 ?? failing('account-mismatch', bindings.filter(binding => binding.sessionAccountId !== accountId).map(binding => binding.sessionId))
                 ?? failing('unattributed-sessions', sessionIds.filter(id => !bound.has(id) && !attributed.has(id)));
             if (bindingRefusal) return bindingRefusal;
