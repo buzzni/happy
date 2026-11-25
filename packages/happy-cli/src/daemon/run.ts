@@ -387,7 +387,7 @@ import { mergeAdditionalDirectoriesIntoSandboxEnvironment, readAdditionalDirecto
 import { resolveSandboxTrustFloor } from '@/sandbox/config';
 import { createAutomationContextWorkspace } from './automations/automationContextWorkspace';
 import { manualLaunchRefusal } from './manualLaunchRefusal';
-import { createAutomationContextAccount } from './automations/automationContextAccount';
+import { AccountProfileUnavailableError, createAutomationContextAccount, createLateAutomationContext } from './automations/automationContextAccount';
 import { createAutomationContextHost, prepareAutomationContextTick } from './automations/automationContextHost';
 import { createAutomationContextReferenceReader } from './automations/automationContextReference';
 import { createAutomationQuestionWorker, withAutomationQuestionWorker } from './automations/automationQuestionWorker';
@@ -2129,11 +2129,16 @@ export async function startDaemon(): Promise<void> {
       if (runtime) for (const recovered of await runtime.recoverLaunches()) sessionIdToFinishedSession.set(recovered.happySessionId!, recovered);
       return runtime;
     };
-    const authenticatedAccountId = async (token: string): Promise<string> => {
+    // Rotation treats any failed answer as a refusal; the automation-context lookup instead retries a server
+    // that is up but not ready (5xx, a captive-portal page), so it opts in to telling those apart.
+    const authenticatedAccountId = async (token: string, options: { retryUnready?: boolean } = {}): Promise<string> => {
       const response = await fetch(`${configuration.serverUrl}/v1/account/profile`, { headers: { Authorization: `Bearer ${token}` },
         redirect: 'error', signal: AbortSignal.timeout(15000) });
+      if (options.retryUnready && response.status >= 500) throw new AccountProfileUnavailableError(`HTTP ${response.status}`);
       if (!response.ok) throw new MachineRotationError('FORBIDDEN');
-      const value = await response.json() as { id?: unknown };
+      const value = await response.json().catch((error: unknown) => {
+        throw options.retryUnready ? new AccountProfileUnavailableError('response is not JSON') : error;
+      }) as { id?: unknown };
       if (typeof value.id !== 'string' || !value.id || value.id.length > 128) throw new MachineRotationError('FORBIDDEN');
       return value.id;
     };
@@ -5696,99 +5701,90 @@ export async function startDaemon(): Promise<void> {
         } } : {}) }) });
     let contextAccountId: string | null = null;
     let contextJournal: ReturnType<typeof createAutomationContextLaunchJournal> | null = null;
-    let contextHost: ReturnType<typeof createAutomationContextHost> | null = null;
-    let questionWorker: ReturnType<typeof createAutomationQuestionWorker> | null = null;
     const contextAccount = createAutomationContextAccount({
-      lookup: () => authenticatedAccountId(credentials.token), log: message => logger.warn(message),
+      lookup: () => authenticatedAccountId(credentials.token, { retryUnready: true }), log: message => logger.warn(message),
     });
     // Offline at start (e.g. DNS not up after a wake) leaves the host null — isolated admission stays
     // closed — and each automation tick asks again; a rejected credential still fails the start.
-    // One build at a time: a stalled tick can be abandoned while its lookup is still pending.
-    let contextBuild: Promise<void> | null = null;
-    const establishAutomationContext = (): Promise<void> => contextBuild ??= buildAutomationContext().finally(() => { contextBuild = null; });
-    const buildAutomationContext = async (): Promise<void> => {
-      if (contextHost || !contextWorkspace || !trustedStudioOrigin) return;
+    const lateContext = contextWorkspace && trustedStudioOrigin ? createLateAutomationContext({
       // A protected daemon's device credential cannot read the account profile; its binding names the account.
-      const accountId = executionBinding?.accountId ?? await contextAccount.get();
-      if (!accountId) return;
-      const journal = createAutomationContextLaunchJournal(configuration.happyHomeDir);
-      const contextReference = createAutomationContextReferenceReader({
-        serverUrl: configuration.serverUrl, token: credentials.token, accountId, machineId, journal,
-        ...(credentials.encryption.type === 'legacy' ? { legacySecret: credentials.encryption.secret } : {}),
-      });
-      contextAccountId = accountId;
-      contextJournal = journal;
-      const host = createAutomationContextHost({
-        accountId, machineId, happyOrigin: configuration.serverUrl,
-        api, workspace: contextWorkspace, journal, resolvePreviousResult: contextReference.resolve,
-        runtimeStore: serverAutomationRuntimeStore,
-        discover: async sessionId => isAutomationSessionRunning(sessionId) ? 'running' : 'unconfirmed',
-        heartbeat: run => apiMachine.serverAutomationTransport().heartbeat(run),
-        log: message => logger.warn(message),
-        transportForRun: async run => contextTransportForRun(run),
-        reportExit: async (run, record) => { await contextTransportForRun(run).reportExit(record); },
-        stopExecution: async ({ sessionId, directory }) => {
-          if (!launchReadiness.isReady()) throw new Error('AUTOMATION_STOP_TARGET_UNCONFIRMED');
-          const tracked = findTrackedSessionById(sessionId);
-          const localDirectory = tracked?.happySessionMetadataFromLocalWebhook?.path ?? tracked?.directory;
-          if (!tracked?.encryption || !localDirectory || await resolveAutomationDirectoryMatch(localDirectory, directory) !== true) {
-            throw new Error('AUTOMATION_STOP_TARGET_UNCONFIRMED');
-          }
-          await stopSessionWithExitVerification(sessionId, { source: 'server-automation', reason: 'Automation execution cancellation requested' });
-        },
-        resolveContext: async run => {
-          // Deferred work obtains a new principal/environment; persisted bearer grants and credentials are never reused.
-          const common = { configUrl: `${trustedStudioOrigin}/api/me/mcp-config`, machineToken: credentials.token, machineId,
-            runId: run.runId, claimToken: run.claimToken,
-            ...(run.payload.executionQuestion ? { conversationSessionId: run.payload.conversation!.sessionId, conversationDirectory: run.payload.directory } : {}) };
-          const authority = await fetchAutomationProjectEnvironment({ ...common,
-            conversationSessionId: run.payload.conversation!.sessionId, conversationDirectory: run.payload.directory });
-          if (!authority.ok) throw new Error(authority.unreachable ? 'AUTOMATION_STUDIO_ADMISSION_UNCONFIRMED' : 'AUTOMATION_CONTEXT_AUTHORITY_DENIED');
-          const grant = await exchangeAutomationMcpCallerGrant(common);
-          if (!grant.ok) throw new Error(grant.unreachable ? 'AUTOMATION_STUDIO_ADMISSION_UNCONFIRMED' : 'AUTOMATION_CONTEXT_AUTHORITY_DENIED');
-          const context = grant.value;
-          if (!context || context.connectorPolicy !== 'optional' || context.requiredConnectors.length) throw new Error('AUTOMATION_CONTEXT_POLICY_UNSUPPORTED');
-          const preflight = await preflightAutomationConnectors({ ...common, context });
-          if (!preflight.ok) logger.debug(`[automation-context] Deferred optional connectors unavailable run=${run.runId} code=${preflight.code}`);
-          return { environmentVariables: authority.environmentVariables, mcpSpawnContext: context };
-        },
-        start: async (options, context, observeChild) => {
-          contextOwnedChildren.set(options, observeChild);
-          try { return await ownedStartGuard.start(options, () => spawnSessionAdmitted(options, context.mcpSpawnContext)); }
-          finally { contextOwnedChildren.delete(options); }
-        },
-      });
-      questionWorker = createAutomationQuestionWorker({
-        // The current daemon credential: on a protected machine the wmx_ token, which renewals replace.
-        home: configuration.happyHomeDir, serverUrl: configuration.serverUrl, token: () => credentials.token,
-        accountId, machineId, journal, host, runtimeStore: serverAutomationRuntimeStore,
-        transport: apiMachine.serverAutomationTransport(), log: message => logger.warn(message),
-        decode: question => trustedServerAutomationPayload({ automationId: question.automationId, generation: question.generation,
-          revision: question.revision, ...question.encrypted, paused: true, enabledAt: 0 }, {
-          machineSecretKey: machineAutomationKey.secretKey, trust: payloadTrust, machineId,
-          questionIdentity: { requestId: question.requestId, sourceRunId: question.sourceRunId },
-          onUnauthenticated: () => recordUnauthenticated(`automation question ${question.requestId}`),
-        }),
-      });
-      contextHost = host;
-    };
-    await establishAutomationContext();
-    const initialContextAdmission = await prepareAutomationContextTick(contextHost, new AbortController().signal,
-      message => logger.warn(message), questionWorker);
+      accountId: async () => executionBinding?.accountId ?? await contextAccount.get(),
+      log: message => logger.warn(message),
+      build: accountId => {
+        const journal = createAutomationContextLaunchJournal(configuration.happyHomeDir);
+        const contextReference = createAutomationContextReferenceReader({
+          serverUrl: configuration.serverUrl, token: credentials.token, accountId, machineId, journal,
+          ...(credentials.encryption.type === 'legacy' ? { legacySecret: credentials.encryption.secret } : {}),
+        });
+        contextAccountId = accountId;
+        contextJournal = journal;
+        const host = createAutomationContextHost({
+          accountId, machineId, happyOrigin: configuration.serverUrl,
+          api, workspace: contextWorkspace, journal, resolvePreviousResult: contextReference.resolve,
+          runtimeStore: serverAutomationRuntimeStore,
+          discover: async sessionId => isAutomationSessionRunning(sessionId) ? 'running' : 'unconfirmed',
+          heartbeat: run => apiMachine.serverAutomationTransport().heartbeat(run),
+          log: message => logger.warn(message),
+          transportForRun: async run => contextTransportForRun(run),
+          reportExit: async (run, record) => { await contextTransportForRun(run).reportExit(record); },
+          stopExecution: async ({ sessionId, directory }) => {
+            if (!launchReadiness.isReady()) throw new Error('AUTOMATION_STOP_TARGET_UNCONFIRMED');
+            const tracked = findTrackedSessionById(sessionId);
+            const localDirectory = tracked?.happySessionMetadataFromLocalWebhook?.path ?? tracked?.directory;
+            if (!tracked?.encryption || !localDirectory || await resolveAutomationDirectoryMatch(localDirectory, directory) !== true) {
+              throw new Error('AUTOMATION_STOP_TARGET_UNCONFIRMED');
+            }
+            await stopSessionWithExitVerification(sessionId, { source: 'server-automation', reason: 'Automation execution cancellation requested' });
+          },
+          resolveContext: async run => {
+            // Deferred work obtains a new principal/environment; persisted bearer grants and credentials are never reused.
+            const common = { configUrl: `${trustedStudioOrigin}/api/me/mcp-config`, machineToken: credentials.token, machineId,
+              runId: run.runId, claimToken: run.claimToken,
+              ...(run.payload.executionQuestion ? { conversationSessionId: run.payload.conversation!.sessionId, conversationDirectory: run.payload.directory } : {}) };
+            const authority = await fetchAutomationProjectEnvironment({ ...common,
+              conversationSessionId: run.payload.conversation!.sessionId, conversationDirectory: run.payload.directory });
+            if (!authority.ok) throw new Error(authority.unreachable ? 'AUTOMATION_STUDIO_ADMISSION_UNCONFIRMED' : 'AUTOMATION_CONTEXT_AUTHORITY_DENIED');
+            const grant = await exchangeAutomationMcpCallerGrant(common);
+            if (!grant.ok) throw new Error(grant.unreachable ? 'AUTOMATION_STUDIO_ADMISSION_UNCONFIRMED' : 'AUTOMATION_CONTEXT_AUTHORITY_DENIED');
+            const context = grant.value;
+            if (!context || context.connectorPolicy !== 'optional' || context.requiredConnectors.length) throw new Error('AUTOMATION_CONTEXT_POLICY_UNSUPPORTED');
+            const preflight = await preflightAutomationConnectors({ ...common, context });
+            if (!preflight.ok) logger.debug(`[automation-context] Deferred optional connectors unavailable run=${run.runId} code=${preflight.code}`);
+            return { environmentVariables: authority.environmentVariables, mcpSpawnContext: context };
+          },
+          start: async (options, context, observeChild) => {
+            contextOwnedChildren.set(options, observeChild);
+            try { return await ownedStartGuard.start(options, () => spawnSessionAdmitted(options, context.mcpSpawnContext)); }
+            finally { contextOwnedChildren.delete(options); }
+          },
+        });
+        const worker = createAutomationQuestionWorker({
+          // The current daemon credential: on a protected machine the wmx_ token, which renewals replace.
+          home: configuration.happyHomeDir, serverUrl: configuration.serverUrl, token: () => credentials.token,
+          accountId, machineId, journal, host, runtimeStore: serverAutomationRuntimeStore,
+          transport: apiMachine.serverAutomationTransport(), log: message => logger.warn(message),
+          decode: question => trustedServerAutomationPayload({ automationId: question.automationId, generation: question.generation,
+            revision: question.revision, ...question.encrypted, paused: true, enabledAt: 0 }, {
+            machineSecretKey: machineAutomationKey.secretKey, trust: payloadTrust, machineId,
+            questionIdentity: { requestId: question.requestId, sourceRunId: question.sourceRunId },
+            onUnauthenticated: () => recordUnauthenticated(`automation question ${question.requestId}`),
+          }),
+        });
+        return { host, worker };
+      },
+    }) : null;
+    await lateContext?.establish();
+    const initialContextAdmission = await prepareAutomationContextTick(lateContext?.host() ?? null, new AbortController().signal,
+      message => logger.warn(message), lateContext?.worker() ?? null);
     apiMachine.setAutomationContextIsolationReady(initialContextAdmission.isolatedContextReady);
     let questionsReady = initialContextAdmission.isolatedContextReady;
-    let lastContextFailure = '';
     const scheduledServerAutomationTickRunner = createAutomationTickRunner({
       // Windows standalone: sessions launch through the verified Job owner, so scheduled
       // sessions run; script gates and GitHub triggers would spawn unfenced cmd/gh/git.
       runTick: async (signal) => {
-        await establishAutomationContext().then(() => { lastContextFailure = ''; }, error => {
-          // Retried every tick; report a refusal once rather than every heartbeat.
-          const message = error instanceof Error ? error.message : String(error);
-          if (message !== lastContextFailure) logger.warn(`[automation-context] Account lookup failed: ${message}`);
-          lastContextFailure = message;
-        });
-        const contextAdmission = await prepareAutomationContextTick(contextHost, signal, message => logger.warn(message), questionWorker);
+        await lateContext?.retry();
+        const contextAdmission = await prepareAutomationContextTick(lateContext?.host() ?? null, signal, message => logger.warn(message),
+          lateContext?.worker() ?? null);
         if (signal.aborted) return;
         apiMachine.setAutomationContextIsolationReady(contextAdmission.isolatedContextReady);
         questionsReady = contextAdmission.isolatedContextReady;
@@ -5965,10 +5961,9 @@ export async function startDaemon(): Promise<void> {
       // 각자 상한이 있다). 이를 10배 넘기면 끝나지 않는 await 다 — 버리고 새로 시작한다.
       stalledAfterMs: SERVER_AUTOMATION_TICK_STALL_MS,
     });
-    // The worker may appear after start (see establishAutomationContext), so read it at each run.
-    const serverAutomationTickRunner = withAutomationQuestionWorker(scheduledServerAutomationTickRunner,
-      contextWorkspace && trustedStudioOrigin ? { ready: () => questionWorker!.ready(), maintain: signal => questionWorker!.maintain(signal) } : null, {
-      isReady: () => questionsReady && questionWorker !== null, log: message => logger.warn(message),
+    // The worker may appear after start (see createLateAutomationContext), so it is read at each run.
+    const serverAutomationTickRunner = withAutomationQuestionWorker(scheduledServerAutomationTickRunner, lateContext?.questions ?? null, {
+      isReady: () => questionsReady && !!lateContext?.worker(), log: message => logger.warn(message),
     });
     const sessionFollowupSyncState = createSessionFollowupSyncState();
     const sessionFollowupTickRunner = createAutomationTickRunner({
