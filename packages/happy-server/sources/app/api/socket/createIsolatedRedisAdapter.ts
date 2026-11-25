@@ -88,6 +88,19 @@ export function createIsolatedRedisAdapter(
         const adapter = create(namespace);
         const restoreSession = adapter.restoreSession.bind(adapter);
         adapter.restoreSession = (pid, offset) => {
+            /*
+             * The adapter XRANGEs from the client's offset to the end of the
+             * stream with no COUNT, and a client whose rooms stayed quiet keeps
+             * an old offset. On 2026-11-25 one 21-minute-old offset pulled
+             * 1.45GB in a single reply and the replica was OOMKilled. The
+             * session lives at most maxDisconnectionDuration, so an offset older
+             * than that is not a brief disconnect: reconnect without recovery.
+             */
+            const maxDisconnectionDuration = namespace.server.opts.connectionStateRecovery?.maxDisconnectionDuration;
+            if (maxDisconnectionDuration !== undefined
+                && Number(offset.split('-')[0]) < Date.now() - maxDisconnectionDuration) {
+                return Promise.reject('offset older than maxDisconnectionDuration');
+            }
             let timer: NodeJS.Timeout | undefined;
             // Rejecting is how the adapter itself reports "nothing to restore";
             // socket.io catches it and connects the client fresh.
