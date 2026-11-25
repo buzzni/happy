@@ -1,4 +1,4 @@
-import { Prisma } from '@prisma/client';
+import { Prisma, type Session } from '@prisma/client';
 import {
   HappySessionExecutionProofSchema, RotationOriginSchema, SessionExecutionCreateBodySchema,
   rotationDecodeBinary, rotationDigest, rotationIsFresh, rotationSha256,
@@ -53,6 +53,50 @@ function fresh(proof: HappySessionExecutionProof) {
   const now = Date.now();
   if (!rotationIsFresh(proof.ticket.body, now) || !rotationIsFresh(proof.deviceProof.body, now)) refuse();
 }
+type VerifiedExecutionCreate = Awaited<ReturnType<typeof verifySessionExecutionCreate>>;
+
+/**
+ * The session an exact replay of this verified create already made, or `null`
+ * when neither its tag nor its launch, nonce or operation is taken. Anything
+ * else is a conflict. `sameSession` narrows which existing session counts.
+ */
+async function replayedExecutionBoundSession(tx: Prisma.TransactionClient, ownerAccountId: string,
+  machine: { id: string; accountId: string }, verified: VerifiedExecutionCreate, sameSession: (existing: Session) => boolean) {
+  const { body, proof, ticketDigest, createProofDigest } = verified;
+  const ticket = proof.ticket.body;
+  const existing = await tx.session.findUnique({ where: { accountId_tag: { accountId: ownerAccountId, tag: body.tag } } });
+  const binding = await tx.sessionExecutionBinding.findFirst({ where: { OR: [
+    { companyId: ticket.companyId, machineId: ticket.machineId, launchId: ticket.launchId },
+    { companyId: ticket.companyId, initialNonce: ticket.initialNonce },
+    { companyId: ticket.companyId, machineId: ticket.machineId, operationId: ticket.operationId },
+  ] } });
+  if (!existing && !binding) return null;
+  if (existing && binding && sameSession(existing) && binding.sessionId === existing.id && binding.sessionRowId === existing.id &&
+    binding.sessionOwnerAccountId === ownerAccountId && binding.machineRowId === machine.id &&
+    binding.machineOwnerAccountId === machine.accountId && binding.companyId === ticket.companyId &&
+    binding.machineId === ticket.machineId && binding.launchId === ticket.launchId &&
+    binding.initialNonce === ticket.initialNonce && binding.operationId === ticket.operationId &&
+    binding.ticketDigest === ticketDigest && binding.createProofDigest === createProofDigest &&
+    binding.sessionTagHash === ticket.sessionTagHash && binding.sessionCreateBodyHash === ticket.sessionCreateBodyHash) {
+    return existing;
+  }
+  conflict();
+}
+
+/** Records the immutable execution relation of the session this verified create just made. */
+async function bindSessionExecution(tx: Prisma.TransactionClient, session: { id: string }, ownerAccountId: string,
+  machine: { id: string; accountId: string }, verified: VerifiedExecutionCreate) {
+  const { proof, ticketDigest, createProofDigest } = verified;
+  const ticket = proof.ticket.body;
+  await tx.sessionExecutionBinding.create({ data: {
+    sessionId: session.id, sessionRowId: session.id, sessionRowOwnerAccountId: ownerAccountId,
+    companyId: ticket.companyId, machineId: machine.id, machineOwnerAccountId: machine.accountId,
+    machineRowId: machine.id, machineRowOwnerAccountId: machine.accountId, sessionOwnerAccountId: ownerAccountId,
+    launchId: ticket.launchId, initialNonce: ticket.initialNonce, operationId: ticket.operationId,
+    approvalId: ticket.approvalId, deviceKeyId: ticket.deviceKeyId, sessionTagHash: ticket.sessionTagHash,
+    sessionCreateBodyHash: ticket.sessionCreateBodyHash, ticketDigest, createProofDigest,
+  } });
+}
 
 /** Only a new session can acquire this immutable relation. Existing rows require exact replay. */
 export async function createExecutionBoundSession(ownerAccountId: string, rawBody: unknown, rawProof: unknown,
@@ -61,7 +105,7 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
   /** Server-only admission: never taken from the ordinary create request body. */
   automationRunId?: string) {
   const verified = await verifySessionExecutionCreate(ownerAccountId, rawBody, rawProof);
-  const { body, proof, ticketDigest, createProofDigest } = verified;
+  const { body, proof } = verified;
   const ticket = proof.ticket.body;
   const reservedId = automationRunId === undefined ? undefined : automationExecutionSessionId(automationRunId);
   if (reservedId && body.tag !== reservedId) conflict();
@@ -75,24 +119,11 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
         if (!await lockLegacyWorkMachineExecution(tx, ticket.machineOwnerAccountId, ticket.machineId)) refuse();
         const machine = await tx.machine.findUnique({ where: { id: ticket.machineId } });
         if (!machine || machine.accountId !== ticket.machineOwnerAccountId) refuse();
-        const existing = await tx.session.findUnique({ where: { accountId_tag: { accountId: ownerAccountId, tag: body.tag } } });
-        const binding = await tx.sessionExecutionBinding.findFirst({ where: { OR: [
-          { companyId: ticket.companyId, machineId: ticket.machineId, launchId: ticket.launchId },
-          { companyId: ticket.companyId, initialNonce: ticket.initialNonce },
-          { companyId: ticket.companyId, machineId: ticket.machineId, operationId: ticket.operationId },
-        ] } });
-        if (existing || binding) {
-          if (existing && binding && (!reservedId || existing.id === reservedId) && binding.sessionId === existing.id && binding.sessionRowId === existing.id &&
-            binding.sessionOwnerAccountId === ownerAccountId && binding.machineRowId === machine.id &&
-            binding.machineOwnerAccountId === machine.accountId && binding.companyId === ticket.companyId &&
-            binding.machineId === ticket.machineId && binding.launchId === ticket.launchId &&
-            binding.initialNonce === ticket.initialNonce && binding.operationId === ticket.operationId &&
-            binding.ticketDigest === ticketDigest && binding.createProofDigest === createProofDigest &&
-            binding.sessionTagHash === ticket.sessionTagHash && binding.sessionCreateBodyHash === ticket.sessionCreateBodyHash) {
-            await participate?.(tx, existing, false);
-            return existing;
-          }
-          conflict();
+        const existing = await replayedExecutionBoundSession(tx, ownerAccountId, machine, verified,
+          session => !reservedId || session.id === reservedId);
+        if (existing) {
+          await participate?.(tx, existing, false);
+          return existing;
         }
         const session = await tx.session.create({ data: {
           ...(reservedId ? { id: reservedId } : {}),
@@ -100,14 +131,7 @@ export async function createExecutionBoundSession(ownerAccountId: string, rawBod
           accountId: ownerAccountId, tag: body.tag, metadata: body.metadata, agentState: body.agentState,
           dataEncryptionKey: body.dataEncryptionKey ? new Uint8Array(Buffer.from(body.dataEncryptionKey, 'base64')) : undefined,
         } });
-        await tx.sessionExecutionBinding.create({ data: {
-          sessionId: session.id, sessionRowId: session.id, sessionRowOwnerAccountId: ownerAccountId,
-          companyId: ticket.companyId, machineId: machine.id, machineOwnerAccountId: machine.accountId,
-          machineRowId: machine.id, machineRowOwnerAccountId: machine.accountId, sessionOwnerAccountId: ownerAccountId,
-          launchId: ticket.launchId, initialNonce: ticket.initialNonce, operationId: ticket.operationId,
-          approvalId: ticket.approvalId, deviceKeyId: ticket.deviceKeyId, sessionTagHash: ticket.sessionTagHash,
-          sessionCreateBodyHash: ticket.sessionCreateBodyHash, ticketDigest, createProofDigest,
-        } });
+        await bindSessionExecution(tx, session, ownerAccountId, machine, verified);
         await participate?.(tx, session, true);
         const account = await tx.account.update({ where: { id: ownerAccountId }, data: { seq: { increment: 1 } }, select: { seq: true } });
         fresh(proof);
