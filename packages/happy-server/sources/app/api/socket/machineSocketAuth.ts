@@ -74,7 +74,7 @@ const daemonAutomationEvents = new Set([
     'session-followup-sync', 'session-followup-claim', 'session-followup-evaluate', 'session-followup-deliver',
 ]);
 const sessionSocketEvents = new Set([
-    'update-metadata', 'update-state', 'session-alive', 'session-stream', 'message', 'session-end', 'usage-report', 'provider-usage-report',
+    'update-metadata', 'update-state', 'session-alive', 'session-stream', 'session-stream-watch', 'message', 'session-end', 'usage-report', 'provider-usage-report',
 ]);
 const rpcTargetEvents = new Set(['rpc-register', 'rpc-unregister', 'rpc-call']);
 

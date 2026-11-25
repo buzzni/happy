@@ -259,10 +259,36 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
             eventRouter.emitEphemeral({
                 userId,
                 payload: { type: 'stream', id: data.sid, time: data.time, data: data.data },
-                recipientFilter: { type: 'user-scoped-only' }
+                recipientFilter: { type: 'session-stream', sessionId: data.sid }
             });
         } catch (error) {
             log({ module: 'websocket', level: 'error' }, `Error in session-stream: ${error}`);
+        }
+    });
+
+    // aplus-dev-studio specs/agent-app-api — a server running an agent-app turn reads that session's answer as it is
+    // written. Only a transport-only socket: a human client already gets every stream of the account.
+    socket.on('session-stream-watch', async (data: { sid?: unknown } | null, callback: (response: { ok: boolean; error?: string }) => void) => {
+        const answer = typeof callback === 'function' ? callback : () => {};
+        try {
+            if (connection.connectionType !== 'user-scoped' || connection.transportOnly !== true) {
+                answer({ ok: false, error: 'transport-only-socket-required' });
+                return;
+            }
+            const sid = data?.sid;
+            if (typeof sid !== 'string' || !sid || sid.includes(':')) {
+                answer({ ok: false, error: 'invalid-session-id' });
+                return;
+            }
+            if (!await activityCache.isSessionValid(sid, userId, socket.data?.piiProtectionVersion === 1)) {
+                answer({ ok: false, error: 'session-not-found' });
+                return;
+            }
+            eventRouter.watchSessionStream(userId, socket, sid);
+            answer({ ok: true });
+        } catch (error) {
+            log({ module: 'websocket', level: 'error' }, `Error in session-stream-watch: ${error}`);
+            answer({ ok: false, error: 'internal-error' });
         }
     });
 

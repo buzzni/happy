@@ -50,6 +50,8 @@ export type ClientConnection = SessionScopedConnection | UserScopedConnection | 
 export type RecipientFilter =
     | { type: 'all-interested-in-session'; sessionId: string }
     | { type: 'user-scoped-only' }
+    /** Human clients plus the servers watching this session's stream (`watchSessionStream`). */
+    | { type: 'session-stream'; sessionId: string }
     | { type: 'machine-scoped-only'; machineId: string }  // For update-machine: sends to user-scoped + only the specific machine
     | { type: 'all-user-authenticated-connections' };
 
@@ -333,6 +335,17 @@ class EventRouter {
         }
     }
 
+    /**
+     * A transport-only server socket reads one session's stream (aplus-dev-studio specs/agent-app-api: an agent-app
+     * turn relays the answer as it is written). It joins that session's watch room, never the user-scoped room: there
+     * it would count as a human watching and hold back the account's push notifications.
+     */
+    watchSessionStream(userId: string, socket: Socket, sessionId: string): void {
+        const room = sessionStreamWatchRoom(userId, sessionId);
+        socket.join(room);
+        if (socket.data?.piiProtectionVersion === 1) socket.join(`${room}:pii-v1`);
+    }
+
     removeConnection(userId: string, connection: ClientConnection): void {
         const connections = this.userConnections.get(userId);
         if (connections) {
@@ -420,6 +433,8 @@ class EventRouter {
                 return [`user:${userId}`];
             case 'user-scoped-only':
                 return [userScopedRoom(userId)];
+            case 'session-stream':
+                return [userScopedRoom(userId), sessionStreamWatchRoom(userId, filter.sessionId)];
             case 'all-interested-in-session':
                 // Union: session watchers + user-scoped (Socket.IO deduplicates)
                 return [`user:${userId}:session:${filter.sessionId}`, userScopedRoom(userId)];
@@ -519,6 +534,10 @@ class EventRouter {
 }
 
 export const eventRouter = new EventRouter();
+
+export function sessionStreamWatchRoom(userId: string, sessionId: string): string {
+    return `user:${userId}:session-stream:${sessionId}`;
+}
 
 // === EVENT BUILDER FUNCTIONS ===
 

@@ -446,6 +446,8 @@ describe('work machine execution authority', () => {
             });
         expect(await check(oldSocket, 'update-state', { sid: sessionId })).toBe(true);
         expect(await check(null, 'message', { sid: sessionId })).toBe(false);
+        // A server's stream watch (aplus-dev-studio specs/agent-app-api) does not reach a protected conversation either.
+        expect(await check(null, 'session-stream-watch', { sid: sessionId })).toBe(false);
         expect(await check(null, 'message', { sid: sessionId }, true)).toBe(false);
         expect(await check(null, 'rpc-call', { method: `${sessionId}:permission` }, true)).toBe(true);
         expect(await check(null, 'rpc-call', { method: `${sessionId}:permission` })).toBe(false);
