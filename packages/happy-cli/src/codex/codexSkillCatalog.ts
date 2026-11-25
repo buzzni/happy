@@ -11,8 +11,8 @@ export const codexSkillRefSchema = z.string().regex(/^[a-f0-9]{64}$/)
 const rpcInput = z.object({ cwd: z.string().max(4096).nullable() }).strict()
 const nativeSkill = z.object({
     name: z.string().min(1).max(256),
-    description: z.string().optional(),
-    shortDescription: z.string().optional(),
+    description: z.string().nullish(),
+    shortDescription: z.string().nullish(),
     interface: z.object({ displayName: z.string().nullish(), shortDescription: z.string().nullish() }).nullish(),
     path: z.string().min(1).max(4096),
     scope: z.enum(['user', 'repo', 'system', 'admin']),

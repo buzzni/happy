@@ -13,7 +13,8 @@ export interface ChannelTurnEnqueueDeps<T> {
             channelRequestId?: string,
         ): void;
     };
-    deferredContinuation: {
+    /** Claude folds context at enqueue; Codex folds it in provider dispatch order. */
+    deferredContinuation?: {
         prepare(text: string, options?: { literalText?: boolean }): PreparedTurn | null;
     };
     /**
@@ -49,7 +50,7 @@ export function enqueueChannelTurn<T>(
     mode: () => T,
     deps: ChannelTurnEnqueueDeps<T>,
 ): void {
-    const deferredTurn = deps.deferredContinuation.prepare(input.text, { literalText: true });
+    const deferredTurn = deps.deferredContinuation?.prepare(input.text, { literalText: true });
     const queuedText = deferredTurn?.text ?? input.text;
     try {
         if (deferredTurn) deps.onDeferredText?.(queuedText);

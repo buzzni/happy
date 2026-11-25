@@ -310,6 +310,7 @@ export async function runCodex(opts: {
     if (agentPlanLaunch && managedStartup) throw new AgentPlanLaunchError('agent_plan_managed_conflict');
 
     const deferredContinuation = createDeferredContinuationContextConsumer(process.env);
+    const continuationInputModes = new WeakSet<CodexEnhancedMode>();
     installBroadKillShims();
     // The prompt's `happy agent` must reach this CLI however the daemon was launched.
     installHappyCommandShim();
@@ -898,60 +899,52 @@ export async function runCodex(opts: {
             effort: messageEffort,
             orgModelOrigin: messageModelOrigin,
         };
-        const deferredTurn = deferredContinuation.prepare(message.content.text, { literalText: parsedSkillRef.success });
-        let enqueueResult: ReturnType<typeof enqueueCodexUserText>;
-        try {
-            enqueueResult = enqueueCodexUserText({
-                text: deferredTurn?.text ?? message.content.text,
-                mode: enhancedMode,
-                queue: messageQueue,
-                evidence: session.queueInput(message),
-                attachments: attachmentsForThisMessage,
-                latencyTrace,
-                attendance: inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
-                // Travels beside the mode so the engine boundary below can commit
-                // this decision — and so a batch keeps every merged request's id.
-                allowClear: !parsedSkillRef.success,
-                requestIds: routed
-                    ? [routed.pending.clientRequestId]
-                    : localDecision ? [localDecision.clientRequestId] : undefined,
-            });
-            deferredTurn?.commit();
-            if (routed && enqueueResult === 'queued') {
-                // Aligned to what the Codex client will actually be given — an
-                // unsupported effort is dropped above, so the decision and the
-                // engine would otherwise disagree. See runClaude for the full note.
-                const reconciled = reconcileDecisionWithAppliedSettings(
-                    routed.pending,
-                    { model: messageModel, effort: messageEffort ?? null },
-                    'codex',
-                );
-                if (reconciled) {
-                    difficultyRoutingCommitter.recordPending(routed.state);
-                    if (reconciled !== routed.pending) {
-                        difficultyRoutingCommitter.recordLocalPending(reconciled);
-                    }
-                } else {
-                    logger.debug('[Codex] Routed model was substituted into an unknown pair; no floor recorded');
+        continuationInputModes.add(enhancedMode);
+        const enqueueResult = enqueueCodexUserText({
+            text: message.content.text,
+            mode: enhancedMode,
+            queue: messageQueue,
+            evidence: session.queueInput(message),
+            attachments: attachmentsForThisMessage,
+            latencyTrace,
+            attendance: inputAttendanceFromMeta(message.meta, session.getMetadata()?.source),
+            // Travels beside the mode so the engine boundary below can commit
+            // this decision — and so a batch keeps every merged request's id.
+            allowClear: !parsedSkillRef.success,
+            requestIds: routed
+                ? [routed.pending.clientRequestId]
+                : localDecision ? [localDecision.clientRequestId] : undefined,
+        });
+        if (routed && enqueueResult === 'queued') {
+            // Aligned to what the Codex client will actually be given — an
+            // unsupported effort is dropped above, so the decision and the
+            // engine would otherwise disagree. See runClaude for the full note.
+            const reconciled = reconcileDecisionWithAppliedSettings(
+                routed.pending,
+                { model: messageModel, effort: messageEffort ?? null },
+                'codex',
+            );
+            if (reconciled) {
+                difficultyRoutingCommitter.recordPending(routed.state);
+                if (reconciled !== routed.pending) {
+                    difficultyRoutingCommitter.recordLocalPending(reconciled);
                 }
-                session.sendSessionProtocolMessage(routed.event);
-            } else if (localDecision && enqueueResult === 'queued') {
-                const reconciled = reconcileDecisionWithAppliedSettings(
-                    localDecision,
-                    { model: messageModel, effort: messageEffort ?? null },
-                    'codex',
-                );
-                if (reconciled) difficultyRoutingCommitter.recordLocalPending(reconciled);
+            } else {
+                logger.debug('[Codex] Routed model was substituted into an unknown pair; no floor recorded');
             }
-            if (enqueueResult === 'clear') {
-                // Phase one: accepted, not yet reset. See DifficultyRoutingCommitter.
-                difficultyRoutingCommitter.requestEpoch();
-            }
-        } catch (error) {
-            deferredTurn?.rollback();
-            throw error;
+            session.sendSessionProtocolMessage(routed.event);
+        } else if (localDecision && enqueueResult === 'queued') {
+            const reconciled = reconcileDecisionWithAppliedSettings(
+                localDecision,
+                { model: messageModel, effort: messageEffort ?? null },
+                'codex',
+            );
+            if (reconciled) difficultyRoutingCommitter.recordLocalPending(reconciled);
         }
         if (enqueueResult === 'clear') {
+            deferredContinuation.prepare(message.content.text);
+            // Phase one: accepted, not yet reset. See DifficultyRoutingCommitter.
+            difficultyRoutingCommitter.requestEpoch();
             logger.debug('[Codex] /clear command pushed to isolated queue');
         }
     }, (error) => {
@@ -1885,7 +1878,7 @@ export async function runCodex(opts: {
                 saycodePromptBlocks: currentSaycodePromptBlocks,
                 effort: currentEffort,
                 orgModelOrigin: currentModelOrigin,
-            }), { queue: messageQueue, deferredContinuation });
+            }), { queue: messageQueue });
         },
         now: () => Date.now(),
     });
@@ -2624,6 +2617,9 @@ export async function runCodex(opts: {
             const measure = <T>(stage: CodexLatencyStage, action: () => T | Promise<T>): T | Promise<T> =>
                 latency ? latency.measure(stage, action) : action();
 
+            const canApplyContinuation = message.channelRequestId !== undefined
+                || continuationInputModes.has(message.mode)
+                || message.items?.some(item => continuationInputModes.has(item.mode));
             let inputInvalidated = false;
             try {
                 if (!isCurrentCapacityContinuation(message.mode)) continue;
@@ -2727,6 +2723,7 @@ export async function runCodex(opts: {
                 }
 
                 let routingApplied = false;
+                let preparedContinuation: ReturnType<typeof deferredContinuation.prepare> = null;
                 try {
                     if (clearRecoveryError) throw clearRecoveryError;
                     // Only a blocked session waits here; an extra await would let a kill land mid-preparation.
@@ -2880,7 +2877,11 @@ export async function runCodex(opts: {
                         }
                     }
 
-                    const goalCommand = message.mode.skill ? null : parseCodexGoalCommand(message.message);
+                    const literalTurnText = !!message.mode.skill || message.channelRequestId !== undefined;
+                    if (canApplyContinuation && !literalTurnText) {
+                        preparedContinuation = deferredContinuation.prepare(message.message, { literalText: true });
+                    }
+                    const goalCommand = literalTurnText ? null : parseCodexGoalCommand(preparedContinuation?.text ?? message.message);
                     if (goalCommand && await handleCodexGoalCommand(goalCommand, activeThreadId)) {
                         latency?.finish('control');
                         continue;
@@ -2900,8 +2901,8 @@ export async function runCodex(opts: {
                             skippedCount: imageInputs.skipped,
                         });
                     }
-                    const hasUserText = message.message.trim().length > 0;
-                    if ((message.attachments?.length ?? 0) > 0 && imageInputs.inputItems.length === 0 && !hasUserText) {
+                    const hasUserTextOrSkill = !!message.mode.skill || (preparedContinuation?.text ?? message.message).trim().length > 0;
+                    if ((message.attachments?.length ?? 0) > 0 && imageInputs.inputItems.length === 0 && !hasUserTextOrSkill) {
                         session.sendSessionEvent({
                             type: 'message',
                             message: 'No supported images were available to send to Codex.',
@@ -2968,8 +2969,9 @@ export async function runCodex(opts: {
                         if (!skill) throw new CodexSkillUnavailableError('선택한 Codex 스킬을 다시 골라 주세요.');
                         skillInputs.push(skill);
                     }
+                    if (canApplyContinuation && literalTurnText) preparedContinuation = deferredContinuation.prepare(message.message, { literalText: true });
                     const turnPrompt = (reviewInstruction ? `${reviewInstruction}\n\n` : '') + buildCodexTurnPrompt({
-                        message: message.message,
+                        message: preparedContinuation?.text ?? message.message,
                         mode: message.mode,
                         includeAppendSystemPrompt,
                         hasTitle: titleCoveredForTurn({
@@ -3044,7 +3046,11 @@ export async function runCodex(opts: {
                                 throw new Error('Codex continuation was cancelled before dispatch');
                             }
                         },
-                        onDispatched: () => { dispatchedWithoutStart = true; },
+                        onDispatched: () => {
+                            dispatchedWithoutStart = true;
+                            preparedContinuation?.commit();
+                            preparedContinuation = null;
+                        },
                         ...(memoryRecall?.reason === 'context_returned' ? { onSubmitted: () => recallHost?.markSubmitted(activeThreadId, memoryRecall.startupIncluded === true) } : {}),
                         ...(memoryIngest ? { onCompleted: memoryIngest.onCompleted,
                             onCompletionObservationSettled: memoryIngest.onSettled } : {}),
@@ -3242,6 +3248,7 @@ export async function runCodex(opts: {
                         session.sendSessionProtocolMessage(envelope);
                     }
                 } finally {
+                    preparedContinuation?.rollback();
                     if (!routingApplied) {
                         difficultyRoutingCommitter.discardPending(message.requestIds ?? [], owningForegroundSignal.aborted ? 'cancelled' : 'failed');
                     }

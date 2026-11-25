@@ -22,6 +22,11 @@ describe('Codex skill references', () => {
         expect(resolveCodexSkill({ data: [{ cwd, skills: [skills[0]] }] }, 'pc', cwd, entries[1].ref)).toBeNull()
     })
 
+    it('keeps skills whose optional native descriptions are null', () => {
+        const response = { data: [{ cwd, skills: [{ ...skills[0], description: null, shortDescription: null }] }] }
+        expect(catalogCodexSkills(response, 'pc', cwd)).toMatchObject([{ name: 'new', description: '' }])
+    })
+
     it('binds repository skills to the catalog folder and omits them before a personal chat has a folder', () => {
         const entries = catalogCodexSkills(response, 'pc', cwd)
         const other = '/other'
