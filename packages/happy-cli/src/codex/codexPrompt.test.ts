@@ -41,6 +41,22 @@ describe('resolveCodexSaycodePromptBlocks', () => {
 });
 
 describe('buildCodexDeveloperInstructions', () => {
+    it('carries the Saycode MCP server instructions (skill catalogs) right after the connector facts', () => {
+        expect(buildCodexDeveloperInstructions({
+            connectorGuidance: 'CONNECTOR FACTS',
+            mcpServerInstructions: '# MCP Server Instructions\n\n## aplus-company\n# 사용 가능한 스킬',
+            mode: {},
+        })).toBe('CONNECTOR FACTS\n\n# MCP Server Instructions\n\n## aplus-company\n# 사용 가능한 스킬\n\n' + SAYCODE_API_GATEWAY_PROMPT);
+    });
+
+    it('leaves the Saycode skill catalogs out when Saycode instructions are off', () => {
+        expect(buildCodexDeveloperInstructions({
+            connectorGuidance: 'CONNECTOR FACTS',
+            mcpServerInstructions: '# MCP Server Instructions',
+            mode: { saycodeSystemPromptEnabled: false },
+        })).toBe('CONNECTOR FACTS');
+    });
+
     it('uses replaceable developer instructions for explicit-policy clients', () => {
         expect(buildCodexDeveloperInstructions({
             connectorGuidance: 'CONNECTOR FACTS',

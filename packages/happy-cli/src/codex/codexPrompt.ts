@@ -62,19 +62,26 @@ export function hashCodexEnhancedMode(mode: CodexEnhancedMode): string {
 
 export function buildCodexDeveloperInstructions({
     connectorGuidance,
+    mcpServerInstructions,
     checkpointGuidance,
     agentOrchestrationPrompt,
     nextStepsPrompt,
     mode,
 }: {
     connectorGuidance?: string;
+    /** Saycode MCP servers' initialize instructions (skill catalogs); Codex does not surface them itself. */
+    mcpServerInstructions?: string;
     checkpointGuidance?: string;
     agentOrchestrationPrompt?: string;
     /** Turn-card guidance (common:next-steps); only on a turn whose client draws the card. */
     nextStepsPrompt?: string;
     mode: Pick<CodexEnhancedMode, 'appendSystemPrompt' | 'saycodeSystemPromptEnabled' | 'saycodePromptBlocks'>;
 }): string | undefined {
-    const blocks = [connectorGuidance, checkpointGuidance];
+    const blocks = [connectorGuidance];
+    if (mode.saycodeSystemPromptEnabled !== false) {
+        blocks.push(mcpServerInstructions);
+    }
+    blocks.push(checkpointGuidance);
     if (isSaycodePromptBlockEnabled(
         'agentOrchestration',
         mode.saycodePromptBlocks,
