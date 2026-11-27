@@ -5,17 +5,24 @@ const mocks = vi.hoisted(() => ({
     emitEphemeral: vi.fn(),
     admit: vi.fn(),
     watchSessionStream: vi.fn(),
+    emitUpdate: vi.fn(),
+    sessionFindFirst: vi.fn(),
+    sessionFindUnique: vi.fn(),
+    sessionUpdateMany: vi.fn(),
 }));
 
-vi.mock('@/storage/db', () => ({ db: {} }));
+vi.mock('@/storage/db', () => ({
+    db: { session: { findFirst: mocks.sessionFindFirst, findUnique: mocks.sessionFindUnique, updateMany: mocks.sessionUpdateMany } },
+}));
+vi.mock('@/storage/seq', () => ({ allocateUserSeq: vi.fn(async () => 7), allocateSessionSeqBatch: vi.fn() }));
 vi.mock('@/app/presence/sessionCache', () => ({
     activityCache: { isSessionValid: mocks.isSessionValid, queueSessionUpdate: vi.fn() },
 }));
 vi.mock('@/app/events/eventRouter', () => ({
-    eventRouter: { emitEphemeral: mocks.emitEphemeral, emitUpdate: vi.fn(), watchSessionStream: mocks.watchSessionStream },
+    eventRouter: { emitEphemeral: mocks.emitEphemeral, emitUpdate: mocks.emitUpdate, watchSessionStream: mocks.watchSessionStream },
     buildNewMessageUpdate: vi.fn(),
     buildSessionActivityEphemeral: vi.fn(),
-    buildUpdateSessionUpdate: vi.fn(),
+    buildUpdateSessionUpdate: vi.fn((sid: string, seq: number, id: string, metadata: unknown) => ({ sid, seq, metadata })),
 }));
 vi.mock('@/app/monitoring/metrics2', () => ({
     getMetricsLabelsFromSocket: () => ({}),
@@ -100,6 +107,7 @@ describe('session-stream-watch', () => {
     beforeEach(() => {
         vi.clearAllMocks();
         mocks.isSessionValid.mockResolvedValue(true);
+        mocks.sessionFindFirst.mockResolvedValue({ metadata: 'sealed-metadata', metadataVersion: 3 });
     });
 
     async function watch(connection: Record<string, unknown>, data: unknown) {
@@ -114,7 +122,17 @@ describe('session-stream-watch', () => {
 
         expect(mocks.isSessionValid).toHaveBeenCalledWith('session-1', 'user-1', false);
         expect(mocks.watchSessionStream).toHaveBeenCalledWith('user-1', socket, 'session-1');
-        expect(callback).toHaveBeenCalledWith({ ok: true });
+        expect(callback).toHaveBeenCalledWith({ ok: true, metadata: { value: 'sealed-metadata', version: 3 } });
+    });
+
+    it('answers with the metadata the session already has, which a watcher joining late would otherwise never see', async () => {
+        // An agent-app turn reads the MCP server status the CLI writes there right after the session starts.
+        const { callback } = await watch(transportOnly, { sid: 'session-1' });
+
+        expect(mocks.sessionFindFirst).toHaveBeenCalledWith(expect.objectContaining({
+            where: expect.objectContaining({ id: 'session-1', accountId: 'user-1' }),
+        }));
+        expect(callback.mock.calls[0][0].metadata).toEqual({ value: 'sealed-metadata', version: 3 });
     });
 
     it('refuses a session the account does not own', async () => {
@@ -144,5 +162,28 @@ describe('session-stream-watch', () => {
         expect(mocks.isSessionValid).not.toHaveBeenCalled();
         expect(mocks.watchSessionStream).not.toHaveBeenCalled();
         expect(callback).toHaveBeenCalledWith({ ok: false, error: 'invalid-session-id' });
+    });
+});
+
+describe('update-metadata', () => {
+    beforeEach(() => {
+        vi.clearAllMocks();
+        mocks.sessionFindUnique.mockResolvedValue({ id: 'session-1', metadataVersion: 1, metadata: 'old', piiProtection: false });
+        mocks.sessionUpdateMany.mockResolvedValue({ count: 1 });
+    });
+
+    it('sends the new metadata to the servers watching the session stream as well', async () => {
+        const { handlers } = registerHandlers({ connectionType: 'session-scoped' });
+        const callback = vi.fn();
+
+        await handlers.get('update-metadata')!({ sid: 'session-1', metadata: 'new', expectedVersion: 1 }, callback);
+
+        expect(callback).toHaveBeenCalledWith({ result: 'success', version: 2, metadata: 'new' });
+        const filters = mocks.emitUpdate.mock.calls.map(([params]) => params.recipientFilter);
+        expect(filters).toEqual([
+            { type: 'all-interested-in-session', sessionId: 'session-1' },
+            { type: 'session-stream-watchers', sessionId: 'session-1' },
+        ]);
+        expect(mocks.emitUpdate.mock.calls[1][0].payload).toEqual(mocks.emitUpdate.mock.calls[0][0].payload);
     });
 });

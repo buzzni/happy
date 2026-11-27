@@ -1,4 +1,4 @@
-import { fork } from 'node:child_process';
+import { fork, type ForkOptions } from 'node:child_process';
 import { join } from 'node:path';
 import { projectPath } from '@/projectPath';
 
@@ -19,16 +19,18 @@ export interface FileDiscoveryResponse {
 let running = 0;
 /** One worker owns each operation so blocked filesystem IO cannot hang the daemon. */
 export async function fileDiscovery(allowedRoot: string, request: unknown, platform: NodeJS.Platform = process.platform): Promise<FileDiscoveryResponse> {
-    // The worker answers only this off macOS. Starting it anyway showed a node.exe console on
-    // Windows each time the app asked, which it does on every project switch.
-    if (platform !== 'darwin') return { version: 1, success: false, error: 'unsupported' };
+    // The worker has a symlink-safe open only for macOS (NOFOLLOW_ANY) and Windows (a checked link-free chain); elsewhere it
+    // answers only this, so no worker is started for it.
+    if (platform !== 'darwin' && platform !== 'win32') return { version: 1, success: false, error: 'unsupported' };
     if (running >= 2) return { version: 1, success: false, error: 'busy' };
     running++;
     try {
         return await new Promise<FileDiscoveryResponse>((resolve) => {
-            const worker = fork(join(projectPath(), 'scripts', 'file-discovery-worker.cjs'), [], {
-                stdio: ['ignore', 'ignore', 'ignore', 'ipc'], execArgv: ['--max-old-space-size=32'],
-            });
+            // The app asks on every project switch, and each worker showed a node.exe console (docs/windows-child-processes.md).
+            // fork passes its options to spawn, which honors windowsHide; ForkOptions only leaves it out of the type.
+            const options: ForkOptions & { windowsHide: boolean } = { stdio: ['ignore', 'ignore', 'ignore', 'ipc'], execArgv: ['--max-old-space-size=32'], windowsHide: true };
+            const forkedAt = Date.now(); // the worker's own search deadline counts from here, inside this 5s
+            const worker = fork(join(projectPath(), 'scripts', 'file-discovery-worker.cjs'), [], options);
             let settled = false;
             let matches: NonNullable<FileDiscoveryResponse['matches']> = [];
             const finish = async (result: FileDiscoveryResponse) => {
@@ -49,7 +51,7 @@ export async function fileDiscovery(allowedRoot: string, request: unknown, platf
             });
             worker.once('error', () => void finish({ version: 1, success: false, error: 'failed' }));
             worker.once('exit', () => { if (!settled) void finish({ version: 1, success: false, error: 'failed' }); });
-            worker.send({ allowedRoot, request }, error => { if (error) void finish({ version: 1, success: false, error: 'failed' }); });
+            worker.send({ allowedRoot, request, forkedAt }, error => { if (error) void finish({ version: 1, success: false, error: 'failed' }); });
         });
     } finally { running--; }
 }
