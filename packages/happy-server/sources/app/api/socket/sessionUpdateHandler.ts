@@ -102,6 +102,13 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 sessionProtection: session.piiProtection,
                 recipientFilter: { type: 'all-interested-in-session', sessionId: sid }
             });
+            // aplus-dev-studio specs/agent-app-api R9 — an agent-app turn reads the MCP server status the CLI writes here.
+            eventRouter.emitUpdate({
+                userId,
+                payload: updatePayload,
+                sessionProtection: session.piiProtection,
+                recipientFilter: { type: 'session-stream-watchers', sessionId: sid }
+            });
 
             // Send success response with new version via callback
             callback({ result: 'success', version: expectedVersion + 1, metadata: metadata });
@@ -268,7 +275,7 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
 
     // aplus-dev-studio specs/agent-app-api — a server running an agent-app turn reads that session's answer as it is
     // written. Only a transport-only socket: a human client already gets every stream of the account.
-    socket.on('session-stream-watch', async (data: { sid?: unknown } | null, callback: (response: { ok: boolean; error?: string }) => void) => {
+    socket.on('session-stream-watch', async (data: { sid?: unknown } | null, callback: (response: { ok: boolean; error?: string; metadata?: { value: string; version: number } | null }) => void) => {
         const answer = typeof callback === 'function' ? callback : () => {};
         try {
             if (connection.connectionType !== 'user-scoped' || connection.transportOnly !== true) {
@@ -285,7 +292,12 @@ export function sessionUpdateHandler(userId: string, socket: Socket, connection:
                 return;
             }
             eventRouter.watchSessionStream(userId, socket, sid);
-            answer({ ok: true });
+            // What the session already has: the CLI may have written its MCP server status before the watcher joined.
+            const session = await db.session.findFirst({
+                where: { ...piiSocketVisibility(socket), id: sid, accountId: userId },
+                select: { metadata: true, metadataVersion: true },
+            });
+            answer({ ok: true, metadata: session ? { value: session.metadata, version: session.metadataVersion } : null });
         } catch (error) {
             log({ module: 'websocket', level: 'error' }, `Error in session-stream-watch: ${error}`);
             answer({ ok: false, error: 'internal-error' });

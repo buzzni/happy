@@ -52,6 +52,8 @@ export type RecipientFilter =
     | { type: 'user-scoped-only' }
     /** Human clients plus the servers watching this session's stream (`watchSessionStream`). */
     | { type: 'session-stream'; sessionId: string }
+    /** Only the servers watching this session's stream: they get no other update of the session (`watchSessionStream`). */
+    | { type: 'session-stream-watchers'; sessionId: string }
     | { type: 'machine-scoped-only'; machineId: string }  // For update-machine: sends to user-scoped + only the specific machine
     | { type: 'all-user-authenticated-connections' };
 
@@ -435,6 +437,8 @@ class EventRouter {
                 return [userScopedRoom(userId)];
             case 'session-stream':
                 return [userScopedRoom(userId), sessionStreamWatchRoom(userId, filter.sessionId)];
+            case 'session-stream-watchers':
+                return [sessionStreamWatchRoom(userId, filter.sessionId)];
             case 'all-interested-in-session':
                 // Union: session watchers + user-scoped (Socket.IO deduplicates)
                 return [`user:${userId}:session:${filter.sessionId}`, userScopedRoom(userId)];

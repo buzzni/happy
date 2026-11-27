@@ -65,3 +65,39 @@ it('delivers a session stream to human clients and to watchers of that session o
     expect(received.watcher).toEqual([frame]);
     expect(received.transport).toEqual([]);
 });
+
+it('delivers an update meant for stream watchers to the watchers of that session only', async () => {
+    // The CLI writes the MCP server status into the session metadata; an agent-app turn fails on it (specs/agent-app-api R9).
+    lookup.mockResolvedValue({ piiProtection: false });
+    const http = createServer(); io = new Server(http);
+    eventRouter.init(io);
+    io.on('connection', socket => {
+        const transportOnly = socket.handshake.auth.transportOnly === true;
+        eventRouter.addConnection('owner', { connectionType: 'user-scoped', socket, userId: 'owner', ...(transportOnly ? { transportOnly: true } : {}) });
+        if (socket.handshake.auth.watch) eventRouter.watchSessionStream('owner', socket, socket.handshake.auth.watch);
+    });
+    await new Promise<void>(resolve => http.listen(0, '127.0.0.1', resolve));
+    const port = (http.address() as { port: number }).port;
+    const received: Record<string, unknown[]> = {};
+    for (const [name, auth] of [
+        ['human', {}],
+        ['watcher', { transportOnly: true, watch: 's1' }],
+        ['otherWatcher', { transportOnly: true, watch: 's2' }],
+    ] as const) {
+        const client = connect(`http://127.0.0.1:${port}`, { auth, transports: ['websocket'] });
+        clients.push(client);
+        received[name] = [];
+        client.on('update', payload => received[name].push(payload));
+        await new Promise<void>(resolve => client.on('connect', resolve));
+    }
+
+    const update = { id: 'u1', seq: 1, body: { t: 'update-session' as const, id: 's1', metadata: { value: 'sealed', version: 2 } }, createdAt: 1 };
+    eventRouter.emitUpdate({ userId: 'owner', payload: update, recipientFilter: { type: 'session-stream-watchers', sessionId: 's1' } });
+    const sentinel = { id: 'u2', seq: 2, body: { t: 'update-session' as const, id: 's2', metadata: { value: 'sealed', version: 2 } }, createdAt: 2 };
+    eventRouter.emitUpdate({ userId: 'owner', payload: sentinel, recipientFilter: { type: 'session-stream-watchers', sessionId: 's2' } });
+
+    await vi.waitFor(() => expect(received.otherWatcher).toEqual([sentinel]));
+    expect(received.watcher).toEqual([update]);
+    // A human client already gets the same update through the session's interested rooms.
+    expect(received.human).toEqual([]);
+});
