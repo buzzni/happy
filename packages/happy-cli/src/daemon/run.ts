@@ -14,7 +14,7 @@ import { drainWorktreeOperations } from './worktreeOps';
 import { drainBashRpcs } from '@/modules/common/bashRpcScheduler';
 import { createMachineSetupTokenProtocol, MachineRotationError } from './machineSetupTokenProtocol';
 import { chooseLaunchRotation, createMachineRotationResolver } from './machineRotationResolver';
-import { discoverMachineSetupTokenSession } from './machineSetupTokenRecovery';
+import { discoverMachineSetupTokenSession, discoverWorkMachineSetupTokenSession } from './machineSetupTokenRecovery';
 import { createMachineSetupTokenJournal } from './machineSetupTokenJournal';
 import { createMachineSetupTokenRuntime, type MachineSetupTokenRuntime } from './machineSetupTokenRuntime';
 import { createDeviceOrgPinStore, migrateLegacyDeviceState } from './deviceOrgPinStore';
@@ -2423,9 +2423,10 @@ export async function startDaemon(): Promise<void> {
             : credentials;
           if (!ownerCredentials) throw new MachineRotationError('FORBIDDEN');
           const ownerApi = await ApiClient.create(ownerCredentials);
-          const [ownerAccountId, machineOwnerAccountId] = await Promise.all([
-            authenticatedAccountId(ownerCredentials.token), authenticatedAccountId(credentials.token),
-          ]);
+          // A protected machine's daemon holds its device credential, not an account bearer: the binding names the account.
+          const [ownerAccountId, machineOwnerAccountId] = executionBinding
+            ? [executionBinding.accountId, executionBinding.accountId]
+            : await Promise.all([authenticatedAccountId(ownerCredentials.token), authenticatedAccountId(credentials.token)]);
           preparedMachineLaunch = await machineRotationRuntime.prepareLaunch({ ownerAccountId, machineOwnerAccountId, userHomeDir: stagedUserHomeDir,
             metadata: { path: directory, host: os.hostname(), version: packageJson.version, os: os.platform(), machineId,
               homeDir: os.homedir(), happyHomeDir: stagedUserHomeDir ?? configuration.happyHomeDir, happyLibDir: projectPath(),
@@ -5452,11 +5453,16 @@ export async function startDaemon(): Promise<void> {
       env: process.env, machineId, happyOrigin: new URL(configuration.serverUrl).origin, studioOrigin: trustedStudioOrigin,
       bearer: () => credentials.token,
       createRuntime: config => createMachineSetupTokenRuntime({
+        ...(executionBinding ? { workMachine: { accountId: executionBinding.accountId } } : {}),
         allowInitialIssue: () => machineRotation?.newIssuesAllowed() ?? false,
         protocol: createMachineSetupTokenProtocol({ config, keys: rotationKeys, pin: companyId => rotationEnrollment.orgPin(companyId), bearer: () => credentials.token }),
         journal: createMachineSetupTokenJournal(configuration.happyHomeDir),
         savePrepared: persistPreparedMachineLaunch, loadPrepared: recoverPreparedMachineLaunch,
         discoverSession: async (state, snapshot, executionProof) => {
+          if (executionBinding) {
+            if (snapshot.userHomeDir) throw new MachineRotationError('WORK_MACHINE_STAGED_HOME');
+            return discoverWorkMachineSetupTokenSession({ happyOrigin: config.happyOrigin, state, executionProof, machineBearer: credentials.token });
+          }
           const ownerCredentials = snapshot.userHomeDir ? parseCredentials(JSON.parse(await fs.readFile(join(snapshot.userHomeDir, 'access.key'), 'utf8'))) : credentials;
           if (!ownerCredentials) throw new MachineRotationError('FORBIDDEN');
           return discoverMachineSetupTokenSession({ happyOrigin: config.happyOrigin, state, executionProof, ownerBearer: ownerCredentials.token, machineBearer: credentials.token });

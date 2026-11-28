@@ -87,6 +87,13 @@ export class OwnershipSessionCreationError extends Error {
   }
 }
 
+/** An execution-bound create the server did not accept. Keeps only the server's refusal reason, never Axios config or proof. */
+export class ExecutionSessionCreationError extends Error {
+  constructor(readonly reason?: string) {
+    super('Execution-bound session creation failed');
+  }
+}
+
 export class ApiClient {
 
   static async create(credential: Credentials) {
@@ -448,7 +455,10 @@ export class ApiClient {
       if (opts.ownershipProof) {
         throw new OwnershipSessionCreationError(true, axios.isAxiosError(error) ? error.response?.status : undefined);
       }
-      if (opts.executionProof) throw new Error('Execution-bound session creation failed');
+      if (opts.executionProof) {
+        const reason = (error as { response?: { data?: { reason?: unknown } } } | null)?.response?.data?.reason;
+        throw new ExecutionSessionCreationError(typeof reason === 'string' ? reason : undefined);
+      }
       logger.debug('[API] [ERROR] Failed to get or create session:', error);
 
       // Classify on whether the server answered at all, before looking at any
