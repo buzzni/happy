@@ -3072,7 +3072,7 @@ export async function runCodex(opts: {
                     latency?.finish(result.aborted ? 'cancelled' : 'completed');
                     lessonFrame.acceptingSteer = false;
                     if (lessonFrame.pendingSteer) preemptLessonReview();
-                    if (codexUpgradeRequired(latestCodexFailure) && codexUpgradeRetryMessage !== message) {
+                    if (latestCodexFailure && codexUpgradeRetryMessage !== message && codexUpgradeRequired(latestCodexFailure, await codexSelfUpdate.runningVersion)) {
                         codexUpgradeRetryMessage = message;
                         // Saycode Desktop's staging patch reads this tag as "self-update is built in" and leaves the bundle alone.
                         logger.debug('[codex-self-update] Codex CLI is too old for this turn; updating it and retrying once');

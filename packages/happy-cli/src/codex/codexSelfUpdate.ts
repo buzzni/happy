@@ -14,8 +14,24 @@ export type CodexVersion = { text: string; parts: [number, number, number]; prer
 type CodexOnPath = { file: string; npmPrefix: string | null };
 type SpawnLike = typeof nodeSpawn;
 
-export const codexUpgradeRequired = (failure: unknown): boolean =>
-    typeof failure === 'string' && /requires a newer version of Codex/i.test(failure);
+/**
+ * The first codex a ChatGPT login may use each model with. Below it the provider does not ask for an update: it
+ * says the model "is not supported when using Codex with a ChatGPT account" (0.163.0 with gpt-6.2-sol, 2026-11-28),
+ * the same words a plan without the model gets. Only a codex below this version is updated for that refusal.
+ */
+const CHATGPT_MODEL_MINIMUM_CODEX: Readonly<Record<string, CodexVersion['parts']>> = {
+    'gpt-6.2-sol': [0, 166, 0],
+    'gpt-6.2-astra': [0, 166, 0],
+};
+const CHATGPT_MODEL_REFUSAL = /\bthe\s+['"‘’`]([^'"‘’`\s]{1,128})['"‘’`]\s+model\s+is\s+not\s+supported\s+when\s+using\s+codex\s+with\s+a\s+chatgpt\s+account\b/i;
+
+export const codexUpgradeRequired = (failure: unknown, running: CodexVersion | null = null): boolean => {
+    if (typeof failure !== 'string') return false;
+    if (/requires a newer version of Codex/i.test(failure)) return true;
+    const model = CHATGPT_MODEL_REFUSAL.exec(failure)?.[1];
+    const minimum = model ? CHATGPT_MODEL_MINIMUM_CODEX[model] : undefined;
+    return !!minimum && !!running && isNewer({ text: '', parts: minimum, prerelease: false }, running);
+};
 
 /**
  * The codex this runtime starts: the first runnable one on PATH. It is run by that full path, so cmd.exe's

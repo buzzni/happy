@@ -72,6 +72,17 @@ describe.skipIf(process.platform === 'win32')('Codex CLI self-update', () => {
         expect(codexUpgradeRequired(null)).toBe(false);
     });
 
+    it('reads a ChatGPT login refusing a model as too old only below that model\'s first supporting codex', () => {
+        const refusal = `{"type":"error","status":400,"error":{"message":"The 'gpt-6.2-sol' model is not supported when using Codex with a ChatGPT account.","subreason":"model_not_in_accessible_catalog"}}`;
+        const version = (text: string) => ({ text, parts: text.split('.').map(Number) as [number, number, number], prerelease: false });
+        expect(codexUpgradeRequired(refusal, version('0.163.0'))).toBe(true);
+        expect(codexUpgradeRequired(refusal.replace('gpt-6.2-sol', 'gpt-6.2-astra'), version('0.165.9'))).toBe(true);
+        // A plan that does not include the model: a newer codex would not change the answer.
+        expect(codexUpgradeRequired(refusal, version('0.166.0'))).toBe(false);
+        expect(codexUpgradeRequired(refusal.replace('gpt-6.2-sol', 'gpt-6.1-sol'), version('0.163.0'))).toBe(false);
+        expect(codexUpgradeRequired(refusal, null)).toBe(false);
+    });
+
     it('points npm at the folder of the npm-installed codex it runs, and succeeds once that codex is newer', async () => {
         const codex = fakeCodex('npm', '0.165.0', '0.166.0');
         expect(await runSelfUpdate(codex.bin)).toEqual({ ok: true });

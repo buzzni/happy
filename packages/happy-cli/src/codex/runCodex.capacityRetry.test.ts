@@ -48,9 +48,10 @@ vi.mock('@/codex/codexCapacityRetry', async (importOriginal) => ({
 
 /** Only the codex on disk is faked; the loop's own update-and-retry wiring is real. */
 const codexSelfUpdate = vi.hoisted(() => ({ update: vi.fn(async () => ({ text: '0.166.0', parts: [0, 166, 0], prerelease: false })), markRunning: vi.fn() }));
+const runningCodex = vi.hoisted(() => ({ version: null as null | { text: string; parts: [number, number, number]; prerelease: boolean } }));
 vi.mock('@/codex/codexSelfUpdate', async (importOriginal) => ({
     ...await importOriginal<typeof import('@/codex/codexSelfUpdate')>(),
-    createCodexSelfUpdater: () => ({ runningVersion: Promise.resolve(null), ...codexSelfUpdate }),
+    createCodexSelfUpdater: () => ({ get runningVersion() { return Promise.resolve(runningCodex.version); }, ...codexSelfUpdate }),
 }));
 const reconnects = vi.hoisted(() => vi.fn(async () => true));
 
@@ -68,7 +69,7 @@ vi.mock('@/utils/MessageQueue2', async (importOriginal) => {
 
 const protocolMessages: SessionEnvelope[] = [];
 let runtimeEvidence: TurnInputEvidence;
-type Outcome = 'overloaded' | 'codex-too-old' | 'ok' | 'write-failure' | 'prepare-failure' | 'sync-write-failure';
+type Outcome = 'overloaded' | 'codex-too-old' | 'chatgpt-refused' | 'ok' | 'write-failure' | 'prepare-failure' | 'sync-write-failure';
 let script: { outcome: Outcome; beforeWrite?: () => Promise<void>; after?: () => void | Promise<void> }[] = [];
 let turnsSent: string[] = [];
 let failingWrites = 0;
@@ -82,6 +83,13 @@ const OVERLOADED = {
         codexErrorInfo: 'serverOverloaded',
         additionalDetails: null,
     },
+};
+
+/** What a ChatGPT login gets from a codex older than the model (0.163.0 with gpt-6.2-sol, 2026-11-28). */
+const CHATGPT_REFUSED = {
+    type: 'task_complete',
+    status: 'failed',
+    error: { message: JSON.stringify({ type: 'error', status: 400, error: { type: 'invalid_request_error', message: "The 'gpt-6.2-sol' model is not supported when using Codex with a ChatGPT account.", code: 'model_not_found', subreason: 'model_not_in_accessible_catalog' } }), additionalDetails: null },
 };
 
 const CODEX_TOO_OLD = {
@@ -130,6 +138,7 @@ vi.mock('@/codex/codexAppServerClient', async (importOriginal) => {
             eventHandler?.(step.outcome === 'overloaded'
                 ? { ...OVERLOADED, turn_id: `turn-${turnsSent.length}` }
                 : step.outcome === 'codex-too-old' ? { ...CODEX_TOO_OLD, turn_id: `turn-${turnsSent.length}` }
+                : step.outcome === 'chatgpt-refused' ? { ...CHATGPT_REFUSED, turn_id: `turn-${turnsSent.length}` }
                 : { type: 'task_complete', status: 'completed', turn_id: `turn-${turnsSent.length}` });
             await step.after?.();
             return { aborted: false };
@@ -211,7 +220,7 @@ const closeQueue = () => { queues[0]!.close(); };
 describe('automatic continuation after a capacity failure', () => {
     beforeEach(() => {
         protocolMessages.length = 0; queues.length = 0; sessionEvents.length = 0; rpc.clear(); turnsSent = []; failingWrites = 0; script = []; eventHandler = null; onUserMessage = null; reportCapacityFailure.mockClear();
-        codexSelfUpdate.update.mockClear(); codexSelfUpdate.markRunning.mockClear(); reconnects.mockClear();
+        codexSelfUpdate.update.mockClear(); codexSelfUpdate.markRunning.mockClear(); reconnects.mockClear(); runningCodex.version = null;
         sessionMetadata = { path: '/workspace/project', codexThreadId: 'thread-1' };
         // Run from inside a Saycode session, the runner would otherwise pick up that
         // session's own lesson host, reconnect target and sandbox settings, and never exit.
@@ -668,6 +677,24 @@ describe('automatic continuation after a capacity failure', () => {
             expect(reconnects).not.toHaveBeenCalled();
             expect(turnsSent).toHaveLength(1);
             expect(updateNotices().at(-1)?.message).toBe('Codex CLI 자동 업데이트에 실패했습니다: Codex CLI is still 0.165.0 (running 0.165.0) after codex update');
+        }, 60_000);
+
+        it('updates codex when a ChatGPT login refuses a model the running codex is too old for', async () => {
+            runningCodex.version = { text: '0.163.0', parts: [0, 163, 0], prerelease: false };
+            script = [{ outcome: 'chatgpt-refused' }, { outcome: 'ok', after: closeQueue }];
+            await run(push);
+
+            expect(codexSelfUpdate.update).toHaveBeenCalledTimes(1);
+            expect(turnsSent).toHaveLength(2);
+            expect(updateNotices()[0]?.message).toBe('Codex CLI가 오래되어 자동 업데이트 중입니다. 완료 후 요청을 다시 시도합니다.');
+        }, 60_000);
+
+        it('leaves the ChatGPT refusal to the user when the running codex is already new enough', async () => {
+            runningCodex.version = { text: '0.171.0', parts: [0, 171, 0], prerelease: false };
+            script = [{ outcome: 'chatgpt-refused', after: closeQueue }];
+            await run(push);
+            expect(codexSelfUpdate.update).not.toHaveBeenCalled();
+            expect(turnsSent).toHaveLength(1);
         }, 60_000);
 
         it('leaves other provider failures to the user', async () => {
