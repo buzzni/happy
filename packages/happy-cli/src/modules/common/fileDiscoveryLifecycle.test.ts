@@ -8,17 +8,10 @@ function child() {
 }
 afterEach(() => { vi.useRealTimers(); forkMock.mockReset(); });
 describe('bounded file discovery process ownership', () => {
-    it('answers unsupported without starting a worker where the worker has no symlink-safe open', async () => {
-        expect(await fileDiscovery('/allowed', { version: 1, operation: 'capabilities' }, 'linux')).toEqual({ version: 1, success: false, error: 'unsupported' });
-        expect(forkMock).not.toHaveBeenCalled();
-    });
     // Every project switch asks for capabilities; on Windows each worker was a visible node.exe console.
-    it('starts the Windows worker with its console hidden', async () => {
-        const process = child(); forkMock.mockReturnValue(process);
-        const result = fileDiscovery('C:/allowed', { version: 1, operation: 'capabilities' }, 'win32');
-        expect(forkMock).toHaveBeenCalledWith(expect.stringContaining('file-discovery-worker.cjs'), [], expect.objectContaining({ windowsHide: true }));
-        process.emit('message', { version: 1, success: true, supported: true }); process.emit('exit', 0);
-        expect(await result).toMatchObject({ success: true, supported: true });
+    it('answers unsupported off macOS without starting a worker', async () => {
+        expect(await fileDiscovery('/allowed', { version: 1, operation: 'capabilities' }, 'win32')).toEqual({ version: 1, success: false, error: 'unsupported' });
+        expect(forkMock).not.toHaveBeenCalled();
     });
     it('kills on deadline and resolves partial results only after the child exits', async () => {
         vi.useFakeTimers(); const process = child(); forkMock.mockReturnValue(process);
