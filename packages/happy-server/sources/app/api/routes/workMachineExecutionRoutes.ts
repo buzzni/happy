@@ -243,17 +243,22 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
             params: z.object({ machineId: identifier }),
             body: z.object({
                 deviceId: z.string().regex(/^[a-zA-Z0-9_-]{43}$/),
-                ownerUserId: identifier,
+                // The owner of a personal or dedicated PC, or (`ownerUserIds`) the
+                // members a shared PC serves. Exactly one is present.
+                ownerUserId: identifier.optional(),
+                ownerUserIds: z.array(identifier).min(1).max(500).optional(),
                 sessionIds: z.array(identifier).max(5000),
                 // Studio's records place these inventory sessions on this machine
-                // for this owner. Covered by the control assertion, not the device proof.
+                // for these owners. Covered by the control assertion, not the device proof.
                 studioAttributedSessionIds: z.array(identifier).max(5000).optional(),
                 proof: deviceSignatureSchema,
-            }).strict(),
+            }).strict().refine(body => (body.ownerUserId === undefined) !== (body.ownerUserIds === undefined), {
+                message: 'Exactly one of ownerUserId and ownerUserIds is required',
+            }),
         },
     }, async (request, reply) => {
         const { machineId } = request.params;
-        const { deviceId, proof, ownerUserId, sessionIds, studioAttributedSessionIds } = request.body;
+        const { deviceId, proof, ownerUserId, ownerUserIds, sessionIds, studioAttributedSessionIds } = request.body;
         const now = Date.now();
         const enrollmentScope = ['happy-work-machine-enrollment-v2', machineId, deviceId, proof.issuedAt, [...sessionIds].sort()] as const;
         if (!verifiedOperation(request.headers, machineId, 'work-machine-enroll', request.body, now)
@@ -261,7 +266,7 @@ export function workMachineExecutionRoutes(app: Fastify, getVerifier: () => Cont
             return reply.code(403).send({ error: 'Work machine enrollment not authorized' });
         }
         const enrolled = await enrollWorkMachineExecution(db, {
-            machineId, accountId: request.userId, deviceId, ownerUserId, sessionIds, studioAttributedSessionIds,
+            machineId, accountId: request.userId, deviceId, ownerUserIds: ownerUserIds ?? [ownerUserId!], sessionIds, studioAttributedSessionIds,
         });
         if ('reason' in enrolled) return reply.code(409).send({ error: 'Work machine enrollment not ready', ...enrolled });
         return reply.header('Cache-Control', 'no-store').send(enrolled);

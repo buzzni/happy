@@ -1,4 +1,5 @@
 import { piiSessionVisibility } from "@/app/session/piiSessionVisibility";
+import type { FastifyReply, FastifyRequest } from "fastify";
 import { Fastify } from "../types";
 import { z } from "zod";
 import { db } from "@/storage/db";
@@ -66,28 +67,82 @@ export function machineSessionOwnerRoutes(app: Fastify) {
         return reply.send({ owner: { ownerAccountId: request.userId } });
     });
 
+    // An account bearer, or the current device credential of the machine the body names
+    // (a protected machine's daemon: drain still allows these reads, a frozen machine does not).
+    const accountOrMachineDaemon = [
+        requireWorkMachineDaemonReadAuth(app, request => (request.body as { machineId?: string }).machineId),
+        async (request: FastifyRequest, reply: FastifyReply) => request.workMachineDaemonGrant ? undefined : requireAccountPrincipal(request, reply),
+    ];
+    // The machine row a caller may ask about. The account bearer only reaches a machine
+    // without work-machine authority, as the legacy lock does: an old PC still holding
+    // the account token must not vouch for the protected machine's sessions.
+    const askedMachine = (request: FastifyRequest, machineId: string) => ({
+        id: machineId, accountId: request.userId,
+        ...(request.workMachineDaemonGrant ? {} : { workMachineExecution: { is: null } }),
+    });
+
     // Execution relation only. This grants neither session ownership nor message access.
     app.post('/v1/machine-sessions/:sessionId/execution-owner', {
-        preHandler: [app.authenticate, requireAccountPrincipal],
+        preHandler: accountOrMachineDaemon,
         schema: {
             params: z.object({ sessionId: z.string().min(1).max(128) }).strict(),
             body: ExecutionOwnerRequestSchema,
             response: { 200: ExecutionOwnerResponseSchema },
         },
     }, async (request, reply) => {
+        reply.header('Cache-Control', 'no-store');
         const { companyId, machineId, launchId, initialNonce } = request.body;
         const sessionId = request.params.sessionId;
         const binding = await db.sessionExecutionBinding.findFirst({ where: {
             sessionId, companyId, machineId, launchId, initialNonce,
             machineOwnerAccountId: request.userId,
-            machine: { is: { id: machineId, accountId: request.userId } },
-            session: { is: { id: sessionId } },
+            machine: { is: askedMachine(request, machineId) },
+            session: { is: { id: sessionId, ...(request.workMachineDaemonGrant ? { workMachineId: machineId } : {}) } },
         } });
         if (!binding) return reply.send({ owner: null });
         return reply.send({ owner: {
             companyId, machineId, sessionId, launchId, initialNonce,
             machineOwnerAccountId: binding.machineOwnerAccountId,
             sessionOwnerAccountId: binding.sessionOwnerAccountId,
+        } });
+    });
+
+    // Recovery of an initial rotation create whose answer was lost: the session the launch
+    // made, if any, of the caller's own account on the caller's own machine. It never creates
+    // one, so a protected machine's daemon can recover without its proof still being fresh.
+    // The snapshot is what the daemon needs to attach to the session; the device credential
+    // reads no other session row.
+    app.post('/v1/machine-sessions/execution-lookup', {
+        preHandler: accountOrMachineDaemon,
+        schema: {
+            body: ExecutionOwnerRequestSchema,
+            response: { 200: z.object({ session: z.object({
+                id: z.string(), seq: z.number(), metadata: z.string(), metadataVersion: z.number(),
+                agentState: z.string().nullable(), agentStateVersion: z.number(), dataEncryptionKey: z.string().nullable(),
+            }).nullable() }) },
+        },
+    }, async (request, reply) => {
+        // The answer carries the session's wrapped data key.
+        reply.header('Cache-Control', 'no-store');
+        const { companyId, machineId, launchId, initialNonce } = request.body;
+        const binding = await db.sessionExecutionBinding.findFirst({
+            where: {
+                companyId, machineId, launchId, initialNonce,
+                machineOwnerAccountId: request.userId, sessionOwnerAccountId: request.userId,
+                machine: { is: askedMachine(request, machineId) },
+                session: { is: {
+                    ...piiSessionVisibility(request), accountId: request.userId,
+                    ...(request.workMachineDaemonGrant ? { workMachineId: machineId } : {}),
+                } },
+            },
+            select: { session: true },
+        });
+        const session = binding?.session;
+        if (!session) return reply.send({ session: null });
+        return reply.send({ session: {
+            id: session.id, seq: session.seq, metadata: session.metadata, metadataVersion: session.metadataVersion,
+            agentState: session.agentState, agentStateVersion: session.agentStateVersion,
+            dataEncryptionKey: session.dataEncryptionKey ? Buffer.from(session.dataEncryptionKey).toString('base64') : null,
         } });
     });
 

@@ -13,7 +13,7 @@ import { sessionDelete } from "@/app/session/sessionDelete";
 import { sessionArchive } from "@/app/session/sessionArchive";
 import { requireSessionScopeAuth, requireAccountPrincipal, requireWorkMachineSessionScopeAuth, verifyWorkMachineDaemonBearer } from "@/app/api/utils/enableAuthentication";
 import { sessionCreateOnWorkMachine } from "@/app/session/sessionCreateOnWorkMachine";
-import { createExecutionBoundSession, ExecutionBindingError } from "@/app/session/sessionExecutionBinding";
+import { createExecutionBoundSession, ExecutionBindingError, sessionCreateExecutionBoundOnWorkMachine } from "@/app/session/sessionExecutionBinding";
 import { createOwnershipBoundSession, OwnershipError } from "@/app/session/sessionOwnershipBinding";
 
 function visibleSessionScope(accountId: string): Prisma.SessionWhereInput {
@@ -544,10 +544,22 @@ export function sessionRoutes(app: Fastify) {
         const workMachineGrant = request.workMachineDaemonGrant;
         if (workMachineGrant) {
             const refused = () => reply.code(403).send({ error: 'Work machine device authorization required' });
-            if (['executionProof', 'ownershipProof'].some(key => Object.prototype.hasOwnProperty.call(request.body, key))) return refused();
-            const result = await sessionCreateOnWorkMachine(workMachineGrant, {
-                tag, metadata, agentState: request.body.agentState, dataEncryptionKey,
-            });
+            if (Object.prototype.hasOwnProperty.call(request.body, 'ownershipProof')) return refused();
+            let result: Awaited<ReturnType<typeof sessionCreateOnWorkMachine>>;
+            if (Object.prototype.hasOwnProperty.call(request.body, 'executionProof')) {
+                // An organization account rotation launch: the Studio ticket still binds launch and session.
+                const { executionProof, ...createBody } = request.body;
+                try {
+                    result = await sessionCreateExecutionBoundOnWorkMachine(workMachineGrant, createBody, executionProof);
+                } catch (error) {
+                    if (error instanceof ExecutionBindingError) return reply.code(error.statusCode).send({ error: error.message });
+                    throw error;
+                }
+            } else {
+                result = await sessionCreateOnWorkMachine(workMachineGrant, {
+                    tag, metadata, agentState: request.body.agentState, dataEncryptionKey,
+                });
+            }
             if (result === 'denied') return refused();
             if (result === 'draining') return reply.code(409).send({ error: 'Work machine is draining', reason: 'work-machine-draining' });
             if (result === 'conflict') return reply.code(409).send({ error: 'Session tag conflict' });
